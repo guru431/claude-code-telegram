@@ -151,10 +151,13 @@ class VoiceHandler:
         """Transcribe audio using the OpenAI Whisper API."""
         client = self._get_openai_client()
         try:
-            response = await client.audio.transcriptions.create(
-                model=self.config.resolved_voice_model,
-                file=("voice.ogg", voice_bytes),
-            )
+            kwargs: dict[str, Any] = {
+                "model": self.config.resolved_voice_model,
+                "file": ("voice.ogg", voice_bytes),
+            }
+            if self.config.voice_language:
+                kwargs["language"] = self.config.voice_language
+            response = await client.audio.transcriptions.create(**kwargs)
         except Exception as exc:
             logger.warning(
                 "OpenAI transcription request failed",
@@ -182,8 +185,17 @@ class VoiceHandler:
             ) from exc
 
         api_key = self.config.openai_api_key_str
-        if not api_key:
+        base_url = self.config.voice_base_url
+        if not api_key and not base_url:
             raise RuntimeError("OpenAI API key is not configured.")
 
-        self._openai_client = AsyncOpenAI(api_key=api_key)
+        kwargs: dict[str, Any] = {}
+        if api_key:
+            kwargs["api_key"] = api_key
+        else:
+            kwargs["api_key"] = "not-needed"
+        if base_url:
+            kwargs["base_url"] = base_url
+
+        self._openai_client = AsyncOpenAI(**kwargs)
         return self._openai_client

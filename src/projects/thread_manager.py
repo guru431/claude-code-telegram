@@ -111,7 +111,7 @@ class ProjectThreadManager:
         for stale in stale_mappings:
             try:
                 await self._call_sync_api(
-                    lambda: bot.close_forum_topic(
+                    lambda: bot.delete_forum_topic(
                         chat_id=stale.chat_id,
                         message_thread_id=stale.message_thread_id,
                     ),
@@ -122,14 +122,24 @@ class ProjectThreadManager:
                     raise PrivateTopicsUnavailableError(
                         "Private chat topics are not enabled for this bot chat."
                     ) from e
-                result.failed += 1
-                logger.warning(
-                    "Could not close stale topic",
-                    chat_id=stale.chat_id,
-                    message_thread_id=stale.message_thread_id,
-                    project_slug=stale.project_slug,
-                    error=str(e),
-                )
+                # Fall back to closing if delete is not supported
+                try:
+                    await self._call_sync_api(
+                        lambda: bot.close_forum_topic(
+                            chat_id=stale.chat_id,
+                            message_thread_id=stale.message_thread_id,
+                        ),
+                    )
+                    result.closed += 1
+                except TelegramError:
+                    result.failed += 1
+                    logger.warning(
+                        "Could not delete/close stale topic",
+                        chat_id=stale.chat_id,
+                        message_thread_id=stale.message_thread_id,
+                        project_slug=stale.project_slug,
+                        error=str(e),
+                    )
             finally:
                 await self.repository.set_active(
                     chat_id=stale.chat_id,

@@ -101,6 +101,9 @@ _TOOL_ICONS: Dict[str, str] = {
     "NotebookEdit": "\U0001f4d3",
     "TodoRead": "\u2611\ufe0f",
     "TodoWrite": "\u2611\ufe0f",
+    "AskUserQuestion": "\u2753",
+    "EnterPlanMode": "\U0001f4cb",
+    "ExitPlanMode": "\U0001f4cb",
 }
 
 

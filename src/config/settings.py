@@ -113,6 +113,9 @@ class Settings(BaseSettings):
             "TodoWrite",
             "WebSearch",
             "Skill",
+            "AskUserQuestion",
+            "EnterPlanMode",
+            "ExitPlanMode",
         ],
         description="List of allowed Claude tools",
     )
@@ -184,6 +187,20 @@ class Settings(BaseSettings):
         description=(
             "Model for voice transcription. "
             "Defaults to 'voxtral-mini-latest' (Mistral) or 'whisper-1' (OpenAI)"
+        ),
+    )
+    voice_base_url: Optional[str] = Field(
+        None,
+        description=(
+            "Custom base URL for OpenAI-compatible transcription API "
+            "(e.g. local Whisper server). Only used with voice_provider=openai."
+        ),
+    )
+    voice_language: Optional[str] = Field(
+        None,
+        description=(
+            "Language hint for voice transcription (ISO 639-1, e.g. 'ru', 'en'). "
+            "Improves accuracy when the spoken language is known in advance."
         ),
     )
     voice_max_file_size_mb: int = Field(

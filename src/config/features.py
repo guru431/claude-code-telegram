@@ -77,7 +77,10 @@ class FeatureFlags:
         if not self.settings.enable_voice_messages:
             return False
         if self.settings.voice_provider == "openai":
-            return self.settings.openai_api_key is not None
+            return (
+                self.settings.openai_api_key is not None
+                or self.settings.voice_base_url is not None
+            )
         return self.settings.mistral_api_key is not None
 
     @property
