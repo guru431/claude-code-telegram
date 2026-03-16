@@ -258,33 +258,45 @@ class ClaudeSDKManager:
                     # generator, Python terminates that generator permanently,
                     # causing us to lose all subsequent messages including
                     # the ResultMessage.
-                    async for raw_data in client._query.receive_messages():
-                        try:
-                            message = parse_message(raw_data)
-                        except MessageParseError as e:
-                            logger.debug(
-                                "Skipping unparseable message",
-                                error=str(e),
-                            )
-                            continue
-
-                        messages.append(message)
-
-                        if isinstance(message, ResultMessage):
-                            break
-
-                        # Handle streaming callback
-                        if stream_callback:
+                    try:
+                        async for raw_data in client._query.receive_messages():
                             try:
-                                await self._handle_stream_message(
-                                    message, stream_callback
+                                message = parse_message(raw_data)
+                            except MessageParseError as e:
+                                logger.debug(
+                                    "Skipping unparseable message",
+                                    error=str(e),
                                 )
-                            except Exception as callback_error:
-                                logger.warning(
-                                    "Stream callback failed",
-                                    error=str(callback_error),
-                                    error_type=type(callback_error).__name__,
-                                )
+                                continue
+
+                            messages.append(message)
+
+                            if isinstance(message, ResultMessage):
+                                break
+
+                            # Handle streaming callback
+                            if stream_callback:
+                                try:
+                                    await self._handle_stream_message(
+                                        message, stream_callback
+                                    )
+                                except Exception as callback_error:
+                                    logger.warning(
+                                        "Stream callback failed",
+                                        error=str(callback_error),
+                                        error_type=type(callback_error).__name__,
+                                    )
+                    except ProcessError:
+                        # ProcessError is raised when the Claude subprocess
+                        # crashes. The SDK's reader task may throw this inside
+                        # the async generator. Re-raise so the outer handler
+                        # catches it instead of waiting for the full timeout.
+                        raise
+                    except (
+                        GeneratorExit,
+                        StopAsyncIteration,
+                    ):
+                        pass
                 finally:
                     await client.disconnect()
 

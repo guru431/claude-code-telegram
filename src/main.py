@@ -24,7 +24,7 @@ from src.events.handlers import AgentHandler
 from src.events.middleware import EventSecurityMiddleware
 from src.exceptions import ConfigurationError
 from src.notifications.service import NotificationService
-from src.projects import ProjectThreadManager, load_project_registry
+from src.projects import ProjectThreadManager, discover_new_projects, load_project_registry
 from src.scheduler.scheduler import JobScheduler
 from src.security.audit import AuditLogger, InMemoryAuditStorage
 from src.security.auth import (
@@ -216,6 +216,7 @@ async def run_application(app: Dict[str, Any]) -> None:
 
     notification_service: Optional[NotificationService] = None
     scheduler: Optional[JobScheduler] = None
+    discovery_scheduler: Optional[Any] = None
     project_threads_manager: Optional[ProjectThreadManager] = None
 
     # Set up signal handlers for graceful shutdown
@@ -239,6 +240,21 @@ async def run_application(app: Dict[str, Any]) -> None:
                 raise ConfigurationError(
                     "Project thread mode enabled but required settings are missing"
                 )
+
+            # Auto-discover new project directories before loading registry
+            try:
+                new_projects, _total = discover_new_projects(
+                    approved_directory=config.approved_directory,
+                    config_path=config.projects_config_path,
+                )
+                if new_projects:
+                    logger.info(
+                        "Startup discovery: new projects added",
+                        new_slugs=[p["slug"] for p in new_projects],
+                    )
+            except Exception:
+                logger.exception("Startup project discovery failed, continuing")
+
             registry = load_project_registry(
                 config_path=config.projects_config_path,
                 approved_directory=config.approved_directory,
@@ -316,6 +332,83 @@ async def run_application(app: Dict[str, Any]) -> None:
             await scheduler.start()
             logger.info("Job scheduler enabled")
 
+        # Nightly project discovery cron (if project threads enabled)
+        if config.enable_project_threads and config.projects_config_path:
+            from apscheduler.schedulers.asyncio import (
+                AsyncIOScheduler as _DiscoveryScheduler,
+            )
+            from apscheduler.triggers.cron import (
+                CronTrigger as _DiscoveryCronTrigger,
+            )
+
+            async def _nightly_project_discovery() -> None:
+                """Discover new project dirs and sync Telegram topics."""
+                _log = structlog.get_logger()
+                try:
+                    new_projects, total = discover_new_projects(
+                        approved_directory=config.approved_directory,
+                        config_path=config.projects_config_path,  # type: ignore[arg-type]
+                    )
+                    if not new_projects:
+                        _log.info("Nightly discovery: no new projects found")
+                        return
+
+                    _log.info(
+                        "Nightly discovery: new projects added",
+                        new_slugs=[p["slug"] for p in new_projects],
+                        total=total,
+                    )
+
+                    # Reload registry from updated YAML
+                    fresh_registry = load_project_registry(
+                        config_path=config.projects_config_path,  # type: ignore[arg-type]
+                        approved_directory=config.approved_directory,
+                    )
+                    fresh_manager = ProjectThreadManager(
+                        registry=fresh_registry,
+                        repository=storage.project_threads,
+                        sync_action_interval_seconds=(
+                            config.project_threads_sync_action_interval_seconds
+                        ),
+                    )
+
+                    # Update bot deps so new topics are routable
+                    bot.deps["project_registry"] = fresh_registry
+                    bot.deps["project_threads_manager"] = fresh_manager
+
+                    # Sync topics in Telegram
+                    if config.project_threads_mode == "group":
+                        chat_id = config.project_threads_chat_id
+                    else:
+                        chat_id = (
+                            config.allowed_users[0]
+                            if config.allowed_users
+                            else None
+                        )
+                    if chat_id:
+                        sync_result = await fresh_manager.sync_topics(
+                            telegram_bot, chat_id=chat_id
+                        )
+                        _log.info(
+                            "Nightly discovery: topics synced",
+                            created=sync_result.created,
+                            reused=sync_result.reused,
+                            renamed=sync_result.renamed,
+                            failed=sync_result.failed,
+                        )
+
+                except Exception:
+                    _log.exception("Nightly project discovery failed")
+
+            discovery_scheduler = _DiscoveryScheduler()
+            discovery_scheduler.add_job(
+                _nightly_project_discovery,
+                trigger=_DiscoveryCronTrigger(hour=3, minute=0),
+                name="nightly_project_discovery",
+            )
+            discovery_scheduler.start()
+            logger.info("Nightly project discovery cron enabled (03:00 daily)")
+
         # Shutdown task
         shutdown_task = asyncio.create_task(shutdown_event.wait())
         tasks.append(shutdown_task)
@@ -352,6 +445,8 @@ async def run_application(app: Dict[str, Any]) -> None:
         logger.info("Shutting down application")
 
         try:
+            if discovery_scheduler:
+                discovery_scheduler.shutdown(wait=False)
             if scheduler:
                 await scheduler.stop()
             if notification_service:
