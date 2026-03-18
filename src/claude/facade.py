@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional
 import structlog
 
 from ..config.settings import Settings
+from .local_sessions import find_latest_local_session
 from .sdk_integration import ClaudeResponse, ClaudeSDKManager, StreamUpdate
 from .session import SessionManager
 
@@ -169,9 +170,15 @@ class ClaudeIntegration:
     ) -> Optional["ClaudeSession"]:  # noqa: F821
         """Find the most recent resumable session for a user in a directory.
 
+        First checks the bot's own SQLite storage. If nothing is found, falls
+        back to scanning ``~/.claude/projects/`` for sessions started in
+        VS Code or the CLI, so the user can seamlessly continue them via the
+        bot.
+
         Returns the session if one exists that is non-expired and has a real
         (non-temporary) session ID from Claude. Returns None otherwise.
         """
+        from .session import ClaudeSession
 
         sessions = await self.session_manager._get_user_sessions(user_id)
 
@@ -183,10 +190,31 @@ class ClaudeIntegration:
             and not s.is_expired(self.config.session_timeout_hours)
         ]
 
-        if not matching_sessions:
-            return None
+        if matching_sessions:
+            return max(matching_sessions, key=lambda s: s.last_used)
 
-        return max(matching_sessions, key=lambda s: s.last_used)
+        # Fallback: discover sessions from ~/.claude/projects/ (VS Code / CLI)
+        known_ids = {s.session_id for s in sessions if s.session_id}
+        local = find_latest_local_session(working_directory, exclude_ids=known_ids)
+        if local:
+            logger.info(
+                "Found local CLI/VS Code session to resume",
+                session_id=local.session_id,
+                cwd=local.cwd,
+                source="~/.claude/projects",
+            )
+            # Wrap as a ClaudeSession so the rest of the flow works unchanged
+            from datetime import UTC, datetime
+
+            return ClaudeSession(
+                session_id=local.session_id,
+                user_id=user_id,
+                project_path=working_directory,
+                created_at=local.timestamp,
+                last_used=datetime.now(UTC),
+            )
+
+        return None
 
     async def continue_session(
         self,

@@ -8,6 +8,7 @@ classic mode, delegates to existing full-featured handlers.
 import asyncio
 import re
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -310,6 +311,7 @@ class MessageOrchestrator:
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
+            ("sessions", self.agentic_sessions),
             ("restart", command.restart_command),
         ]
         if self.settings.enable_project_threads:
@@ -352,6 +354,14 @@ class MessageOrchestrator:
             CallbackQueryHandler(
                 self._inject_deps(self._agentic_callback),
                 pattern=r"^cd:",
+            )
+        )
+
+        # resume: callbacks (for session switching from /sessions)
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._agentic_resume_callback),
+                pattern=r"^resume:",
             )
         )
 
@@ -419,6 +429,7 @@ class MessageOrchestrator:
                 BotCommand("status", "Show session status"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
+                BotCommand("sessions", "List sessions (local + bot)"),
                 BotCommand("restart", "Restart the bot"),
             ]
             if self.settings.enable_project_threads:
@@ -1610,3 +1621,121 @@ class MessageOrchestrator:
                 args=[project_name],
                 success=True,
             )
+
+    async def agentic_sessions(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """List recent Claude Code sessions (local + bot) with resume buttons."""
+        from ..claude.local_sessions import list_all_local_sessions
+
+        current_dir = context.user_data.get(
+            "current_directory", self.settings.approved_directory
+        )
+        current_session_id = context.user_data.get("claude_session_id")
+
+        local_sessions = list_all_local_sessions(limit=15)
+
+        if not local_sessions:
+            await update.message.reply_text("No sessions found.")
+            return
+
+        lines: list[str] = []
+        keyboard_rows: list[list[InlineKeyboardButton]] = []
+
+        for i, sess in enumerate(local_sessions, 1):
+            # Show relative path from approved_directory if possible
+            try:
+                display_path = Path(sess.cwd).relative_to(
+                    self.settings.approved_directory
+                )
+            except ValueError:
+                display_path = Path(sess.cwd).name or sess.cwd
+
+            short_id = sess.session_id[:8]
+            mtime = datetime.fromtimestamp(
+                sess.jsonl_path.stat().st_mtime, tz=UTC
+            )
+            age = datetime.now(UTC) - mtime
+            if age.days > 0:
+                age_str = f"{age.days}d ago"
+            elif age.seconds >= 3600:
+                age_str = f"{age.seconds // 3600}h ago"
+            else:
+                age_str = f"{age.seconds // 60}m ago"
+
+            marker = " \u25c0" if sess.session_id == current_session_id else ""
+            preview = ""
+            if sess.first_message:
+                # Truncate to ~40 chars for display
+                msg_preview = sess.first_message[:40]
+                if len(sess.first_message) > 40:
+                    msg_preview += "…"
+                preview = f"\n   <i>{escape_html(msg_preview)}</i>"
+            lines.append(
+                f"{i}. <code>{escape_html(str(display_path))}/</code>"
+                f" · <code>{short_id}</code> · {age_str}{marker}{preview}"
+            )
+
+            # callback_data max 64 bytes — uuid is 36 chars, prefix 7 = 43
+            # Button text: show first words of the conversation
+            btn_label = f"{short_id}"
+            if sess.first_message:
+                btn_msg = sess.first_message[:30]
+                if len(sess.first_message) > 30:
+                    btn_msg += "…"
+                btn_label = f"{short_id} {btn_msg}"
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        btn_label,
+                        callback_data=f"resume:{sess.session_id}",
+                    )
+                ]
+            )
+
+        reply_markup = InlineKeyboardMarkup(keyboard_rows)
+
+        await update.message.reply_text(
+            "<b>Sessions</b>\n\n" + "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+
+    async def _agentic_resume_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle resume: callbacks — switch to a session from /sessions list."""
+        query = update.callback_query
+        await query.answer()
+
+        _, session_id = query.data.split(":", 1)
+
+        # Find the session's working directory from local storage
+        from ..claude.local_sessions import _claude_projects_dir, _parse_session_head
+
+        projects_dir = _claude_projects_dir()
+        cwd = None
+        if projects_dir.is_dir():
+            for project_dir in projects_dir.iterdir():
+                if not project_dir.is_dir():
+                    continue
+                jsonl = project_dir / f"{session_id}.jsonl"
+                if jsonl.is_file():
+                    first = _parse_session_head(jsonl)
+                    if first:
+                        cwd = first.get("cwd")
+                    break
+
+        if cwd:
+            context.user_data["current_directory"] = Path(cwd)
+
+        context.user_data["claude_session_id"] = session_id
+        context.user_data.pop("force_new_session", None)
+
+        short_id = session_id[:8]
+        dir_display = f" in <code>{escape_html(cwd)}</code>" if cwd else ""
+
+        await query.edit_message_text(
+            f"Resumed session <code>{short_id}…</code>{dir_display}",
+            parse_mode="HTML",
+        )
