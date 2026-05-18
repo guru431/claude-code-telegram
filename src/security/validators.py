@@ -7,6 +7,7 @@ Features:
 - Input sanitization
 """
 
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -183,7 +184,10 @@ class SecurityValidator:
                 # Relative path
                 target = current_dir / user_path
 
-            # Resolve path and check boundaries
+            # Resolve path and check boundaries.
+            # ``Path.resolve()`` follows symlinks, so a symlink inside the
+            # approved directory pointing outside will resolve to the
+            # outside path and be rejected by the boundary check below.
             target = target.resolve()
 
             # Ensure target is within approved directory
@@ -193,6 +197,29 @@ class SecurityValidator:
                     requested_path=user_path,
                     resolved_path=str(target),
                     approved_directory=str(self.approved_directory),
+                )
+                return False, None, "Access denied: path outside approved directory"
+
+            # Defense-in-depth: cross-check via os.path.realpath in case
+            # any intermediate symlink was not fully resolved (e.g. due to
+            # FS races between resolve() and the actual file operation).
+            # This narrows but does not eliminate the TOCTOU window; the
+            # final defence is filesystem permissions on approved_directory.
+            try:
+                real_target = Path(os.path.realpath(str(target)))
+            except OSError as e:
+                logger.warning(
+                    "realpath failed during path validation",
+                    path=str(target),
+                    error=str(e),
+                )
+                return False, None, "Invalid path"
+            if not self._is_within_directory(real_target, self.approved_directory):
+                logger.warning(
+                    "Symlink target outside approved directory",
+                    requested_path=user_path,
+                    resolved_path=str(target),
+                    real_path=str(real_target),
                 )
                 return False, None, "Access denied: path outside approved directory"
 

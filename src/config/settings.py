@@ -152,12 +152,6 @@ class Settings(BaseSettings):
     session_timeout_hours: int = Field(
         DEFAULT_SESSION_TIMEOUT_HOURS, description="Session timeout"
     )
-    session_timeout_minutes: int = Field(
-        default=120,
-        description="Session timeout in minutes",
-        ge=10,
-        le=1440,  # Max 24 hours
-    )
     max_sessions_per_user: int = Field(
         DEFAULT_MAX_SESSIONS_PER_USER, description="Max concurrent sessions"
     )

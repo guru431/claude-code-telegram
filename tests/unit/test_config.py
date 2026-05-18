@@ -578,33 +578,36 @@ def test_feature_flags():
     Path("/tmp/test_mcp.json").unlink(missing_ok=True)
 
 
-def test_environment_loading():
-    """Test environment-specific configuration loading."""
-    # Test development environment
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        os.environ["TELEGRAM_BOT_TOKEN"] = "test_token"
-        os.environ["TELEGRAM_BOT_USERNAME"] = "test_bot"
-        os.environ["APPROVED_DIRECTORY"] = tmp_dir
+def test_environment_loading(monkeypatch, tmp_path):
+    """Environment overrides apply when env vars do not explicitly set them.
 
-        try:
-            config = load_config(env="development")
-            assert config.debug is True
-            assert config.development_mode is True
-            assert config.log_level == "DEBUG"
+    With the env-override-precedence fix (see ``loader._apply_environment_overrides``),
+    fields appearing in ``model_fields_set`` (i.e. set via env / .env / kwargs)
+    are preserved against environment-class overrides. The test needs to run
+    in a directory that contains no ``.env`` file — Pydantic Settings auto-
+    loads ``.env`` from cwd via its ``model_config``, separately from
+    ``load_config``'s own ``load_dotenv``.
+    """
+    approved_dir = tmp_path / "projects"
+    approved_dir.mkdir()
+    monkeypatch.chdir(tmp_path)  # No .env file here
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test_token")
+    monkeypatch.setenv("TELEGRAM_BOT_USERNAME", "test_bot")
+    monkeypatch.setenv("APPROVED_DIRECTORY", str(approved_dir))
+    # Fields under test must NOT be env-set so environment-class overrides
+    # apply. Clear anything that might leak from the OS env.
+    for var in ("DEBUG", "DEVELOPMENT_MODE", "LOG_LEVEL"):
+        monkeypatch.delenv(var, raising=False)
 
-            config = load_config(env="production")
-            assert config.debug is False
-            assert config.development_mode is False
-            assert config.log_level == "INFO"
+    config = load_config(env="development")
+    assert config.debug is True
+    assert config.development_mode is True
+    assert config.log_level == "DEBUG"
 
-        finally:
-            # Clean up environment
-            for key in [
-                "TELEGRAM_BOT_TOKEN",
-                "TELEGRAM_BOT_USERNAME",
-                "APPROVED_DIRECTORY",
-            ]:
-                os.environ.pop(key, None)
+    config = load_config(env="production")
+    assert config.debug is False
+    assert config.development_mode is False
+    assert config.log_level == "INFO"
 
 
 def test_load_config_does_not_log_api_keys(tmp_path):

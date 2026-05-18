@@ -130,15 +130,16 @@ async def validate_message_content(
             )
             return False, "Command injection attempt"
 
-    # Check for path traversal attempts
+    # Check for path traversal attempts. These patterns intentionally
+    # require a command-like context (start of message, separator, or a
+    # cd/rm/cat-style command prefix) so legitimate references such as
+    # "see ../README.md" or "/etc/hosts is documented in ..." are not
+    # blocked. The authoritative path check still happens in
+    # ``SecurityValidator.validate_path`` for actual file operations.
     path_traversal_patterns = [
-        r"\.\./.*",
-        r"~\/.*",
-        r"\/etc\/.*",
-        r"\/var\/.*",
-        r"\/usr\/.*",
-        r"\/sys\/.*",
-        r"\/proc\/.*",
+        r"(?:^|[;&|]|\b(?:cd|cat|rm|mv|cp|ls|less|head|tail)\s+)\.\./",
+        r"(?:^|[;&|]\s*)~/",
+        r"(?:^|[;&|]|\b(?:cd|cat|rm|mv|cp|ls|less|head|tail)\s+)/(?:etc|var|usr|sys|proc)/",
     ]
 
     for pattern in path_traversal_patterns:

@@ -35,21 +35,25 @@ class SQLiteSessionStorage(SessionStorage):
             user_exists = await cursor.fetchone()
 
             if not user_exists:
-                # Create user record
+                # Create user record. ``is_allowed`` defaults to FALSE in
+                # the schema — authorization is granted by the
+                # ``AuthenticationManager`` (whitelist/token providers),
+                # not by the act of creating a session record. Leaving it
+                # FALSE here prevents this code path from acting as an
+                # implicit allowlist bypass.
                 now = datetime.now(UTC)
                 await conn.execute(
                     """
                     INSERT INTO users
-                    (user_id, telegram_username, first_seen, last_active, is_allowed)
-                    VALUES (?, ?, ?, ?, ?)
+                    (user_id, telegram_username, first_seen, last_active)
+                    VALUES (?, ?, ?, ?)
                     """,
                     (
                         user_id,
                         username,
                         now,
                         now,
-                        True,
-                    ),  # Allow user by default for now
+                    ),
                 )
                 await conn.commit()
 

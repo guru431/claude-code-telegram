@@ -4,9 +4,20 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
+from typing import Any
 
 from src.storage.facade import Storage
 from src.utils.constants import MAX_SESSION_LENGTH
+
+
+def _iso(value: Any) -> str | None:
+    """Best-effort ISO-8601 string for a datetime or pre-formatted value."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    # Already a string (or other primitive) — return as-is.
+    return str(value)
 
 
 class ExportFormat(Enum):
@@ -145,12 +156,11 @@ class SessionExporter:
             "session": {
                 "id": session["id"],
                 "user_id": session["user_id"],
-                "created_at": session["created_at"].isoformat(),
-                "updated_at": (
-                    session.get("updated_at", "").isoformat()
-                    if session.get("updated_at")
-                    else None
-                ),
+                # Storage may return either ``datetime`` objects or
+                # already-formatted ISO strings depending on adapter
+                # configuration; ``_iso`` accepts both.
+                "created_at": _iso(session.get("created_at")),
+                "updated_at": _iso(session.get("updated_at")),
                 "message_count": len(messages),
             },
             "messages": [
@@ -158,7 +168,7 @@ class SessionExporter:
                     "id": msg["id"],
                     "role": msg["role"],
                     "content": msg["content"],
-                    "created_at": msg["created_at"].isoformat(),
+                    "created_at": _iso(msg.get("created_at")),
                 }
                 for msg in messages
             ],

@@ -91,7 +91,7 @@ class NotificationService:
 
     async def _rate_limited_send(self, chat_id: int, event: AgentResponseEvent) -> None:
         """Send message with per-chat rate limiting."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         now = loop.time()
         last_send = self._last_send_per_chat.get(chat_id, 0.0)
         wait_time = SEND_INTERVAL_SECONDS - (now - last_send)
@@ -110,7 +110,7 @@ class NotificationService:
                     text=chunk,
                     parse_mode=(ParseMode.HTML if event.parse_mode == "HTML" else None),
                 )
-                self._last_send_per_chat[chat_id] = asyncio.get_event_loop().time()
+                self._last_send_per_chat[chat_id] = loop.time()
 
                 # Rate limit between chunks too
                 if len(chunks) > 1:

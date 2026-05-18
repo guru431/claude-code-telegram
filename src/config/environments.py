@@ -3,6 +3,20 @@
 from typing import Any, Dict
 
 
+def _annotated_fields(cls: type) -> Dict[str, Any]:
+    """Return ``{name: value}`` for each annotated field on *cls*.
+
+    Driving the dict from ``__annotations__`` means subclasses can add
+    type-annotated overrides without explicit values being filtered out
+    by ``cls.__dict__`` lookups, and annotations-only fields (without a
+    default value) are still picked up via ``getattr`` if present on a
+    parent class.
+    """
+    return {
+        name: getattr(cls, name) for name in cls.__annotations__ if hasattr(cls, name)
+    }
+
+
 class DevelopmentConfig:
     """Development environment overrides."""
 
@@ -16,13 +30,7 @@ class DevelopmentConfig:
     @classmethod
     def as_dict(cls) -> Dict[str, Any]:
         """Return config as dictionary."""
-        return {
-            key: value
-            for key, value in cls.__dict__.items()
-            if not key.startswith("_")
-            and not callable(value)
-            and not isinstance(value, classmethod)
-        }
+        return _annotated_fields(cls)
 
 
 class TestingConfig:
@@ -40,13 +48,7 @@ class TestingConfig:
     @classmethod
     def as_dict(cls) -> Dict[str, Any]:
         """Return config as dictionary."""
-        return {
-            key: value
-            for key, value in cls.__dict__.items()
-            if not key.startswith("_")
-            and not callable(value)
-            and not isinstance(value, classmethod)
-        }
+        return _annotated_fields(cls)
 
 
 class ProductionConfig:
@@ -65,10 +67,4 @@ class ProductionConfig:
     @classmethod
     def as_dict(cls) -> Dict[str, Any]:
         """Return config as dictionary."""
-        return {
-            key: value
-            for key, value in cls.__dict__.items()
-            if not key.startswith("_")
-            and not callable(value)
-            and not isinstance(value, classmethod)
-        }
+        return _annotated_fields(cls)

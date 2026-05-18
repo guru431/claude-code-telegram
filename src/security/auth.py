@@ -12,7 +12,7 @@ import secrets
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional
 
 import structlog
 
@@ -25,17 +25,25 @@ logger = structlog.get_logger()
 
 @dataclass
 class UserSession:
-    """User session data."""
+    """User session data.
+
+    ``last_activity`` may be omitted at construction; when absent it is
+    populated from ``created_at`` in ``__post_init__``. We use a sentinel
+    rather than ``Optional[datetime]`` so callers (and type checkers)
+    can treat it as a plain ``datetime``.
+    """
+
+    _UNSET: ClassVar[datetime] = datetime.min.replace(tzinfo=UTC)
 
     user_id: int
     auth_provider: str
     created_at: datetime
-    last_activity: datetime
+    last_activity: datetime = _UNSET
     user_info: Optional[Dict[str, Any]] = None
     session_timeout: timedelta = timedelta(hours=24)
 
     def __post_init__(self) -> None:
-        if self.last_activity is None:
+        if self.last_activity is UserSession._UNSET:
             self.last_activity = self.created_at
 
     def is_expired(self) -> bool:

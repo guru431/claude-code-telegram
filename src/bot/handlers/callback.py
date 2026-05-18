@@ -11,6 +11,7 @@ from ...claude.facade import ClaudeIntegration
 from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
+from ..features.session_export import ExportFormat
 from ..utils.html_format import escape_html
 
 logger = structlog.get_logger()
@@ -1258,9 +1259,21 @@ async def handle_export_callback(
             parse_mode="HTML",
         )
 
-        # Export session
+        # Export session. ``SessionExporter.export_session`` expects
+        # ``(user_id, session_id, format)`` with an :class:`ExportFormat`
+        # enum value, not a raw string.
+        try:
+            fmt = ExportFormat(export_format)
+        except ValueError:
+            await query.edit_message_text(
+                f"❌ <b>Unsupported export format: {escape_html(export_format)}</b>",
+                parse_mode="HTML",
+            )
+            return
         exported_session = await session_exporter.export_session(
-            claude_session_id, export_format
+            user_id=user_id,
+            session_id=claude_session_id,
+            format=fmt,
         )
 
         # Send the exported file

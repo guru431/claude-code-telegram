@@ -37,6 +37,11 @@ class RateLimitBucket:
             return True
         return False
 
+    def can_consume(self, tokens: int = 1) -> bool:
+        """Return True if *tokens* are available, without consuming them."""
+        self._refill()
+        return self.tokens >= tokens
+
     def _refill(self) -> None:
         """Refill tokens based on time passed."""
         now = datetime.now(UTC)
@@ -126,10 +131,15 @@ class RateLimiter:
     def _check_request_rate(
         self, user_id: int, tokens: int
     ) -> Tuple[bool, Optional[str]]:
-        """Check request rate limit."""
+        """Check request rate limit without consuming tokens.
+
+        Consumption happens later via ``_consume_request_tokens`` only
+        after the cost check has also succeeded — otherwise a cost-limit
+        rejection would still bill the user a rate-limit token.
+        """
         bucket = self._get_or_create_bucket(user_id)
 
-        if bucket.consume(tokens):
+        if bucket.can_consume(tokens):
             return True, None
 
         wait_time = bucket.get_wait_time(tokens)

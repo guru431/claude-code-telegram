@@ -9,7 +9,9 @@ Features:
 """
 
 import shutil
+import sys
 import tarfile
+import tempfile
 import uuid
 import zipfile
 from collections import defaultdict
@@ -21,6 +23,9 @@ from telegram import Document
 
 from src.config import Settings
 from src.security.validators import SecurityValidator
+
+# Hard limit on number of files in an archive (zip-bomb mitigation).
+MAX_ARCHIVE_FILES = 10000
 
 
 @dataclass
@@ -50,7 +55,7 @@ class FileHandler:
     def __init__(self, config: Settings, security: SecurityValidator):
         self.config = config
         self.security = security
-        self.temp_dir = Path("/tmp/claude_bot_files")
+        self.temp_dir = Path(tempfile.gettempdir()) / "claude_bot_files"
         self.temp_dir.mkdir(exist_ok=True)
 
         # Supported code extensions
@@ -198,10 +203,17 @@ class FileHandler:
         extract_dir.mkdir()
 
         try:
+            extract_dir_resolved = extract_dir.resolve()
+
             # Extract based on type
             if archive_path.suffix == ".zip":
                 with zipfile.ZipFile(archive_path) as zf:
                     # Security check - prevent zip bombs
+                    if len(zf.filelist) > MAX_ARCHIVE_FILES:
+                        raise ValueError(
+                            f"Archive contains too many files "
+                            f"(>{MAX_ARCHIVE_FILES})"
+                        )
                     total_size = sum(f.file_size for f in zf.filelist)
                     if total_size > 100 * 1024 * 1024:  # 100MB limit
                         raise ValueError("Archive too large")
@@ -213,8 +225,16 @@ class FileHandler:
                         if file_path.is_absolute() or ".." in file_path.parts:
                             continue
 
-                        # Extract file
+                        # Defense-in-depth: resolve and verify boundary so
+                        # exotic Windows drive prefixes and symlink targets
+                        # cannot escape extract_dir.
                         target_path = extract_dir / file_path
+                        resolved_target = target_path.resolve()
+                        try:
+                            resolved_target.relative_to(extract_dir_resolved)
+                        except ValueError:
+                            continue
+
                         target_path.parent.mkdir(parents=True, exist_ok=True)
 
                         with (
@@ -225,18 +245,46 @@ class FileHandler:
 
             elif archive_path.suffix in {".tar", ".gz", ".bz2", ".xz"}:
                 with tarfile.open(archive_path) as tf:
+                    members = tf.getmembers()
+                    if len(members) > MAX_ARCHIVE_FILES:
+                        raise ValueError(
+                            f"Archive contains too many files "
+                            f"(>{MAX_ARCHIVE_FILES})"
+                        )
                     # Security checks
-                    total_size = sum(member.size for member in tf.getmembers())
+                    total_size = sum(member.size for member in members)
                     if total_size > 100 * 1024 * 1024:  # 100MB limit
                         raise ValueError("Archive too large")
 
-                    # Extract with security checks
-                    for member in tf.getmembers():
-                        # Prevent path traversal
+                    # Extract with security checks. PEP 706 added the
+                    # ``filter='data'`` argument in Python 3.12 — use it
+                    # when available; otherwise manually reject absolute
+                    # paths, parent-directory escapes and symlinks (where
+                    # linkname could point outside the extraction dir).
+                    use_data_filter = sys.version_info >= (3, 12)
+                    for member in members:
+                        # Prevent path traversal via name
                         if member.name.startswith("/") or ".." in member.name:
                             continue
+                        # Manually validate link targets for sym/hard links
+                        if member.issym() or member.islnk():
+                            linkname = member.linkname or ""
+                            if (
+                                not linkname
+                                or linkname.startswith("/")
+                                or ".." in linkname.split("/")
+                            ):
+                                continue
+                            if not use_data_filter:
+                                # Without filter='data' we cannot safely
+                                # extract a link — skip rather than risk
+                                # escape on older Python.
+                                continue
 
-                        tf.extract(member, extract_dir)
+                        if use_data_filter:
+                            tf.extract(member, extract_dir, filter="data")
+                        else:
+                            tf.extract(member, extract_dir)
 
             # Analyze contents
             file_tree = self._build_file_tree(extract_dir)

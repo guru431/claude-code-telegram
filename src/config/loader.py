@@ -78,8 +78,14 @@ def load_config(
 
 
 def _apply_environment_overrides(settings: Settings, env: Optional[str]) -> Settings:
-    """Apply environment-specific configuration overrides."""
-    overrides = {}
+    """Apply environment-specific configuration overrides.
+
+    Fields that were explicitly set via environment variables (and thus
+    appear in ``model_fields_set``) take precedence over environment
+    defaults — otherwise setting e.g. ``RATE_LIMIT_REQUESTS=20`` with
+    ``ENVIRONMENT=production`` would silently get clobbered.
+    """
+    overrides: dict[str, Any] = {}
 
     if env == "development":
         overrides = DevelopmentConfig.as_dict()
@@ -90,8 +96,17 @@ def _apply_environment_overrides(settings: Settings, env: Optional[str]) -> Sett
     else:
         logger.warning("Unknown environment, using default settings", environment=env)
 
+    explicitly_set: set[str] = getattr(settings, "model_fields_set", set())
+
     # Apply overrides
     for key, value in overrides.items():
+        if key in explicitly_set:
+            logger.debug(
+                "Skipping environment override for explicitly-set field",
+                key=key,
+                environment=env,
+            )
+            continue
         if hasattr(settings, key):
             setattr(settings, key, value)
             logger.debug(

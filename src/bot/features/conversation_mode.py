@@ -24,6 +24,7 @@ Usage:
     keyboard = enhancer.create_follow_up_keyboard(suggestions)
 """
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -268,8 +269,12 @@ class ConversationEnhancer:
 
         # Add suggestion buttons (max 4, in rows of 1 for better mobile experience)
         for suggestion in suggestions[:4]:
-            # Create a shorter hash for callback data
-            suggestion_hash = str(hash(suggestion) % 1000000)
+            # Stable hash so callback_data stays valid across bot restarts;
+            # builtin ``hash()`` is randomized via PYTHONHASHSEED and would
+            # produce a different value each run.
+            suggestion_hash = hashlib.sha256(suggestion.encode("utf-8")).hexdigest()[
+                :12
+            ]
             keyboard.append(
                 [
                     InlineKeyboardButton(

@@ -68,19 +68,36 @@ _SECRET_PATTERNS: List[re.Pattern[str]] = [
     ),
     # Bearer / Basic auth headers
     re.compile(r"(Bearer )[A-Za-z0-9+/_.:-]{8,}" r"|(Basic )[A-Za-z0-9+/=]{8,}"),
-    # Connection strings with credentials  user:pass@host
-    re.compile(r"://([^:]+:)[^@]{4,}(@)"),
+    # Connection strings with credentials  scheme://user:pass@host
+    # Two outer capture groups preserve the `scheme://user:` prefix and
+    # the `@host` suffix; the password between them is redacted.
+    re.compile(r"(://[^:/\s]+:)[^@\s]{4,}(@[^\s]+)"),
 ]
+
+
+def _redact_match(match: "re.Match[str]") -> str:
+    """Replace a matched secret while preserving structural groups.
+
+    The patterns in :data:`_SECRET_PATTERNS` use capture groups for the
+    non-secret prefix (e.g. ``"Bearer "``, ``"sk-abc"``) and, where
+    relevant, a trailing suffix (``"@host"`` for connection strings).
+    We concatenate all non-None groups around a ``***`` placeholder so
+    that the redacted output keeps the surrounding context legible.
+    """
+    groups = [g for g in match.groups() if g is not None]
+    if not groups:
+        return "***"
+    if len(groups) == 1:
+        return f"{groups[0]}***"
+    # Two-group case: prefix + suffix wrap the redacted secret.
+    return f"{groups[0]}***{groups[1]}"
 
 
 def _redact_secrets(text: str) -> str:
     """Replace likely secrets/credentials with redacted placeholders."""
     result = text
     for pattern in _SECRET_PATTERNS:
-        result = pattern.sub(
-            lambda m: next((g + "***" for g in m.groups() if g is not None), "***"),
-            result,
-        )
+        result = pattern.sub(_redact_match, result)
     return result
 
 
@@ -1652,9 +1669,7 @@ class MessageOrchestrator:
                 display_path = Path(sess.cwd).name or sess.cwd
 
             short_id = sess.session_id[:8]
-            mtime = datetime.fromtimestamp(
-                sess.jsonl_path.stat().st_mtime, tz=UTC
-            )
+            mtime = datetime.fromtimestamp(sess.jsonl_path.stat().st_mtime, tz=UTC)
             age = datetime.now(UTC) - mtime
             if age.days > 0:
                 age_str = f"{age.days}d ago"

@@ -136,7 +136,10 @@ async def cost_tracking_middleware(
     This middleware runs after the main handler to track
     actual costs incurred during processing.
     """
-    user_id = event.from_user.id
+    effective_user = getattr(event, "effective_user", None)
+    if not effective_user:
+        return await handler(event, data)
+    user_id = effective_user.id
     rate_limiter = data.get("rate_limiter")
 
     # Store start time for duration tracking
@@ -187,7 +190,13 @@ async def burst_protection_middleware(
     This middleware provides an additional layer of protection
     against burst attacks that might bypass normal rate limiting.
     """
-    user_id = event.from_user.id
+    # ``event.from_user`` is missing for non-message updates (e.g. inline
+    # callback queries on channel posts); fall back to ``effective_user``
+    # so we never raise AttributeError on such updates.
+    effective_user = getattr(event, "effective_user", None)
+    if not effective_user:
+        return await handler(event, data)
+    user_id = effective_user.id
 
     # Get or create burst tracker
     burst_tracker = data.setdefault("burst_tracker", {})

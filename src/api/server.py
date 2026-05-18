@@ -4,6 +4,7 @@ Runs in the same process as the bot, sharing the event loop.
 Receives external webhooks and publishes them as events on the bus.
 """
 
+import json
 import uuid
 from typing import Any, Dict, Optional
 
@@ -83,9 +84,10 @@ def create_api_app(
             event_type_name = request.headers.get("X-Event-Type", "unknown")
             delivery_id = request.headers.get("X-Delivery-ID", str(uuid.uuid4()))
 
-        # Parse JSON payload
+        # Parse JSON payload from the already-buffered body so we do not
+        # re-read the request stream after signature verification.
         try:
-            payload: Dict[str, Any] = await request.json()
+            payload: Dict[str, Any] = json.loads(body)
         except Exception:
             payload = {"raw_body": body.decode("utf-8", errors="replace")[:5000]}
 
@@ -147,8 +149,6 @@ async def _try_record_webhook(
     If the row already exists the insert is a no-op and changes() == 0.
     Returns True if the event is new (inserted), False if duplicate.
     """
-    import json
-
     async with db_manager.get_connection() as conn:
         await conn.execute(
             """

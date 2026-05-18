@@ -4,8 +4,15 @@ Runs as a stdio transport server. The ``send_image_to_user`` tool validates
 file existence and extension, then returns a success string. Actual Telegram
 delivery is handled by the bot's stream callback which intercepts the tool
 call.
+
+If ``APPROVED_DIRECTORY`` is set in the environment, the tool additionally
+rejects paths that resolve outside of it. The bot's stream callback already
+re-validates the path via :func:`bot.utils.image_extractor.validate_image_path`
+before sending; this check is a defense-in-depth measure for cases where the
+MCP server is reachable independently of the bot.
 """
 
+import os
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -13,6 +20,17 @@ from mcp.server.fastmcp import FastMCP
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 
 mcp = FastMCP("telegram")
+
+
+def _approved_directory() -> Path | None:
+    """Return the configured approved directory, if any."""
+    value = os.environ.get("APPROVED_DIRECTORY")
+    if not value:
+        return None
+    try:
+        return Path(value).resolve()
+    except OSError:
+        return None
 
 
 @mcp.tool()
@@ -39,6 +57,16 @@ async def send_image_to_user(file_path: str, caption: str = "") -> str:
 
     if not path.is_file():
         return f"Error: file not found: {file_path}"
+
+    approved = _approved_directory()
+    if approved is not None:
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(approved)
+        except (OSError, ValueError):
+            return (
+                "Error: file is outside the approved directory and cannot " "be sent."
+            )
 
     return f"Image queued for delivery: {path.name}"
 
