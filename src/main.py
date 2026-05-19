@@ -24,7 +24,11 @@ from src.events.handlers import AgentHandler
 from src.events.middleware import EventSecurityMiddleware
 from src.exceptions import ConfigurationError
 from src.notifications.service import NotificationService
-from src.projects import ProjectThreadManager, discover_new_projects, load_project_registry
+from src.projects import (
+    ProjectThreadManager,
+    discover_new_projects,
+    load_project_registry,
+)
 from src.scheduler.scheduler import JobScheduler
 from src.security.audit import AuditLogger, InMemoryAuditStorage
 from src.security.auth import (
@@ -228,6 +232,11 @@ async def run_application(app: Dict[str, Any]) -> None:
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+    # On Windows, SIGTERM does not invoke Python-level handlers — it is a
+    # hard termination. SIGBREAK (CTRL_BREAK_EVENT) does, so we register the
+    # same handler against it for /restart on Windows.
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, signal_handler)
 
     try:
         logger.info("Starting Claude Code Telegram Bot")
@@ -381,9 +390,7 @@ async def run_application(app: Dict[str, Any]) -> None:
                         chat_id = config.project_threads_chat_id
                     else:
                         chat_id = (
-                            config.allowed_users[0]
-                            if config.allowed_users
-                            else None
+                            config.allowed_users[0] if config.allowed_users else None
                         )
                     if chat_id:
                         sync_result = await fresh_manager.sync_topics(

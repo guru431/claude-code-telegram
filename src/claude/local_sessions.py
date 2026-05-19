@@ -7,7 +7,6 @@ started outside of the bot (e.g. in VS Code or the CLI).
 """
 
 import json
-import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -44,6 +43,13 @@ def _claude_projects_dir() -> Path:
     return Path.home() / ".claude" / "projects"
 
 
+# Maximum bytes we will read per JSONL line. A malformed or hostile file with
+# a single multi-MB line could otherwise cause Python to load it whole into
+# memory just to discard most of it. 4 MiB is comfortably above the largest
+# legitimate Claude session prompts we observe.
+_MAX_LINE_BYTES = 4 * 1024 * 1024
+
+
 def _parse_session_head(jsonl_path: Path) -> Optional[dict]:
     """Read session metadata and the first user message from a JSONL file.
 
@@ -54,12 +60,24 @@ def _parse_session_head(jsonl_path: Path) -> Optional[dict]:
     try:
         result: Optional[dict] = None
         first_message = ""
-        with open(jsonl_path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
+        # Open in binary mode and read up to _MAX_LINE_BYTES per line so a
+        # single oversize line can't be used to DoS the bot.
+        with open(jsonl_path, "rb") as fh:
+            for raw in fh:
+                if len(raw) > _MAX_LINE_BYTES:
+                    # Skip pathologically long lines rather than abort the
+                    # whole scan — other lines may still be useful.
+                    continue
+                try:
+                    line = raw.decode("utf-8").strip()
+                except UnicodeDecodeError:
+                    continue
                 if not line:
                     continue
-                obj = json.loads(line)
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
                 if result is None:
                     result = obj
                 # Look for the first user message
@@ -193,9 +211,7 @@ def list_all_local_sessions(limit: int = 20) -> List[LocalSession]:
             try:
                 ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
             except (ValueError, AttributeError):
-                ts = datetime.fromtimestamp(
-                    entry.stat().st_mtime, tz=UTC
-                )
+                ts = datetime.fromtimestamp(entry.stat().st_mtime, tz=UTC)
 
             all_sessions.append(
                 LocalSession(
@@ -208,7 +224,5 @@ def list_all_local_sessions(limit: int = 20) -> List[LocalSession]:
             )
 
     # Sort by file modification time, newest first
-    all_sessions.sort(
-        key=lambda s: s.jsonl_path.stat().st_mtime, reverse=True
-    )
+    all_sessions.sort(key=lambda s: s.jsonl_path.stat().st_mtime, reverse=True)
     return all_sessions[:limit]

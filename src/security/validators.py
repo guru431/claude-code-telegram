@@ -22,9 +22,12 @@ logger = structlog.get_logger()
 class SecurityValidator:
     """Security validation for user inputs."""
 
-    # Dangerous patterns for path traversal and injection
+    # Dangerous patterns for path traversal and injection.
+    # NOTE: r"\.\." matches the literal two-character sequence "..": both dots
+    # are escaped, so this is not a wildcard. Keep the explicit escape so the
+    # intent is unambiguous to readers and static analyzers.
     DANGEROUS_PATTERNS = [
-        r"\.\.",  # Parent directory
+        r"\.\.",  # Parent directory (literal "..")
         r"~",  # Home directory expansion
         r"\$\{",  # Variable expansion ${...}
         r"\$\(",  # Command substitution $(...)
@@ -136,6 +139,10 @@ class SecurityValidator:
         self, approved_directory: Path, disable_security_patterns: bool = False
     ):
         """Initialize validator with approved directory."""
+        # Keep the raw configured path so we can re-resolve on every check —
+        # this prevents the cached value from going stale if the directory is
+        # replaced with a symlink, or moved/recreated at runtime.
+        self._approved_directory_raw = approved_directory
         self.approved_directory = approved_directory.resolve()
         self.disable_security_patterns = disable_security_patterns
         logger.info(
@@ -143,6 +150,15 @@ class SecurityValidator:
             approved_directory=str(self.approved_directory),
             disable_security_patterns=self.disable_security_patterns,
         )
+
+    def _current_approved_directory(self) -> Path:
+        """Re-resolve the approved directory at call time to defeat stale-symlink
+        attacks where the original target is replaced after startup.
+        """
+        try:
+            return self._approved_directory_raw.resolve()
+        except OSError:
+            return self.approved_directory
 
     def validate_path(
         self, user_path: str, current_dir: Optional[Path] = None
@@ -174,8 +190,13 @@ class SecurityValidator:
                             f"Invalid path: contains forbidden pattern '{pattern}'",
                         )
 
+            # Resolve approved_directory fresh on each call so that swapping
+            # the underlying directory for a symlink after startup does not
+            # silently broaden the allow-list. (Stale-value mitigation.)
+            current_approved = self._current_approved_directory()
+
             # Handle path resolution
-            current_dir = current_dir or self.approved_directory
+            current_dir = current_dir or current_approved
 
             if user_path.startswith("/"):
                 # Absolute path - use as-is
@@ -191,12 +212,12 @@ class SecurityValidator:
             target = target.resolve()
 
             # Ensure target is within approved directory
-            if not self._is_within_directory(target, self.approved_directory):
+            if not self._is_within_directory(target, current_approved):
                 logger.warning(
                     "Path traversal attempt detected",
                     requested_path=user_path,
                     resolved_path=str(target),
-                    approved_directory=str(self.approved_directory),
+                    approved_directory=str(current_approved),
                 )
                 return False, None, "Access denied: path outside approved directory"
 
@@ -214,7 +235,7 @@ class SecurityValidator:
                     error=str(e),
                 )
                 return False, None, "Invalid path"
-            if not self._is_within_directory(real_target, self.approved_directory):
+            if not self._is_within_directory(real_target, current_approved):
                 logger.warning(
                     "Symlink target outside approved directory",
                     requested_path=user_path,

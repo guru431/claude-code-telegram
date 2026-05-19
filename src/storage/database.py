@@ -12,7 +12,7 @@ import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterator, List, Tuple
+from typing import AsyncIterator, List, Optional, Tuple
 
 import aiosqlite
 import structlog
@@ -140,9 +140,13 @@ class DatabaseManager:
     def __init__(self, database_url: str):
         """Initialize database manager."""
         self.database_path = self._parse_database_url(database_url)
-        self._connection_pool = []
+        self._connection_pool: List[aiosqlite.Connection] = []
         self._pool_size = 5
         self._pool_lock = asyncio.Lock()
+        # Semaphore caps concurrent borrows at _pool_size so we never end up
+        # with more live connections than the configured pool size, even on
+        # a burst. Initialised lazily in initialize() once _pool_size is fixed.
+        self._pool_semaphore: Optional[asyncio.Semaphore] = None
 
     def _parse_database_url(self, database_url: str) -> Path:
         """Parse database URL to path."""
@@ -194,13 +198,11 @@ class DatabaseManager:
 
     async def _get_schema_version(self, conn: aiosqlite.Connection) -> int:
         """Get current schema version."""
-        await conn.execute(
-            """
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER PRIMARY KEY
             )
-        """
-        )
+        """)
 
         cursor = await conn.execute("SELECT MAX(version) FROM schema_version")
         row = await cursor.fetchone()
@@ -283,8 +285,10 @@ class DatabaseManager:
                 CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_active
                     ON scheduled_jobs(is_active);
 
-                -- Enable WAL mode for better concurrent write performance
-                PRAGMA journal_mode=WAL;
+                -- NOTE: PRAGMA journal_mode=WAL is enabled in DatabaseManager.
+                -- _init_pool() via a dedicated connection — it cannot run
+                -- inside a transaction. It persists across opens so we only
+                -- need to set it once.
                 """,
             ),
             (
@@ -316,6 +320,16 @@ class DatabaseManager:
         """Initialize connection pool."""
         logger.info("Initializing connection pool", size=self._pool_size)
 
+        # WAL must be set OUTSIDE any open transaction and persists across
+        # opens, so we set it once via a one-shot connection here.
+        try:
+            async with aiosqlite.connect(self.database_path) as conn:
+                await conn.execute("PRAGMA journal_mode=WAL")
+        except Exception as e:
+            # Non-fatal: fall back to default journal_mode (DELETE).
+            logger.warning("Failed to enable WAL journal mode", error=str(e))
+
+        self._pool_semaphore = asyncio.Semaphore(self._pool_size)
         async with self._pool_lock:
             for _ in range(self._pool_size):
                 conn = await aiosqlite.connect(
@@ -327,25 +341,50 @@ class DatabaseManager:
 
     @asynccontextmanager
     async def get_connection(self) -> AsyncIterator[aiosqlite.Connection]:
-        """Get database connection from pool."""
-        async with self._pool_lock:
-            if self._connection_pool:
-                conn = self._connection_pool.pop()
-            else:
+        """Get database connection from pool.
+
+        Concurrent borrows are capped at ``_pool_size`` by an asyncio.Semaphore
+        so we never have more live connections than the pool can hold even
+        under burst load.
+        """
+        if self._pool_semaphore is None:
+            # Pool not yet initialised; emulate sequential behaviour by opening
+            # a transient connection. Should only happen during early startup.
+            transient_conn = await aiosqlite.connect(
+                self.database_path, detect_types=sqlite3.PARSE_DECLTYPES
+            )
+            transient_conn.row_factory = aiosqlite.Row
+            await transient_conn.execute("PRAGMA foreign_keys = ON")
+            try:
+                yield transient_conn
+            finally:
+                await transient_conn.close()
+            return
+
+        await self._pool_semaphore.acquire()
+        conn: Optional[aiosqlite.Connection] = None
+        try:
+            async with self._pool_lock:
+                if self._connection_pool:
+                    conn = self._connection_pool.pop()
+            if conn is None:
                 conn = await aiosqlite.connect(
                     self.database_path, detect_types=sqlite3.PARSE_DECLTYPES
                 )
                 conn.row_factory = aiosqlite.Row
                 await conn.execute("PRAGMA foreign_keys = ON")
 
-        try:
             yield conn
         finally:
-            async with self._pool_lock:
-                if len(self._connection_pool) < self._pool_size:
-                    self._connection_pool.append(conn)
-                else:
+            released = False
+            if conn is not None:
+                async with self._pool_lock:
+                    if len(self._connection_pool) < self._pool_size:
+                        self._connection_pool.append(conn)
+                        released = True
+                if not released:
                     await conn.close()
+            self._pool_semaphore.release()
 
     async def close(self):
         """Close all connections in pool."""

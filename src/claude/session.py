@@ -141,12 +141,17 @@ class SessionManager:
         if session_id and session_id in self.active_sessions:
             session = self.active_sessions[session_id]
             if session.user_id != user_id:
+                # Ownership mismatch is a hard security boundary — never serve
+                # another user's cached session. Falling through to load_session
+                # already filters by user_id at the DB layer, but we still drop
+                # the requested session_id so we don't lazily re-attach to it.
                 logger.warning(
                     "Session ownership mismatch in active cache",
                     session_id=session_id,
                     session_owner=session.user_id,
                     requesting_user=user_id,
                 )
+                session_id = None
             elif not session.is_expired(self.config.session_timeout_hours):
                 logger.debug("Using active session", session_id=session_id)
                 return session

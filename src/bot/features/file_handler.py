@@ -227,19 +227,26 @@ class FileHandler:
 
                         # Defense-in-depth: resolve and verify boundary so
                         # exotic Windows drive prefixes and symlink targets
-                        # cannot escape extract_dir.
+                        # cannot escape extract_dir. Resolve the *parent*
+                        # rather than the target itself, then re-join, so we
+                        # write through the verified parent and avoid any
+                        # TOCTOU between resolve() and open().
                         target_path = extract_dir / file_path
-                        resolved_target = target_path.resolve()
+                        parent_dir = target_path.parent
+                        parent_dir.mkdir(parents=True, exist_ok=True)
+                        resolved_parent = parent_dir.resolve()
                         try:
-                            resolved_target.relative_to(extract_dir_resolved)
+                            resolved_parent.relative_to(extract_dir_resolved)
                         except ValueError:
                             continue
 
-                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        # Now build the write path using the resolved parent
+                        # so the open() can't follow a symlink outside.
+                        safe_target = resolved_parent / target_path.name
 
                         with (
                             zf.open(file_info) as source,
-                            open(target_path, "wb") as target,
+                            open(safe_target, "wb") as target,
                         ):
                             shutil.copyfileobj(source, target)
 
@@ -260,7 +267,10 @@ class FileHandler:
                     # ``filter='data'`` argument in Python 3.12 — use it
                     # when available; otherwise manually reject absolute
                     # paths, parent-directory escapes and symlinks (where
-                    # linkname could point outside the extraction dir).
+                    # linkname could point outside the extraction dir),
+                    # AND verify post-extract that resolved path is inside
+                    # extract_dir (catches paths like 'foo/../../etc' that
+                    # the substring check misses).
                     use_data_filter = sys.version_info >= (3, 12)
                     for member in members:
                         # Prevent path traversal via name
@@ -284,7 +294,30 @@ class FileHandler:
                         if use_data_filter:
                             tf.extract(member, extract_dir, filter="data")
                         else:
+                            # Defense-in-depth path resolution before extract
+                            # to defeat 'foo/../../etc' style traversal that
+                            # naive substring checks miss. Also guards against
+                            # symlinks pre-existing in extract_dir (we created
+                            # it fresh, so this is belt-and-braces).
+                            target_path = (extract_dir / member.name).resolve()
+                            try:
+                                target_path.relative_to(extract_dir_resolved)
+                            except ValueError:
+                                continue
                             tf.extract(member, extract_dir)
+                            # Post-extract check: confirm the just-written file
+                            # still lives inside extract_dir (re-resolves to
+                            # catch any race with concurrent symlink creation).
+                            try:
+                                extracted = (extract_dir / member.name).resolve()
+                                extracted.relative_to(extract_dir_resolved)
+                            except (ValueError, OSError):
+                                # Suspicious — try to remove and skip.
+                                try:
+                                    (extract_dir / member.name).unlink(missing_ok=True)
+                                except OSError:
+                                    pass
+                                continue
 
             # Analyze contents
             file_tree = self._build_file_tree(extract_dir)

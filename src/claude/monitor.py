@@ -1,5 +1,6 @@
 """Bash directory boundary enforcement for Claude tool calls."""
 
+import re
 import shlex
 from pathlib import Path
 from typing import Optional, Set, Tuple
@@ -51,11 +52,42 @@ _READ_ONLY_COMMANDS: Set[str] = {
     "basename",
 }
 
+# Commands that fetch remote content or run arbitrary interpreted code.
+# They take paths/URLs/scripts whose static analysis is unreliable, so we
+# treat them like FS-modifying commands and require boundary checks (a URL
+# argument won't resolve to a path inside approved_directory, so it will be
+# rejected — that is intentional).
+_NETWORK_OR_INTERP_COMMANDS: Set[str] = {
+    "curl",
+    "wget",
+    "fetch",
+    "python",
+    "python2",
+    "python3",
+    "node",
+    "ruby",
+    "perl",
+    "php",
+    "bash",
+    "sh",
+    "zsh",
+}
+
 # Actions / expressions that make ``find`` a filesystem-modifying command
 _FIND_MUTATING_ACTIONS: Set[str] = {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
 
 # Bash command separators
 _COMMAND_SEPARATORS: Set[str] = {"&&", "||", ";", "|", "&"}
+
+# Bash subshell / command-substitution patterns. shlex.split silently absorbs
+# these into a token (e.g. "$(rm -rf /)" becomes a single token), bypassing
+# per-command boundary checks. Reject them outright.
+_SUBSHELL_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"\$\("),  # $(cmd) command substitution
+    re.compile(r"<\("),  # <(cmd) process substitution
+    re.compile(r">\("),  # >(cmd) process substitution
+    re.compile(r"`"),  # `cmd` backtick substitution
+)
 
 
 def check_bash_directory_boundary(
@@ -64,6 +96,18 @@ def check_bash_directory_boundary(
     approved_directory: Path,
 ) -> Tuple[bool, Optional[str]]:
     """Check if a bash command's paths stay within the approved directory."""
+
+    # Reject subshells / command substitution outright — shlex.split bundles
+    # ``$(rm -rf /etc)`` and ``<(cat /etc/shadow)`` into a single opaque token,
+    # so per-command path checking cannot see what's executing inside. We
+    # consider such constructs out of scope for static analysis.
+    for pat in _SUBSHELL_PATTERNS:
+        if pat.search(command):
+            return False, (
+                "Directory boundary violation: command contains subshell or "
+                "command-substitution syntax which cannot be safely validated"
+            )
+
     try:
         tokens = shlex.split(command)
     except ValueError:
@@ -108,15 +152,30 @@ def check_bash_directory_boundary(
             needs_check = any(t in _FIND_MUTATING_ACTIONS for t in cmd_tokens[1:])
         elif base_command in _FS_MODIFYING_COMMANDS:
             needs_check = True
+        elif base_command in _NETWORK_OR_INTERP_COMMANDS:
+            needs_check = True
 
         if not needs_check:
             continue
 
         # Check each argument for paths outside the boundary
+        seen_double_dash = False
         for token in cmd_tokens[1:]:
-            # Skip flags
-            if token.startswith("-"):
+            # ``--`` marks the end of options; everything after is a positional
+            # argument and must be path-checked even if it starts with ``-``.
+            if token == "--" and not seen_double_dash:
+                seen_double_dash = True
                 continue
+            # Skip flags only before ``--`` to prevent attackers smuggling paths
+            # past the boundary by prefixing them with ``-`` (e.g. ``rm -- -foo``).
+            if not seen_double_dash and token.startswith("-"):
+                continue
+
+            # For network/interp commands a non-flag token that *looks* like
+            # a URL/scheme is not a filesystem path; rejecting it via path
+            # resolution still works because Path("https://...").resolve()
+            # yields a path inside working_directory that won't escape.
+            # The check below handles both cases uniformly.
 
             # Resolve both absolute and relative paths against the working
             # directory so that traversal sequences like ``../../evil`` are

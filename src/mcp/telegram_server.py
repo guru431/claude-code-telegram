@@ -55,20 +55,28 @@ async def send_image_to_user(file_path: str, caption: str = "") -> str:
             f"Supported: {', '.join(sorted(IMAGE_EXTENSIONS))}"
         )
 
-    if not path.is_file():
-        return f"Error: file not found: {file_path}"
+    # Resolve the path FIRST (follows symlinks, normalises ../) so subsequent
+    # existence and boundary checks always agree on the same final path. This
+    # closes the gap where is_file() and the boundary check might look at
+    # different paths (e.g. if the original was a symlink).
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError as e:
+        return f"Error: cannot resolve path '{file_path}': {e}"
 
     approved = _approved_directory()
     if approved is not None:
         try:
-            resolved = path.resolve()
             resolved.relative_to(approved)
-        except (OSError, ValueError):
+        except ValueError:
             return (
                 "Error: file is outside the approved directory and cannot " "be sent."
             )
 
-    return f"Image queued for delivery: {path.name}"
+    if not resolved.is_file():
+        return f"Error: file not found: {file_path}"
+
+    return f"Image queued for delivery: {resolved.name}"
 
 
 if __name__ == "__main__":

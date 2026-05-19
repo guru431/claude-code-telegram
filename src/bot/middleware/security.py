@@ -93,12 +93,14 @@ async def validate_message_content(
 ) -> tuple[bool, str]:
     """Validate message text content for security threats."""
 
-    # Check for command injection patterns
+    # Check for command injection patterns. The backtick pattern is scoped
+    # to *dangerous* commands inside backticks (rm/curl/wget/etc.) so users
+    # can still discuss code snippets using inline code formatting.
     dangerous_patterns = [
         r";\s*rm\s+",
         r";\s*del\s+",
         r";\s*format\s+",
-        r"`[^`]*`",
+        r"`[^`]*\b(?:rm|curl|wget|chmod|chown|nc|bash|sh)\s+[^`]*`",
         r"\$\([^)]*\)",
         r"&&\s*rm\s+",
         r"\|\s*mail\s+",
@@ -161,13 +163,16 @@ async def validate_message_content(
             )
             return False, "Path traversal attempt"
 
-    # Check for suspicious URLs or domains
+    # Check for suspicious URLs or domains.
+    # Note: blanket TLD blocks (.ru/.tk/.ml) produce too many false positives
+    # for a Russian-speaking userbase and any project hosted on legitimate
+    # ccTLDs. Restrict to URL-shortener-style obfuscation and inline-script
+    # schemes that have no business use case here.
     suspicious_patterns = [
-        r"https?://[^/]*\.ru/",
-        r"https?://[^/]*\.tk/",
-        r"https?://[^/]*\.ml/",
         r"https?://bit\.ly/",
         r"https?://tinyurl\.com/",
+        r"https?://t\.co/",
+        r"https?://goo\.gl/",
         r"javascript:",
         r"data:text/html",
     ]

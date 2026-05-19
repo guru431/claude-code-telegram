@@ -109,7 +109,13 @@ class TestClaudeSDKManager:
         return ClaudeSDKManager(config)
 
     async def test_sdk_manager_initialization_with_api_key(self, tmp_path):
-        """Test SDK manager initialization with API key."""
+        """SDK manager must NOT write the API key into ``os.environ``.
+
+        Writing it would leak the key to every subprocess of this bot
+        (including MCP servers and shell tools). Instead, the key is
+        passed to the Claude CLI via ``ClaudeAgentOptions.env`` at
+        command-execution time.
+        """
         from src.config.settings import Settings
 
         # Test with API key provided
@@ -121,21 +127,24 @@ class TestClaudeSDKManager:
             claude_timeout_seconds=2,
         )
 
-        # Store original env var
-        original_api_key = os.environ.get("ANTHROPIC_API_KEY")
+        # Snapshot pre-test state so we can assert it is unchanged.
+        pre_value = os.environ.get("ANTHROPIC_API_KEY")
 
         try:
-            ClaudeSDKManager(config_with_key)
+            manager = ClaudeSDKManager(config_with_key)
 
-            # Check that API key was set in environment
-            assert os.environ.get("ANTHROPIC_API_KEY") == "test-api-key"
+            # The key MUST NOT be pushed into the global environment.
+            assert os.environ.get("ANTHROPIC_API_KEY") == pre_value
+            # It MUST be available via the config for the CLI subprocess.
+            assert manager.config.anthropic_api_key_str == "test-api-key"
 
         finally:
-            # Restore original env var
-            if original_api_key:
-                os.environ["ANTHROPIC_API_KEY"] = original_api_key
-            elif "ANTHROPIC_API_KEY" in os.environ:
+            # Defensive: restore pre-test state in case a future regression
+            # starts writing to os.environ again.
+            if pre_value is None and "ANTHROPIC_API_KEY" in os.environ:
                 del os.environ["ANTHROPIC_API_KEY"]
+            elif pre_value is not None:
+                os.environ["ANTHROPIC_API_KEY"] = pre_value
 
     async def test_sdk_manager_initialization_without_api_key(self, config):
         """Test SDK manager initialization without API key (uses CLI auth)."""

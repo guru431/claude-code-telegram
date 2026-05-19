@@ -11,8 +11,11 @@ from ...claude.facade import ClaudeIntegration
 from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
-from ..features.session_export import ExportFormat
 from ..utils.html_format import escape_html
+
+# session_export is imported lazily inside the export callback to keep the
+# command/callback dispatch path lightweight — this module is the largest
+# handler file and is imported on every bot startup.
 
 logger = structlog.get_logger()
 
@@ -1262,6 +1265,8 @@ async def handle_export_callback(
         # Export session. ``SessionExporter.export_session`` expects
         # ``(user_id, session_id, format)`` with an :class:`ExportFormat`
         # enum value, not a raw string.
+        from ..features.session_export import ExportFormat  # lazy import
+
         try:
             fmt = ExportFormat(export_format)
         except ValueError:

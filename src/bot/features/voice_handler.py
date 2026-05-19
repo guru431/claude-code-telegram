@@ -68,7 +68,10 @@ class VoiceHandler:
                 "Please retry with a smaller voice message."
             )
 
-        # Download voice data
+        # Download voice data. ``_ensure_allowed_file_size`` enforces the
+        # final hard cap after the download completes, so a Telegram-side
+        # size mismatch (declared size < actual stream size) cannot push the
+        # bot into transcribing an over-limit payload.
         voice_bytes = bytes(await file.download_as_bytearray())
         self._ensure_allowed_file_size(len(voice_bytes))
 

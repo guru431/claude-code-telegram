@@ -46,6 +46,14 @@ class RateLimitBucket:
         """Refill tokens based on time passed."""
         now = datetime.now(UTC)
         elapsed = (now - self.last_update).total_seconds()
+        # Cap elapsed at the time needed to refill to full capacity. This
+        # avoids float-precision loss when a bucket sat idle for a very
+        # long time (elapsed * refill_rate would otherwise dwarf
+        # self.tokens and small additions would silently round away).
+        if self.refill_rate > 0:
+            max_useful_elapsed = (self.capacity * 2) / self.refill_rate
+            if elapsed > max_useful_elapsed:
+                elapsed = max_useful_elapsed
         self.tokens = min(self.capacity, self.tokens + (elapsed * self.refill_rate))
         self.last_update = now
 

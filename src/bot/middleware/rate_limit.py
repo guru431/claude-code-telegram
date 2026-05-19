@@ -198,15 +198,30 @@ async def burst_protection_middleware(
         return await handler(event, data)
     user_id = effective_user.id
 
-    # Get or create burst tracker
-    burst_tracker = data.setdefault("burst_tracker", {})
-    user_burst_data = burst_tracker.setdefault(
-        user_id, {"recent_requests": [], "warnings_sent": 0}
-    )
-
     import time
 
     current_time = time.time()
+
+    # Get or create burst tracker. The tracker accumulates one entry per user
+    # ever seen, so we periodically evict users that have gone idle to keep
+    # memory bounded under sustained traffic from many distinct users.
+    burst_tracker = data.setdefault("burst_tracker", {})
+    last_gc = data.get("_burst_tracker_last_gc", 0.0)
+    # GC at most once every 60s, and only when the tracker has grown.
+    if current_time - last_gc > 60 and len(burst_tracker) > 100:
+        idle_cutoff = current_time - 600  # 10 minutes idle → evict
+        stale_users = [
+            uid
+            for uid, ud in burst_tracker.items()
+            if not ud.get("recent_requests") or max(ud["recent_requests"]) < idle_cutoff
+        ]
+        for uid in stale_users:
+            burst_tracker.pop(uid, None)
+        data["_burst_tracker_last_gc"] = current_time
+
+    user_burst_data = burst_tracker.setdefault(
+        user_id, {"recent_requests": [], "warnings_sent": 0}
+    )
 
     # Clean old requests (older than 10 seconds)
     user_burst_data["recent_requests"] = [
@@ -217,6 +232,10 @@ async def burst_protection_middleware(
 
     # Add current request
     user_burst_data["recent_requests"].append(current_time)
+    # Hard cap: never let a single user's list grow beyond a sane bound even
+    # if the time-window filter glitches; we only need the last few entries.
+    if len(user_burst_data["recent_requests"]) > 200:
+        user_burst_data["recent_requests"] = user_burst_data["recent_requests"][-50:]
 
     # Check for burst (more than 5 requests in 10 seconds)
     if len(user_burst_data["recent_requests"]) > 5:

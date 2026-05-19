@@ -179,7 +179,15 @@ async def test_classic_bot_commands(classic_settings, deps):
 
 
 async def test_restart_command_sends_sigterm(deps):
-    """restart_command sends SIGTERM to the current process."""
+    """restart_command sends the platform-appropriate graceful-shutdown signal.
+
+    On POSIX this is SIGTERM. On Windows SIGTERM does not invoke Python's
+    registered signal handlers, so we send SIGBREAK (CTRL_BREAK_EVENT)
+    which does.
+    """
+    import os
+    import signal
+    import sys
     from unittest.mock import patch
 
     from src.bot.handlers.command import restart_command
@@ -194,10 +202,12 @@ async def test_restart_command_sends_sigterm(deps):
     with patch("src.bot.handlers.command.os.kill") as mock_kill:
         await restart_command(update, context)
 
-    import os
-    import signal
-
-    mock_kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
+    expected_sig = (
+        getattr(signal, "SIGBREAK", signal.SIGTERM)
+        if sys.platform == "win32"
+        else signal.SIGTERM
+    )
+    mock_kill.assert_called_once_with(os.getpid(), expected_sig)
     # Verify confirmation message was sent
     update.message.reply_text.assert_called_once()
     msg = update.message.reply_text.call_args[0][0]

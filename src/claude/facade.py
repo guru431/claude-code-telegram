@@ -97,8 +97,13 @@ class ClaudeIntegration:
                         failed_session_id=claude_session_id,
                         error=str(resume_error),
                     )
-                    # Clean up the stale session
-                    await self.session_manager.remove_session(session.session_id)
+                    # Clean up the stale session only if it has a real ID.
+                    # A new session that crashed before getting an ID from
+                    # Claude would have an empty session_id; calling
+                    # remove_session("") would no-op against storage but
+                    # still mutate the in-memory cache unexpectedly.
+                    if session.session_id:
+                        await self.session_manager.remove_session(session.session_id)
 
                     # Create a fresh session and retry
                     session = await self.session_manager.get_or_create_session(

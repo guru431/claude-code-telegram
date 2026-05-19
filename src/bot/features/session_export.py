@@ -190,13 +190,17 @@ class SessionExporter:
         markdown_content = await self._export_markdown(session, messages)
         html_content = self._markdown_to_html(markdown_content)
 
-        # HTML template
+        # HTML template. The session id is escaped just in case it ever
+        # contains chars outside of [0-9a-f-] (legacy data, manual edits).
+        from html import escape as html_escape
+
+        safe_session_id = html_escape(str(session["id"])[:8], quote=True)
         template = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Claude Code Session - {session['id'][:8]}</title>
+    <title>Claude Code Session - {safe_session_id}</title>
     <style>
         body {{
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -273,7 +277,10 @@ class SessionExporter:
     def _markdown_to_html(self, markdown: str) -> str:
         """Convert markdown to HTML.
 
-        Simple conversion for basic markdown elements.
+        Simple conversion for basic markdown elements. We HTML-escape the
+        source first so that user-supplied content (prompts, Claude
+        responses, file paths) cannot inject ``<script>`` tags or other
+        active markup when the exported file is opened in a browser.
 
         Args:
             markdown: Markdown content
@@ -281,9 +288,12 @@ class SessionExporter:
         Returns:
             HTML content
         """
-        html = markdown
+        from html import escape as html_escape
 
-        # Headers
+        html = html_escape(markdown, quote=False)
+
+        # Headers — operate on the *escaped* string so user text can never
+        # introduce angle brackets that survive into the output.
         html = html.replace("# ", "<h1>").replace("\n\n", "</h1>\n\n", 1)
         html = html.replace("### ", "<h3>").replace("\n", "</h3>\n", 3)
 

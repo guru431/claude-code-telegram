@@ -2,6 +2,7 @@
 
 import os
 import signal
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -1257,7 +1258,24 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # SIGTERM triggers the existing graceful-shutdown handler in main.py;
     # systemd Restart=always will bring the process back up.
-    os.kill(os.getpid(), signal.SIGTERM)
+    #
+    # On Windows, Python only honours SIGTERM as an alias for
+    # ``terminate()`` and does not invoke the Python-level signal handler
+    # installed via signal.signal(). To still get the same graceful path,
+    # we use SIGBREAK (CTRL_BREAK_EVENT) on Windows, which is handled by
+    # the same handler chain in main.py.
+    try:
+        if sys.platform == "win32":
+            sig = getattr(signal, "SIGBREAK", signal.SIGTERM)
+        else:
+            sig = signal.SIGTERM
+        os.kill(os.getpid(), sig)
+    except Exception as kill_err:  # pragma: no cover - best-effort fallback
+        logger.warning(
+            "Graceful shutdown signal failed; exiting hard",
+            error=str(kill_err),
+        )
+        os._exit(0)
 
 
 def _format_file_size(size: int) -> str:

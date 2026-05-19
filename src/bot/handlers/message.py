@@ -1226,13 +1226,18 @@ def _update_working_directory_from_claude_response(
     import re
     from pathlib import Path
 
-    # Look for directory changes in Claude's response
-    # This searches for common patterns that indicate directory changes
+    # Look for directory changes in Claude's response.
+    # NOTE: This is a best-effort heuristic to keep the bot's notion of cwd
+    # in sync with what Claude told the user. It is not authoritative —
+    # Claude's actual cwd is tracked by the SDK. The patterns are anchored
+    # tightly to reduce false-positive parsing (e.g. words like "racd" or
+    # "I'd love to acd" no longer match).
     patterns = [
-        r"(?:^|\n).*?cd\s+([^\s\n]+)",  # cd command
-        r"(?:^|\n).*?Changed directory to:?\s*([^\s\n]+)",  # explicit directory change
-        r"(?:^|\n).*?Current directory:?\s*([^\s\n]+)",  # current directory indication
-        r"(?:^|\n).*?Working directory:?\s*([^\s\n]+)",  # working directory indication
+        r"(?:^|[\n\r])\s*cd\s+(\S+)",  # cd command at start of a line
+        r"(?:^|[\n\r])(?:```|\$)\s*cd\s+(\S+)",  # cd in a shell block
+        r"(?:^|[\n\r])\s*Changed directory to:?\s*(\S+)",
+        r"(?:^|[\n\r])\s*Current directory:?\s*(\S+)",
+        r"(?:^|[\n\r])\s*Working directory:?\s*(\S+)",
     ]
 
     content = claude_response.content.lower()

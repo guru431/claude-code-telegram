@@ -44,26 +44,47 @@ logger = structlog.get_logger()
 
 # Patterns that look like secrets/credentials in CLI arguments
 _SECRET_PATTERNS: List[re.Pattern[str]] = [
-    # API keys / tokens (sk-ant-..., sk-..., ghp_..., gho_..., github_pat_..., xoxb-...)
+    # API keys / tokens (sk-ant-..., sk-..., ghp_..., gho_..., github_pat_..., xoxb-...,
+    # gh[ps]_..., glpat-... GitLab, npm_..., AIzaSy... Google, hf_... HuggingFace,
+    # SG.... SendGrid)
     re.compile(
         r"(sk-ant-api\d*-[A-Za-z0-9_-]{10})[A-Za-z0-9_-]*"
         r"|(sk-[A-Za-z0-9_-]{20})[A-Za-z0-9_-]*"
         r"|(ghp_[A-Za-z0-9]{5})[A-Za-z0-9]*"
         r"|(gho_[A-Za-z0-9]{5})[A-Za-z0-9]*"
+        r"|(ghs_[A-Za-z0-9]{5})[A-Za-z0-9]*"
+        r"|(ghr_[A-Za-z0-9]{5})[A-Za-z0-9]*"
+        r"|(ghu_[A-Za-z0-9]{5})[A-Za-z0-9]*"
         r"|(github_pat_[A-Za-z0-9_]{5})[A-Za-z0-9_]*"
+        r"|(glpat-[A-Za-z0-9_-]{5})[A-Za-z0-9_-]*"
         r"|(xoxb-[A-Za-z0-9]{5})[A-Za-z0-9-]*"
+        r"|(xoxp-[A-Za-z0-9-]{5})[A-Za-z0-9-]*"
+        r"|(xoxa-[A-Za-z0-9-]{5})[A-Za-z0-9-]*"
+        r"|(npm_[A-Za-z0-9]{5})[A-Za-z0-9]*"
+        r"|(AIzaSy[A-Za-z0-9_-]{5})[A-Za-z0-9_-]*"
+        r"|(hf_[A-Za-z0-9]{5})[A-Za-z0-9]*"
+        r"|(SG\.[A-Za-z0-9_-]{5})[A-Za-z0-9_.-]*"
     ),
+    # Telegram bot token (digits:alphanum_-, ~46 chars)
+    re.compile(r"(\d{6,12}:AAE[A-Za-z0-9_-]{5})[A-Za-z0-9_-]*"),
+    # Anthropic / OpenAI / generic project key prefixes that vary in length
+    re.compile(r"(sk-proj-[A-Za-z0-9_-]{8})[A-Za-z0-9_-]*"),
     # AWS access keys
     re.compile(r"(AKIA[0-9A-Z]{4})[0-9A-Z]{12}"),
+    re.compile(r"(ASIA[0-9A-Z]{4})[0-9A-Z]{12}"),
     # Generic long hex/base64 tokens after common flags/env patterns
     re.compile(
-        r"((?:--token|--secret|--password|--api-key|--apikey|--auth)"
+        r"((?:--token|--secret|--password|--api-key|--apikey|--auth"
+        r"|--access-key|--bearer|--client-secret|--private-key)"
         r"[= ]+)['\"]?[A-Za-z0-9+/_.:-]{8,}['\"]?"
     ),
     # Inline env assignments like KEY=value
     re.compile(
-        r"((?:TOKEN|SECRET|PASSWORD|API_KEY|APIKEY|AUTH_TOKEN|PRIVATE_KEY"
-        r"|ACCESS_KEY|CLIENT_SECRET|WEBHOOK_SECRET)"
+        r"((?:TOKEN|SECRET|PASSWORD|PASSWD|PASS|API_KEY|APIKEY"
+        r"|AUTH_TOKEN|AUTH|PRIVATE_KEY|ACCESS_KEY|ACCESS_TOKEN"
+        r"|CLIENT_SECRET|WEBHOOK_SECRET|REFRESH_TOKEN|SESSION_TOKEN"
+        r"|BOT_TOKEN|GH_TOKEN|GITHUB_TOKEN|SLACK_TOKEN|DATABASE_URL"
+        r"|REDIS_URL)"
         r"=)['\"]?[^\s'\"]{8,}['\"]?"
     ),
     # Bearer / Basic auth headers
@@ -72,6 +93,17 @@ _SECRET_PATTERNS: List[re.Pattern[str]] = [
     # Two outer capture groups preserve the `scheme://user:` prefix and
     # the `@host` suffix; the password between them is redacted.
     re.compile(r"(://[^:/\s]+:)[^@\s]{4,}(@[^\s]+)"),
+    # Private key blocks
+    re.compile(
+        r"(-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----)"
+        r"[\s\S]+?(-----END (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----)"
+    ),
+    # JSON-like "password": "...", "token": "..."
+    re.compile(
+        r'("(?:password|passwd|pass|token|secret|api_?key|auth(?:_token)?)"'
+        r"\s*:\s*\")[^\"]{4,}(\")",
+        re.IGNORECASE,
+    ),
 ]
 
 
