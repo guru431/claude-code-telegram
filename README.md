@@ -88,3 +88,7 @@ make format        # автоформатирование
 ```
 
 Версия: **1.5.0** | Лицензия: MIT
+
+## Credits
+
+Изначально форк [RichardAtCT/claude-code-telegram](https://github.com/RichardAtCT/claude-code-telegram). С момента форка значительно переработано: agentic-режим как default, webhook-сервер (FastAPI) для внешних триггеров, multi-project topics в Telegram, транскрипция голосовых сообщений (Mistral/OpenAI), local session discovery (`~/.claude/projects/`), MCP-сервер для отправки изображений, расширенный набор middleware (security/auth/rate-limit) и итеративные code reviews.
