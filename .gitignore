@@ -147,3 +147,7 @@ sessions/
 backups/
 uploads/
 config/mcp.json
+
+# Local agent/assistant instructions (private to maintainer)
+AGENTS.md
+CLAUDE.md
