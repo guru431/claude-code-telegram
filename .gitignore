@@ -151,3 +151,8 @@ config/mcp.json
 # Local agent/assistant instructions (private to maintainer)
 AGENTS.md
 CLAUDE.md
+
+# Local fork artifacts (maintainer-specific, never committed)
+.claude/
+config/projects.yaml
+FINDINGS.md
