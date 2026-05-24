@@ -183,8 +183,16 @@ class ClaudeSDKManager:
             )
             claude_md_path = Path(working_directory) / "CLAUDE.md"
             if claude_md_path.exists():
+                # Cap size to bound prompt growth and reduce attack surface.
+                # Check size BEFORE reading to avoid OOM on multi-GB files.
+                max_bytes = 64 * 1024
                 try:
-                    claude_md_content = claude_md_path.read_text(encoding="utf-8")
+                    with open(claude_md_path, "rb") as _fh:
+                        raw = _fh.read(max_bytes + 1)
+                    truncated = len(raw) > max_bytes
+                    claude_md_content = raw[:max_bytes].decode(
+                        "utf-8", errors="replace"
+                    )
                 except OSError as read_err:
                     logger.warning(
                         "Could not read CLAUDE.md",
@@ -192,10 +200,7 @@ class ClaudeSDKManager:
                         error=str(read_err),
                     )
                 else:
-                    # Cap size to bound prompt growth and reduce attack surface.
-                    max_bytes = 64 * 1024
-                    if len(claude_md_content.encode("utf-8")) > max_bytes:
-                        claude_md_content = claude_md_content[:max_bytes]
+                    if truncated:
                         logger.warning(
                             "Truncated CLAUDE.md to limit prompt size",
                             path=str(claude_md_path),

@@ -1,5 +1,5 @@
 @echo off
-cd /d "s:\Private2\_task\LLM\_VSC\claude-code-telegram"
+cd /d "s:\Private2\_task\LLM\_VSC\claude-code-telegram" || exit /b 1
 set APPROVED_DIRECTORY=s:\Private2\_task\LLM\_VSC
 "C:\Program Files\Python314\python.exe" scripts\sync_projects_yaml.py
 if %ERRORLEVEL% EQU 2 (
