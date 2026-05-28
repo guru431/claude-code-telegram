@@ -156,3 +156,5 @@ CLAUDE.md
 .claude/
 config/projects.yaml
 FINDINGS.md
+# local-only secret denylist for pre-commit hook (never commit)
+.sanitize-patterns
