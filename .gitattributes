@@ -1,0 +1,2 @@
+# Keep the git hook as LF so its shebang works after a fresh clone on Windows
+.githooks/pre-commit text eol=lf
