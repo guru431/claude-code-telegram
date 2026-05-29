@@ -312,9 +312,14 @@ class TestSecurityValidator:
         target_file = target_dir / "file.txt"
         target_file.write_text("test content")
 
-        # Symlink inside approved dir pointing to file in approved dir
+        # Symlink inside approved dir pointing to file in approved dir.
+        # Creating symlinks on Windows needs a privilege the test runner may
+        # lack (WinError 1314); skip rather than fail in that environment.
         link_path = temp_approved_dir / "link_to_file"
-        link_path.symlink_to(target_file)
+        try:
+            link_path.symlink_to(target_file)
+        except OSError as exc:
+            pytest.skip(f"Cannot create symlinks in this environment: {exc}")
 
         # Should be valid - symlink resolves within approved directory
         valid, path, error = validator.validate_path("link_to_file")

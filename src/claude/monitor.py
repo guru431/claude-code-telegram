@@ -20,6 +20,14 @@ _FS_MODIFYING_COMMANDS: Set[str] = {
     "install",
     "tee",
     "cd",
+    # Destructive / permission-changing commands that take a target path and
+    # could otherwise escape the boundary unchecked.
+    "dd",
+    "chmod",
+    "chown",
+    "chgrp",
+    "truncate",
+    "shred",
 }
 
 # Commands that are read-only or don't take filesystem paths
@@ -35,7 +43,6 @@ _READ_ONLY_COMMANDS: Set[str] = {
     "pwd",
     "echo",
     "printf",
-    "env",
     "printenv",
     "date",
     "wc",
@@ -71,7 +78,18 @@ _NETWORK_OR_INTERP_COMMANDS: Set[str] = {
     "bash",
     "sh",
     "zsh",
+    # Command launchers / evaluators: they run another command whose path we
+    # cannot statically see, so force a boundary check rather than waving them
+    # through as "unknown".
+    "xargs",
+    "eval",
+    "env",
 }
+
+# Leading ``VAR=value`` environment-assignment tokens (e.g. ``FOO=bar cmd``).
+# Without stripping these, the first token is treated as the command name,
+# which matches nothing and bypasses path validation entirely.
+_ENV_ASSIGN_RE: re.Pattern[str] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 # Actions / expressions that make ``find`` a filesystem-modifying command
 _FIND_MUTATING_ACTIONS: Set[str] = {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
@@ -140,6 +158,13 @@ def check_bash_directory_boundary(
         if not cmd_tokens:
             continue
 
+        # Strip leading ``VAR=value`` env-assignment tokens so the real command
+        # (e.g. the ``rm`` in ``FOO=bar rm -rf /etc``) is the one we classify.
+        while cmd_tokens and _ENV_ASSIGN_RE.match(cmd_tokens[0]):
+            cmd_tokens = cmd_tokens[1:]
+        if not cmd_tokens:
+            continue
+
         base_command = Path(cmd_tokens[0]).name
 
         # Read-only commands are always allowed
@@ -170,6 +195,15 @@ def check_bash_directory_boundary(
             # past the boundary by prefixing them with ``-`` (e.g. ``rm -- -foo``).
             if not seen_double_dash and token.startswith("-"):
                 continue
+
+            # ``key=value`` operands (e.g. ``dd of=/etc/shadow``) hide the real
+            # path on the right of ``=``; resolving the whole token would treat
+            # ``of=/etc/shadow`` as a relative name inside the working dir and
+            # miss the escape. Check the value part instead.
+            if "=" in token:
+                token = token.split("=", 1)[1]
+                if not token:
+                    continue
 
             # For network/interp commands a non-flag token that *looks* like
             # a URL/scheme is not a filesystem path; rejecting it via path

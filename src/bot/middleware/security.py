@@ -45,9 +45,15 @@ async def security_middleware(
     settings = data.get("settings")
     agentic_mode = getattr(settings, "agentic_mode", False) if settings else False
 
+    # For callback queries, ``effective_message`` is the bot's own message that
+    # carries the inline keyboard, not user-supplied input — validating its text
+    # would be both meaningless and a false-positive risk. Auth and rate-limit
+    # checks still apply to callbacks; only content validation is skipped here.
+    is_callback = getattr(event, "callback_query", None) is not None
+
     # Validate text content if present (classic mode only)
     message = event.effective_message
-    if message and message.text and not agentic_mode:
+    if message and message.text and not agentic_mode and not is_callback:
         is_safe, violation_type = await validate_message_content(
             message.text, security_validator, user_id, audit_logger
         )

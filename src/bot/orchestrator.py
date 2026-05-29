@@ -1012,6 +1012,10 @@ class MessageOrchestrator:
 
             context.user_data["claude_session_id"] = claude_response.session_id
 
+            # Charge the real cost so claude_max_cost_per_user is enforced.
+            if rate_limiter:
+                await rate_limiter.record_actual_cost(user_id, claude_response.cost)
+
             # Track directory changes
             from .handlers.message import _update_working_directory_from_claude_response
 
@@ -1255,6 +1259,10 @@ class MessageOrchestrator:
 
             context.user_data["claude_session_id"] = claude_response.session_id
 
+            rate_limiter = context.bot_data.get("rate_limiter")
+            if rate_limiter:
+                await rate_limiter.record_actual_cost(user_id, claude_response.cost)
+
             from .handlers.message import _update_working_directory_from_claude_response
 
             _update_working_directory_from_claude_response(
@@ -1455,6 +1463,10 @@ class MessageOrchestrator:
             context.user_data["force_new_session"] = False
 
         context.user_data["claude_session_id"] = claude_response.session_id
+
+        rate_limiter = context.bot_data.get("rate_limiter")
+        if rate_limiter:
+            await rate_limiter.record_actual_cost(user_id, claude_response.cost)
 
         from .handlers.message import _update_working_directory_from_claude_response
 
@@ -1677,12 +1689,14 @@ class MessageOrchestrator:
         """List recent Claude Code sessions (local + bot) with resume buttons."""
         from ..claude.local_sessions import list_all_local_sessions
 
-        current_dir = context.user_data.get(
-            "current_directory", self.settings.approved_directory
-        )
         current_session_id = context.user_data.get("claude_session_id")
 
-        local_sessions = list_all_local_sessions(limit=15)
+        # Scope to the approved directory: never list sessions whose working
+        # directory lives outside it, or resuming one would move the bot's
+        # current_directory past the approved root.
+        local_sessions = list_all_local_sessions(
+            limit=15, within=self.settings.approved_directory
+        )
 
         if not local_sessions:
             await update.message.reply_text("No sessions found.")
@@ -1772,6 +1786,16 @@ class MessageOrchestrator:
                     if first:
                         cwd = first.get("cwd")
                     break
+
+        # Reject sessions whose working directory escapes the approved root —
+        # otherwise resuming would point subsequent prompts outside it.
+        approved = self.settings.approved_directory
+        if cwd and not self._is_within(Path(cwd).resolve(), approved.resolve()):
+            await query.edit_message_text(
+                "❌ That session's working directory is outside the approved "
+                "directory and cannot be resumed.",
+            )
+            return
 
         if cwd:
             context.user_data["current_directory"] = Path(cwd)

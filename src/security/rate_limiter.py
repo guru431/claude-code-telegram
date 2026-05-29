@@ -228,6 +228,20 @@ class RateLimiter:
                     reset_time=now.isoformat(),
                 )
 
+    async def record_actual_cost(self, user_id: int, cost: float) -> None:
+        """Add the *actual* cost of a completed request to the user's budget.
+
+        The pre-flight ``check_rate_limit`` only tracks a small heuristic
+        estimate; without this, ``claude_max_cost_per_user`` never reflects real
+        spend and the cap is cosmetic. Call this once the real
+        ``ClaudeResponse.cost`` is known. Costs of 0 or less are ignored.
+        """
+        if cost <= 0:
+            return
+        async with self.locks[user_id]:
+            self._maybe_reset_cost_tracker(user_id)
+            self._track_cost(user_id, cost)
+
     async def reset_user_limits(self, user_id: int) -> None:
         """Reset all limits for a user (admin function)."""
         async with self.locks[user_id]:

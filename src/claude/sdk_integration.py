@@ -153,6 +153,7 @@ class ClaudeSDKManager:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
+        allowed_tools_override: Optional[List[str]] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -226,7 +227,13 @@ class ClaudeSDKManager:
 
             # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
             # tools so the SDK does not restrict tool usage (e.g. MCP tools).
-            if self.config.disable_tool_validation:
+            # An explicit allowed_tools_override (e.g. the read-only set used for
+            # untrusted webhook-triggered runs) always wins — it must NOT be
+            # widened by DISABLE_TOOL_VALIDATION.
+            if allowed_tools_override is not None:
+                sdk_allowed_tools = allowed_tools_override
+                sdk_disallowed_tools = self.config.claude_disallowed_tools
+            elif self.config.disable_tool_validation:
                 sdk_allowed_tools = None
                 sdk_disallowed_tools = None
             else:

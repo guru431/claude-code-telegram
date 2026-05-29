@@ -28,7 +28,12 @@ class SecurityValidator:
     # intent is unambiguous to readers and static analyzers.
     DANGEROUS_PATTERNS = [
         r"\.\.",  # Parent directory (literal "..")
-        r"~",  # Home directory expansion
+        # Home-directory expansion: a "~" that starts a path component
+        # (start of string or right after a / or \). Scoped this way so a "~"
+        # embedded mid-component — e.g. the Windows 8.3 short name
+        # "SUPERU~1" — is not flagged, while "~/", "~user/", and a bare "~"
+        # still are.
+        r"(?:^|[\\/])~",
         r"\$\{",  # Variable expansion ${...}
         r"\$\(",  # Command substitution $(...)
         r"\$[A-Za-z_]",  # Environment variable expansion $VAR

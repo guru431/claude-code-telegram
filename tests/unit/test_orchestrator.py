@@ -82,8 +82,8 @@ def deps():
     }
 
 
-def test_agentic_registers_6_commands(agentic_settings, deps):
-    """Agentic mode registers start, new, status, verbose, repo, restart commands."""
+def test_agentic_registers_7_commands(agentic_settings, deps):
+    """Agentic mode registers start, new, status, verbose, repo, sessions, restart."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     app = MagicMock()
     app.add_handler = MagicMock()
@@ -100,12 +100,13 @@ def test_agentic_registers_6_commands(agentic_settings, deps):
     ]
     commands = [h[0][0].commands for h in cmd_handlers]
 
-    assert len(cmd_handlers) == 6
+    assert len(cmd_handlers) == 7
     assert frozenset({"start"}) in commands
     assert frozenset({"new"}) in commands
     assert frozenset({"status"}) in commands
     assert frozenset({"verbose"}) in commands
     assert frozenset({"repo"}) in commands
+    assert frozenset({"sessions"}) in commands
     assert frozenset({"restart"}) in commands
 
 
@@ -151,18 +152,26 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
 
     # 4 message handlers (text, document, photo, voice)
     assert len(msg_handlers) == 4
-    # 1 callback handler (for cd: only)
-    assert len(cb_handlers) == 1
+    # 2 callback handlers (cd: for repo switch, resume: for /sessions)
+    assert len(cb_handlers) == 2
 
 
 async def test_agentic_bot_commands(agentic_settings, deps):
-    """Agentic mode returns 6 bot commands."""
+    """Agentic mode returns 7 bot commands."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     commands = await orchestrator.get_bot_commands()
 
-    assert len(commands) == 6
+    assert len(commands) == 7
     cmd_names = [c.command for c in commands]
-    assert cmd_names == ["start", "new", "status", "verbose", "repo", "restart"]
+    assert cmd_names == [
+        "start",
+        "new",
+        "status",
+        "verbose",
+        "repo",
+        "sessions",
+        "restart",
+    ]
 
 
 async def test_classic_bot_commands(classic_settings, deps):
@@ -332,8 +341,10 @@ async def test_agentic_text_calls_claude(agentic_settings, deps):
         assert call.kwargs.get("reply_markup") is None
 
 
-async def test_agentic_callback_scoped_to_cd_pattern(agentic_settings, deps):
-    """Agentic callback handler is registered with cd: pattern filter."""
+async def test_agentic_callbacks_scoped_to_cd_and_resume_patterns(
+    agentic_settings, deps
+):
+    """Agentic callback handlers are scoped to cd: and resume: pattern filters."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     app = MagicMock()
     app.add_handler = MagicMock()
@@ -348,10 +359,11 @@ async def test_agentic_callback_scoped_to_cd_pattern(agentic_settings, deps):
         if isinstance(call[0][0], CallbackQueryHandler)
     ]
 
-    assert len(cb_handlers) == 1
-    # The pattern attribute should match cd: prefixed data
-    assert cb_handlers[0].pattern is not None
-    assert cb_handlers[0].pattern.match("cd:my_project")
+    assert len(cb_handlers) == 2
+    # Every handler is scoped to a specific prefix (no catch-all).
+    assert all(h.pattern is not None for h in cb_handlers)
+    assert any(h.pattern.match("cd:my_project") for h in cb_handlers)
+    assert any(h.pattern.match("resume:abc123") for h in cb_handlers)
 
 
 async def test_agentic_document_rejects_large_files(agentic_settings, deps):

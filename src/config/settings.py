@@ -44,6 +44,14 @@ class Settings(BaseSettings):
     allowed_users: Optional[List[int]] = Field(
         None, description="Allowed Telegram user IDs"
     )
+    allow_all_users: bool = Field(
+        False,
+        description=(
+            "Explicitly allow ANY Telegram user (no whitelist). Required to opt "
+            "in to the development-only allow-all fallback. Never enable in "
+            "production — the bot exposes Claude Code with full tool access."
+        ),
+    )
     enable_token_auth: bool = Field(
         False, description="Enable token-based authentication"
     )
@@ -129,8 +137,11 @@ class Settings(BaseSettings):
         True,
         description="Enable OS-level bash sandboxing for approved dir",
     )
+    # NOTE: pip/make/docker are deliberately NOT excluded — they can execute
+    # arbitrary code outside the sandbox (pip runs setup.py, make runs recipes,
+    # docker can bind-mount the host fs). Run them inside the sandbox instead.
     sandbox_excluded_commands: Optional[List[str]] = Field(
-        default=["git", "npm", "pip", "poetry", "make", "docker"],
+        default=["git", "npm", "poetry"],
         description="Commands that run outside the sandbox (need system access)",
     )
 

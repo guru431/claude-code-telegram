@@ -234,6 +234,48 @@ class TestCheckBashDirectoryBoundary:
         assert not valid
         assert "/tmp" in error
 
+    # --- destructive commands, env-prefix and key=value operands ---
+
+    def test_chmod_outside_approved_directory(self) -> None:
+        """chmod on a file outside the approved dir should be blocked."""
+        valid, error = check_bash_directory_boundary(
+            "chmod 600 /etc/shadow", self.cwd, self.approved
+        )
+        assert not valid
+        assert "/etc/shadow" in error
+
+    def test_chmod_inside_approved_directory_passes(self) -> None:
+        """chmod on a file inside the approved dir should pass."""
+        valid, error = check_bash_directory_boundary(
+            "chmod +x build.sh", self.cwd, self.approved
+        )
+        assert valid
+        assert error is None
+
+    def test_env_prefix_does_not_bypass_check(self) -> None:
+        """FOO=bar rm /etc/x must still validate the rm target."""
+        valid, error = check_bash_directory_boundary(
+            "FOO=bar rm /etc/passwd", self.cwd, self.approved
+        )
+        assert not valid
+        assert "/etc/passwd" in error
+
+    def test_env_prefix_inside_passes(self) -> None:
+        """An env-prefixed command staying inside the dir should pass."""
+        valid, error = check_bash_directory_boundary(
+            "DEBUG=1 touch out.txt", self.cwd, self.approved
+        )
+        assert valid
+        assert error is None
+
+    def test_dd_key_value_operand_outside_blocked(self) -> None:
+        """dd of=/etc/x hides the path after '='; it must still be checked."""
+        valid, error = check_bash_directory_boundary(
+            "dd if=input.bin of=/etc/cron.d/evil", self.cwd, self.approved
+        )
+        assert not valid
+        assert "/etc/cron.d/evil" in error
+
 
 class TestIsClaudeInternalPath:
     """Test the _is_claude_internal_path helper function."""

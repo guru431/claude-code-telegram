@@ -123,6 +123,7 @@ async def test_sync_deactivates_stale_projects(tmp_path: Path, db_manager) -> No
     )
     bot.send_message = AsyncMock()
     bot.reopen_forum_topic = AsyncMock()
+    bot.delete_forum_topic = AsyncMock()
     bot.close_forum_topic = AsyncMock()
     bot.edit_forum_topic = AsyncMock()
 
@@ -148,7 +149,9 @@ async def test_sync_deactivates_stale_projects(tmp_path: Path, db_manager) -> No
     assert result.closed == 1
     assert app2
     assert app2[0].is_active is False
-    bot.close_forum_topic.assert_called_once_with(
+    # Stale topics are removed via delete_forum_topic (close is only the
+    # fallback when delete is unsupported).
+    bot.delete_forum_topic.assert_called_once_with(
         chat_id=-1001234567890,
         message_thread_id=102,
     )

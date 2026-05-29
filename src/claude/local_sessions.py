@@ -183,10 +183,24 @@ def find_latest_local_session(
     return None
 
 
-def list_all_local_sessions(limit: int = 20) -> List[LocalSession]:
+def _is_within(path: Path, root: Path) -> bool:
+    """Return True if *path* is inside *root* (after resolution)."""
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def list_all_local_sessions(
+    limit: int = 20, within: Optional[Path] = None
+) -> List[LocalSession]:
     """List recent sessions across all projects (for the /sessions command).
 
     Returns up to *limit* sessions sorted by modification time (newest first).
+    When *within* is given, only sessions whose ``cwd`` resolves inside that
+    directory are returned — this keeps the bot from listing (and later
+    resuming into) sessions that live outside the approved directory.
     """
     projects_dir = _claude_projects_dir()
     if not projects_dir.is_dir():
@@ -207,6 +221,9 @@ def list_all_local_sessions(limit: int = 20) -> List[LocalSession]:
                 continue
 
             cwd = first.get("cwd", "")
+            # Skip sessions outside the approved directory when scoping.
+            if within is not None and (not cwd or not _is_within(Path(cwd), within)):
+                continue
             ts_str = first.get("timestamp", "")
             try:
                 ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))

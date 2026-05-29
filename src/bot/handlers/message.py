@@ -269,12 +269,31 @@ def _format_error_message(error: Exception | str) -> str:
             "• Ask the administrator to check MCP server logs"
         )
 
-    # --- No match — show the raw error as-is ---
-    safe_error = escape_html(error_str)
-    if len(safe_error) > 500:
-        safe_error = safe_error[:500] + "..."
+    # Voice transcription failures are a known, user-actionable category (the
+    # provider rejected/failed the request) — surface the message rather than
+    # hiding it behind the generic fallback.
+    if "transcription" in error_lower:
+        return (
+            "🎙️ <b>Transcription Failed</b>\n\n"
+            f"{escape_html(error_str)}\n\n"
+            "<b>What you can do:</b>\n"
+            "• Try sending the voice message again\n"
+            "• Send your request as text instead"
+        )
 
-    return f"❌ {safe_error}"
+    # --- No match — unknown error. Do NOT echo the raw exception to the user:
+    # it can leak internal paths, config, or stack details. Log the full text
+    # and show a generic message instead.
+    logger.error("Unhandled error surfaced to user", error=error_str)
+    return (
+        "❌ <b>Unexpected Error</b>\n\n"
+        "Something went wrong while handling your request. "
+        "The details have been logged for the administrator.\n\n"
+        "<b>What you can do:</b>\n"
+        "• Try again\n"
+        "• Use /new to start a fresh session if the problem persists\n"
+        "• Check /status for your current session state"
+    )
 
 
 def _format_process_error(error_str: str) -> str:
@@ -401,6 +420,10 @@ async def handle_text_message(
 
             # Update session ID
             context.user_data["claude_session_id"] = claude_response.session_id
+
+            # Charge the real cost so claude_max_cost_per_user is enforced.
+            if rate_limiter:
+                await rate_limiter.record_actual_cost(user_id, claude_response.cost)
 
             # Check if Claude changed the working directory and update our tracking
             _update_working_directory_from_claude_response(
@@ -824,6 +847,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
             # Update session ID
             context.user_data["claude_session_id"] = claude_response.session_id
+
+            # Charge the real cost so claude_max_cost_per_user is enforced.
+            if rate_limiter:
+                await rate_limiter.record_actual_cost(user_id, claude_response.cost)
 
             # Check if Claude changed the working directory and update our tracking
             _update_working_directory_from_claude_response(

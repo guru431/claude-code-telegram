@@ -119,15 +119,23 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         token_storage = InMemoryTokenStorage()  # TODO: Use database storage
         providers.append(TokenAuthProvider(config.auth_token_secret, token_storage))
 
-    # Fall back to allowing all users in development mode
-    if not providers and config.development_mode:
+    # Fall back to allowing all users ONLY when explicitly opted in via
+    # ALLOW_ALL_USERS=true AND in development mode. The bot exposes Claude
+    # Code with full tool access, so an empty allowlist is fail-closed by
+    # default — a silent allow-all would be an RCE surface for anyone on
+    # Telegram who finds the bot.
+    if not providers and config.development_mode and config.allow_all_users:
         logger.warning(
-            "No auth providers configured"
-            " - creating development-only allow-all provider"
+            "ALLOW_ALL_USERS is enabled - creating development-only allow-all"
+            " provider. Any Telegram user can control this bot."
         )
         providers.append(WhitelistAuthProvider([], allow_all_dev=True))
     elif not providers:
-        raise ConfigurationError("No authentication providers configured")
+        raise ConfigurationError(
+            "No authentication providers configured. Set ALLOWED_USERS to a "
+            "comma-separated list of Telegram IDs, enable ENABLE_TOKEN_AUTH, or "
+            "(development only) set ALLOW_ALL_USERS=true to allow any user."
+        )
 
     auth_manager = AuthenticationManager(providers)
     security_validator = SecurityValidator(
@@ -346,9 +354,7 @@ async def run_application(app: Dict[str, Any]) -> None:
             from apscheduler.schedulers.asyncio import (
                 AsyncIOScheduler as _DiscoveryScheduler,
             )
-            from apscheduler.triggers.cron import (
-                CronTrigger as _DiscoveryCronTrigger,
-            )
+            from apscheduler.triggers.cron import CronTrigger as _DiscoveryCronTrigger
 
             async def _nightly_project_discovery() -> None:
                 """Discover new project dirs and sync Telegram topics."""

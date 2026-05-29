@@ -32,9 +32,14 @@ SKIP_DIRS: Set[str] = {
 
 
 def _slugify(name: str) -> str:
-    """Convert directory name to a URL-friendly slug."""
+    """Convert directory name to a URL-friendly slug.
+
+    Underscores and any other non-alphanumeric characters collapse to hyphens
+    (e.g. ``real_project`` -> ``real-project``), so slugs are consistently
+    hyphenated. Leading/trailing separators are stripped.
+    """
     slug = name.lower().strip().strip("_").strip("-")
-    slug = re.sub(r"[^a-z0-9_-]", "-", slug)
+    slug = re.sub(r"[^a-z0-9-]", "-", slug)
     slug = re.sub(r"[-]+", "-", slug)
     slug = slug.strip("-")
     return slug or name.lower()
@@ -156,7 +161,9 @@ def discover_new_projects(
     data["projects"] = existing_projects
 
     with open(config_path, "w", encoding="utf-8") as f:
-        yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        yaml.dump(
+            data, f, default_flow_style=False, allow_unicode=True, sort_keys=False
+        )
 
     logger.info(
         "New projects discovered and added to config",

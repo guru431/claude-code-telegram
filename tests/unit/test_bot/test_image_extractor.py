@@ -146,7 +146,12 @@ class TestValidateImagePath:
         secret_img = outside / "secret.png"
         secret_img.write_bytes(b"\x00" * 100)
         link = approved / "link.png"
-        link.symlink_to(secret_img)
+        # Symlink creation needs a privilege the Windows test runner may lack
+        # (WinError 1314); skip rather than fail in that environment.
+        try:
+            link.symlink_to(secret_img)
+        except OSError as exc:
+            pytest.skip(f"Cannot create symlinks in this environment: {exc}")
         result = validate_image_path(str(link), approved)
         assert result is None
 

@@ -15,6 +15,21 @@ from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
 
 logger = structlog.get_logger()
 
+# Webhook payloads are untrusted external input (PR/issue bodies, etc.) that run
+# unattended with no human-in-the-loop. A prompt-injection payload could turn a
+# full tool set into RCE inside the approved directory. Restrict webhook-driven
+# runs to read-only / analysis tools — no Bash, Write, Edit, or Task.
+_WEBHOOK_READONLY_TOOLS = [
+    "Read",
+    "Glob",
+    "Grep",
+    "LS",
+    "WebFetch",
+    "WebSearch",
+    "TodoRead",
+    "TodoWrite",
+]
+
 
 class AgentHandler:
     """Translates incoming events into Claude agent executions.
@@ -60,6 +75,7 @@ class AgentHandler:
                 prompt=prompt,
                 working_directory=self.default_working_directory,
                 user_id=self.default_user_id,
+                allowed_tools_override=_WEBHOOK_READONLY_TOOLS,
             )
 
             if response.content:

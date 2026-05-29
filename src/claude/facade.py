@@ -38,8 +38,15 @@ class ClaudeIntegration:
         session_id: Optional[str] = None,
         on_stream: Optional[Callable[[StreamUpdate], None]] = None,
         force_new: bool = False,
+        allowed_tools_override: Optional[List[str]] = None,
     ) -> ClaudeResponse:
-        """Run Claude Code command with full integration."""
+        """Run Claude Code command with full integration.
+
+        *allowed_tools_override* restricts the tools the SDK may use for this
+        run, overriding ``claude_allowed_tools`` (and ignoring
+        ``DISABLE_TOOL_VALIDATION``). Used to run untrusted, unattended
+        triggers (e.g. webhooks) with a read-only tool set.
+        """
         logger.info(
             "Running Claude command",
             user_id=user_id,
@@ -86,6 +93,7 @@ class ClaudeIntegration:
                     session_id=claude_session_id,
                     continue_session=should_continue,
                     stream_callback=on_stream,
+                    allowed_tools_override=allowed_tools_override,
                 )
             except Exception as resume_error:
                 # If resume failed (e.g., session expired/missing on Claude's side),
@@ -115,6 +123,7 @@ class ClaudeIntegration:
                         session_id=None,
                         continue_session=False,
                         stream_callback=on_stream,
+                        allowed_tools_override=allowed_tools_override,
                     )
                 else:
                     raise
@@ -158,6 +167,7 @@ class ClaudeIntegration:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         stream_callback: Optional[Callable] = None,
+        allowed_tools_override: Optional[List[str]] = None,
     ) -> ClaudeResponse:
         """Execute command via SDK."""
         return await self.sdk_manager.execute_command(
@@ -166,6 +176,7 @@ class ClaudeIntegration:
             session_id=session_id,
             continue_session=continue_session,
             stream_callback=stream_callback,
+            allowed_tools_override=allowed_tools_override,
         )
 
     async def _find_resumable_session(

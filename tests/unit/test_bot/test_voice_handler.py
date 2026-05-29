@@ -31,6 +31,9 @@ def openai_config():
     cfg.resolved_voice_model = "whisper-1"
     cfg.voice_max_file_size_mb = 20
     cfg.voice_max_file_size_bytes = 20 * 1024 * 1024
+    # Explicit None — otherwise MagicMock auto-creates a truthy attribute and
+    # the handler passes it as base_url= to AsyncOpenAI.
+    cfg.voice_base_url = None
     return cfg
 
 

@@ -15,6 +15,7 @@ from telegram import Update
 from telegram.ext import (
     AIORateLimiter,
     Application,
+    CallbackQueryHandler,
     ContextTypes,
     Defaults,
     MessageHandler,
@@ -106,30 +107,21 @@ class ClaudeCodeBot:
         from .middleware.rate_limit import rate_limit_middleware
         from .middleware.security import security_middleware
 
-        # Middleware runs in order of group numbers (lower = earlier)
-        # Security middleware first (validate inputs)
-        self.app.add_handler(
-            MessageHandler(
-                filters.ALL, self._create_middleware_handler(security_middleware)
-            ),
-            group=-3,
-        )
-
-        # Authentication second
-        self.app.add_handler(
-            MessageHandler(
-                filters.ALL, self._create_middleware_handler(auth_middleware)
-            ),
-            group=-2,
-        )
-
-        # Rate limiting third
-        self.app.add_handler(
-            MessageHandler(
-                filters.ALL, self._create_middleware_handler(rate_limit_middleware)
-            ),
-            group=-1,
-        )
+        # Middleware runs in order of group numbers (lower = earlier).
+        # Each middleware is registered for BOTH message updates and callback
+        # queries: a plain MessageHandler(filters.ALL) does NOT match inline-
+        # button CallbackQuery updates, which would otherwise let every
+        # callback (cd:/resume:/action:/git:/export:) bypass auth, rate-limit
+        # and security checks entirely.
+        middleware_groups = [
+            (-3, security_middleware),
+            (-2, auth_middleware),
+            (-1, rate_limit_middleware),
+        ]
+        for group, mw in middleware_groups:
+            wrapped = self._create_middleware_handler(mw)
+            self.app.add_handler(MessageHandler(filters.ALL, wrapped), group=group)
+            self.app.add_handler(CallbackQueryHandler(wrapped), group=group)
 
         logger.info("Middleware added to bot")
 
