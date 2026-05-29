@@ -292,9 +292,15 @@ async def run_application(app: Dict[str, Any]) -> None:
                     raise ConfigurationError(
                         "Group thread mode requires PROJECT_THREADS_CHAT_ID"
                     )
+                # Startup sync is lightweight: it creates missing topics and
+                # reopens inactive ones, but does NOT probe every active topic
+                # (one reopen write-call each) — with many projects that trips
+                # Telegram's per-chat rate limit (429) on every restart.
+                # /sync_threads and the nightly job run the full reconcile.
                 sync_result = await project_threads_manager.sync_topics(
                     bot.app.bot,
                     chat_id=config.project_threads_chat_id,
+                    probe_usable=False,
                 )
                 logger.info(
                     "Project thread startup sync complete",

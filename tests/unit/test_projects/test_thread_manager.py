@@ -365,6 +365,43 @@ async def test_sync_recreates_active_mapping_when_topic_unusable(
     assert mapping.message_thread_id == 2002
 
 
+async def test_startup_sync_skips_active_topic_probe(
+    tmp_path: Path, db_manager
+) -> None:
+    """probe_usable=False must not reopen-probe active topics (avoids 429 storm)."""
+    approved = tmp_path / "projects"
+    approved.mkdir()
+    (approved / "app1").mkdir()
+
+    config_file = tmp_path / "projects.yaml"
+    config_file.write_text(
+        "projects:\n" "  - slug: app1\n" "    name: App One\n" "    path: app1\n",
+        encoding="utf-8",
+    )
+    registry = load_project_registry(config_file, approved)
+
+    repo = ProjectThreadRepository(db_manager)
+    await repo.upsert_mapping(
+        project_slug="app1",
+        chat_id=42,
+        message_thread_id=1001,
+        topic_name="App One",
+        is_active=True,
+    )
+
+    manager = ProjectThreadManager(registry, repo, sync_action_interval_seconds=0.0)
+    bot = AsyncMock()
+    bot.reopen_forum_topic = AsyncMock()
+    bot.edit_forum_topic = AsyncMock()
+
+    result = await manager.sync_topics(bot, chat_id=42, probe_usable=False)
+
+    # No write call against the already-active topic.
+    bot.reopen_forum_topic.assert_not_called()
+    assert result.created == 0
+    assert result.reused == 1
+
+
 async def test_sync_reopen_inactive_mapping(tmp_path: Path, db_manager) -> None:
     """Inactive mapping is reopened and reactivated when project returns."""
     approved = tmp_path / "projects"

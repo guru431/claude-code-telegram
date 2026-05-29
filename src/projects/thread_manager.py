@@ -52,8 +52,19 @@ class ProjectThreadManager:
         self._sync_api_lock = asyncio.Lock()
         self._last_sync_api_call_at: Optional[float] = None
 
-    async def sync_topics(self, bot: Bot, chat_id: int) -> TopicSyncResult:
-        """Create/reconcile topics for all enabled projects."""
+    async def sync_topics(
+        self, bot: Bot, chat_id: int, *, probe_usable: bool = True
+    ) -> TopicSyncResult:
+        """Create/reconcile topics for all enabled projects.
+
+        *probe_usable* controls whether each already-active topic is probed
+        (via ``reopen_forum_topic``) to confirm it still exists. That probe is
+        one write call per project, so with many projects it can trip Telegram's
+        per-chat rate limit (429). Startup passes ``probe_usable=False`` to keep
+        restart cheap; ``/sync_threads`` and the nightly job use the default
+        (full reconcile, which recreates active mappings whose topic was
+        deleted out of band).
+        """
         result = TopicSyncResult()
 
         enabled = self.registry.list_enabled()
@@ -72,6 +83,7 @@ class ProjectThreadManager:
                         project=project,
                         mapping=existing,
                         result=result,
+                        probe_usable=probe_usable,
                     )
                     if handled:
                         continue
@@ -179,11 +191,14 @@ class ProjectThreadManager:
         project: ProjectDefinition,
         mapping: ProjectThreadModel,
         result: TopicSyncResult,
+        probe_usable: bool = True,
     ) -> bool:
         """Sync an existing mapping. Returns True if handled without recreate."""
         chat_id = mapping.chat_id
 
         if not mapping.is_active:
+            # Closed topic: reopening is real work, and it also surfaces a
+            # deleted/unusable topic — no separate usability probe needed.
             reopen_status = await self._reopen_topic_if_possible(bot, mapping)
             if reopen_status == "unusable":
                 return False
@@ -191,13 +206,16 @@ class ProjectThreadManager:
                 result.failed += 1
                 return True
             result.reopened += 1
-
-        usable_status = await self._ensure_topic_usable(bot, mapping)
-        if usable_status == "unusable":
-            return False
-        if usable_status == "failed":
-            result.failed += 1
-            return True
+        elif probe_usable:
+            # Active topic: optionally confirm it still exists. This is a write
+            # call per topic, skipped on startup to avoid a 429 storm across
+            # many projects (see sync_topics docstring).
+            usable_status = await self._ensure_topic_usable(bot, mapping)
+            if usable_status == "unusable":
+                return False
+            if usable_status == "failed":
+                result.failed += 1
+                return True
 
         topic_name = mapping.topic_name
         if mapping.topic_name != project.name:
