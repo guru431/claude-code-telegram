@@ -26,6 +26,17 @@ The Claude Code Telegram Bot implements a defense-in-depth security model with m
 - **Path Sanitization**: Removes dangerous characters and patterns (`;`, `&&`, `$()`, `..`)
 - **Secret File Protection**: Blocks access to `.env`, `.ssh`, `id_rsa`, `.pem` files
 
+> **Important — agentic mode (the default, `AGENTIC_MODE=true`):** the
+> command/path text heuristics above (`;`, `&&`, `$()`, `..`) run in **classic
+> mode only**. In agentic mode the user's message is a *prompt to Claude*, not a
+> shell command, so applying them would block normal conversation; they are
+> intentionally **not** applied. Do not assume message-content filtering is
+> active in the default mode. Safety there is enforced at the **tool level**:
+> the SDK `can_use_tool` callback, `ToolMonitor` (allow/deny lists, file-path
+> boundaries, dangerous-bash and interpreter inline-code checks), and the OS
+> sandbox. Harden those layers (and keep `SANDBOX_ENABLED` on) rather than
+> relying on input sanitization in agentic mode.
+
 ### 4. Rate Limiting
 - **Request Rate Limiting**: Token bucket algorithm prevents abuse with configurable limits
 - **Cost-Based Limiting**: Tracks and limits Claude usage costs per user

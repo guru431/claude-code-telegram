@@ -203,8 +203,11 @@ class SecurityValidator:
             # Handle path resolution
             current_dir = current_dir or current_approved
 
-            if user_path.startswith("/"):
-                # Absolute path - use as-is
+            if Path(user_path).is_absolute():
+                # Absolute path - use as-is. ``is_absolute()`` is
+                # platform-aware, so Windows drive-absolute (``C:\\...``) and
+                # UNC (``\\\\server\\share``) paths are recognised too, not just
+                # POSIX ``/...`` paths.
                 target = Path(user_path)
             else:
                 # Relative path

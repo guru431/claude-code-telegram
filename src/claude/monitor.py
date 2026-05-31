@@ -86,6 +86,42 @@ _NETWORK_OR_INTERP_COMMANDS: Set[str] = {
     "env",
 }
 
+# Interpreters that can execute an inline code string / opaque module supplied
+# via a flag. The code is not a filesystem path, so resolving it against the
+# working directory falsely "passes" the boundary check (e.g.
+# ``python3 -c "import os; os.system(...)"`` resolves the code string to a name
+# inside the approved dir). We deny these outright rather than relying solely on
+# the OS sandbox.
+_INTERP_COMMANDS: Set[str] = {
+    "python",
+    "python2",
+    "python3",
+    "node",
+    "ruby",
+    "perl",
+    "php",
+    "bash",
+    "sh",
+    "zsh",
+}
+
+# Flags that introduce inline code / opaque module execution across the
+# interpreters above (python -c/-m, node -e/-p/--eval/--print,
+# perl -e/-E/-n/-p, ruby -e, php -r/-R, bash/sh/zsh -c).
+_INLINE_CODE_FLAGS: Set[str] = {
+    "-c",
+    "-e",
+    "-E",
+    "-n",
+    "-p",
+    "-r",
+    "-R",
+    "-m",
+    "--eval",
+    "--exec",
+    "--print",
+}
+
 # Leading ``VAR=value`` environment-assignment tokens (e.g. ``FOO=bar cmd``).
 # Without stripping these, the first token is treated as the command name,
 # which matches nothing and bypasses path validation entirely.
@@ -182,6 +218,29 @@ def check_bash_directory_boundary(
 
         if not needs_check:
             continue
+
+        # Interpreters invoked with an inline-code/opaque-module flag execute a
+        # code string that no filesystem-path check can analyze. Resolving that
+        # string as a path would falsely "pass" the boundary, so deny these
+        # outright instead of trusting the OS sandbox alone (covers the
+        # SANDBOX_ENABLED=false case).
+        if base_command in _INTERP_COMMANDS:
+            for token in cmd_tokens[1:]:
+                flag = token.split("=", 1)[0]
+                # Bundled short flags like ``-ec`` or ``-ic`` smuggle ``-c``/
+                # ``-e`` past an exact match; flag the whole cluster.
+                bundled_short = (
+                    len(flag) > 1
+                    and flag[0] == "-"
+                    and flag[1] != "-"
+                    and any(f"-{ch}" in _INLINE_CODE_FLAGS for ch in flag[1:])
+                )
+                if flag in _INLINE_CODE_FLAGS or bundled_short:
+                    return False, (
+                        f"Inline-code execution via '{base_command} {token}' "
+                        "cannot be validated against the directory boundary "
+                        "and is not allowed"
+                    )
 
         # Check each argument for paths outside the boundary
         seen_double_dash = False

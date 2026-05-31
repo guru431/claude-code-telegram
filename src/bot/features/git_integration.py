@@ -67,6 +67,10 @@ class GitIntegration:
         "describe",
     }
 
+    # Hard wall-clock limit per git invocation. Without it a hung git process
+    # (e.g. blocked on a credential/network prompt) waits forever.
+    COMMAND_TIMEOUT: float = 30.0
+
     # Dangerous patterns to block
     DANGEROUS_PATTERNS = [
         r"--exec",
@@ -123,6 +127,7 @@ class GitIntegration:
             raise SecurityError("Invalid repository path")
 
         # Execute command
+        process = None
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -131,7 +136,9 @@ class GitIntegration:
                 stderr=asyncio.subprocess.PIPE,
             )
 
-            stdout, stderr = await process.communicate()
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=self.COMMAND_TIMEOUT
+            )
 
             if process.returncode != 0:
                 raise GitError(f"Git command failed: {stderr.decode()}")
@@ -139,6 +146,9 @@ class GitIntegration:
             return stdout.decode(), stderr.decode()
 
         except asyncio.TimeoutError:
+            if process is not None:
+                process.kill()
+                await process.wait()
             raise GitError("Git command timed out")
         except Exception as e:
             logger.error(f"Git command error: {e}")
@@ -238,6 +248,9 @@ class GitIntegration:
             file_path_obj = (repo_path / file_path).resolve()
             if not file_path_obj.is_relative_to(repo_path):
                 raise SecurityError("File path outside repository")
+            # ``--`` ends option parsing so a dashed file name (e.g.
+            # ``--output=...``) is treated as a pathspec, not a git flag.
+            command.append("--")
             command.append(file_path)
 
         diff_out, _ = await self.execute_git_command(command, repo_path)

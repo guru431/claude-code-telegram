@@ -114,9 +114,25 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     if config.allowed_users:
         providers.append(WhitelistAuthProvider(config.allowed_users))
 
-    # Add token provider if enabled
+    # Add token provider if enabled. The only TokenStorage implementation is
+    # in-memory, so every issued token is invalidated on restart and audit
+    # events are non-persistent. Fail-closed in production (mirrors the
+    # ALLOW_ALL_USERS gate below); allow it only when DEVELOPMENT_MODE
+    # explicitly acknowledges the limitation.
     if config.enable_token_auth:
-        token_storage = InMemoryTokenStorage()  # TODO: Use database storage
+        if not config.development_mode:
+            raise ConfigurationError(
+                "ENABLE_TOKEN_AUTH currently uses in-memory token storage, which "
+                "loses all issued tokens on every restart and is not "
+                "production-safe. Persist tokens in SQLite before enabling token "
+                "auth in production, or set DEVELOPMENT_MODE=true to acknowledge "
+                "the limitation."
+            )
+        logger.warning(
+            "Token auth uses in-memory storage - all issued tokens are lost on "
+            "restart (development only)."
+        )
+        token_storage = InMemoryTokenStorage()
         providers.append(TokenAuthProvider(config.auth_token_secret, token_storage))
 
     # Fall back to allowing all users ONLY when explicitly opted in via
