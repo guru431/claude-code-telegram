@@ -1534,6 +1534,40 @@ class MessageOrchestrator:
             'voice extras with: pip install "claude-code-telegram[voice]"'
         )
 
+    def _navigation_root(self, context: ContextTypes.DEFAULT_TYPE) -> Path:
+        """Root that /repo and ``cd:`` navigation is confined to.
+
+        In project-thread mode each topic is pinned to its project root, and
+        ``_persist_thread_state`` clamps any wider move back to it — so confine
+        navigation to that root instead of the global approved directory. Using
+        the approved root there would accept a switch that is then silently
+        reverted, leaving the user with a misleading "Switched to X".
+        """
+        thread_context = context.user_data.get("_thread_context")
+        if thread_context:
+            return Path(thread_context["project_root"])
+        return self.settings.approved_directory
+
+    def _resolve_within_approved(
+        self, name: str, base: Optional[Path] = None
+    ) -> Optional[Path]:
+        """Resolve *name* under *base* (the approved root by default), or
+        ``None`` if it escapes it.
+
+        Guards /repo and ``cd:`` navigation against ``..`` traversal, absolute
+        paths (on Windows ``base / "C:/x"`` discards ``base`` entirely) and
+        symlinks that resolve outside the root — any of which would otherwise
+        move the working directory past the boundary. Returns the resolved path
+        only when it is an existing directory inside the root.
+        """
+        base = base or self.settings.approved_directory
+        candidate = (base / name).resolve()
+        try:
+            candidate.relative_to(base.resolve())
+        except ValueError:
+            return None
+        return candidate if candidate.is_dir() else None
+
     async def agentic_repo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -1543,14 +1577,14 @@ class MessageOrchestrator:
         /repo <name>   — switch to that directory, resume session if available
         """
         args = update.message.text.split()[1:] if update.message.text else []
-        base = self.settings.approved_directory
+        base = self._navigation_root(context)
         current_dir = context.user_data.get("current_directory", base)
 
         if args:
             # Switch to named repo
             target_name = args[0]
-            target_path = base / target_name
-            if not target_path.is_dir():
+            target_path = self._resolve_within_approved(target_name, base)
+            if target_path is None:
                 await update.message.reply_text(
                     f"Directory not found: <code>{escape_html(target_name)}</code>",
                     parse_mode="HTML",
@@ -1640,10 +1674,11 @@ class MessageOrchestrator:
         data = query.data
         _, project_name = data.split(":", 1)
 
-        base = self.settings.approved_directory
-        new_path = base / project_name
+        new_path = self._resolve_within_approved(
+            project_name, self._navigation_root(context)
+        )
 
-        if not new_path.is_dir():
+        if new_path is None:
             await query.edit_message_text(
                 f"Directory not found: <code>{escape_html(project_name)}</code>",
                 parse_mode="HTML",

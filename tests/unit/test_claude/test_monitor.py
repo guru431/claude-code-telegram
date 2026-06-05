@@ -85,10 +85,52 @@ class TestCheckBashDirectoryBoundary:
         assert not valid
         assert "directory boundary violation" in error.lower()
 
-    def test_read_only_commands_pass(self) -> None:
+    def test_read_only_no_path_commands_pass(self) -> None:
+        """Read-only commands that take no filesystem path always pass."""
+        for cmd in ["whoami", "pwd", "echo hi", "date", "printenv PATH"]:
+            valid, error = check_bash_directory_boundary(cmd, self.cwd, self.approved)
+            assert valid, f"Expected no-path read-only command to pass: {cmd}"
+            assert error is None
+
+    def test_read_only_path_commands_inside_boundary_pass(self) -> None:
+        """Path-taking read-only commands pass when the path stays inside."""
+        for cmd in [
+            "cat notes.txt",
+            "ls /root/projects/myapp",
+            "head /root/projects/sibling.txt",
+        ]:
+            valid, error = check_bash_directory_boundary(cmd, self.cwd, self.approved)
+            assert valid, f"Expected in-boundary read-only command to pass: {cmd}"
+            assert error is None
+
+    def test_read_only_path_commands_outside_boundary_blocked(self) -> None:
+        """Path-taking read-only commands are blocked when reading outside.
+
+        Without this the OS sandbox is the only guard; if it is disabled or
+        bypassed, ``cat /etc/passwd`` would leak files outside the approved root.
+        """
         for cmd in ["cat /etc/hosts", "ls /tmp", "head /var/log/syslog"]:
             valid, error = check_bash_directory_boundary(cmd, self.cwd, self.approved)
-            assert valid, f"Expected read-only command to pass: {cmd}"
+            assert not valid, f"Expected out-of-boundary read to be blocked: {cmd}"
+            assert "directory boundary violation" in error.lower()
+
+    def test_text_search_commands_outside_boundary_blocked(self) -> None:
+        """grep/sed/awk reading an external file are boundary-checked too."""
+        for cmd in [
+            "grep root /etc/passwd",
+            "sed -n 1p /etc/passwd",
+            "awk '{print}' /etc/passwd",
+        ]:
+            valid, error = check_bash_directory_boundary(cmd, self.cwd, self.approved)
+            assert not valid, f"Expected out-of-boundary read to be blocked: {cmd}"
+            assert "directory boundary violation" in error.lower()
+            assert "/etc/passwd" in error
+
+    def test_text_search_commands_inside_boundary_pass(self) -> None:
+        """The same tools pass when their file operand stays inside the root."""
+        for cmd in ["grep root notes.txt", "awk '{print}' data/in.txt"]:
+            valid, error = check_bash_directory_boundary(cmd, self.cwd, self.approved)
+            assert valid, f"Expected in-boundary read to pass: {cmd}"
             assert error is None
 
     def test_non_fs_commands_pass(self) -> None:
@@ -134,10 +176,19 @@ class TestCheckBashDirectoryBoundary:
 
     # --- find command handling ---
 
-    def test_find_without_mutating_flags_passes(self) -> None:
-        """Plain find (read-only) should pass regardless of search path."""
+    def test_find_outside_approved_dir_blocked(self) -> None:
+        """Plain find now boundary-checks its search path (read/list escape)."""
         valid, error = check_bash_directory_boundary(
             "find /tmp -name '*.log'", self.cwd, self.approved
+        )
+        assert not valid
+        assert "directory boundary violation" in error.lower()
+        assert "/tmp" in error
+
+    def test_find_inside_approved_dir_passes(self) -> None:
+        """find within the approved root is fine; predicates aren't paths."""
+        valid, error = check_bash_directory_boundary(
+            "find /root/projects/myapp -name '*.log'", self.cwd, self.approved
         )
         assert valid
         assert error is None

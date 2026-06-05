@@ -30,21 +30,18 @@ _FS_MODIFYING_COMMANDS: Set[str] = {
     "shred",
 }
 
-# Commands that are read-only or don't take filesystem paths
-_READ_ONLY_COMMANDS: Set[str] = {
+# Read-only commands that take filesystem-path arguments. They don't modify
+# anything, but reading outside the approved root (e.g. ``cat /etc/passwd``,
+# ``ls /root``) is still an information-disclosure escape if the OS sandbox is
+# disabled or bypassed. Their path arguments are boundary-checked just like the
+# FS-modifying commands.
+_READ_ONLY_PATH_COMMANDS: Set[str] = {
     "cat",
     "ls",
     "head",
     "tail",
     "less",
     "more",
-    "which",
-    "whoami",
-    "pwd",
-    "echo",
-    "printf",
-    "printenv",
-    "date",
     "wc",
     "sort",
     "uniq",
@@ -55,9 +52,58 @@ _READ_ONLY_COMMANDS: Set[str] = {
     "df",
     "tree",
     "realpath",
+    # Text search / stream processors that take file-path operands — a classic
+    # way to read files outside the root (e.g. ``grep x /etc/passwd``).
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "ag",
+    "sed",
+    "awk",
+    "gawk",
+    "nawk",
+    # Dump / slice / encode utilities that read a named file.
+    "cut",
+    "nl",
+    "tac",
+    "comm",
+    "join",
+    "paste",
+    "fold",
+    "fmt",
+    "expand",
+    "unexpand",
+    "od",
+    "xxd",
+    "hexdump",
+    "strings",
+    "base64",
+    # Checksums over a named file.
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "sha512sum",
+    "cksum",
+    "sum",
+}
+
+# Read-only commands that take no filesystem path (or only manipulate strings).
+# Nothing to boundary-check, so they're always allowed.
+_READ_ONLY_NO_PATH_COMMANDS: Set[str] = {
+    "which",
+    "whoami",
+    "pwd",
+    "echo",
+    "printf",
+    "printenv",
+    "date",
     "dirname",
     "basename",
 }
+
+# Union kept for any external reference; the two subsets above drive the logic.
+_READ_ONLY_COMMANDS: Set[str] = _READ_ONLY_PATH_COMMANDS | _READ_ONLY_NO_PATH_COMMANDS
 
 # Commands that fetch remote content or run arbitrary interpreted code.
 # They take paths/URLs/scripts whose static analysis is unreliable, so we
@@ -126,9 +172,6 @@ _INLINE_CODE_FLAGS: Set[str] = {
 # Without stripping these, the first token is treated as the command name,
 # which matches nothing and bypasses path validation entirely.
 _ENV_ASSIGN_RE: re.Pattern[str] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-
-# Actions / expressions that make ``find`` a filesystem-modifying command
-_FIND_MUTATING_ACTIONS: Set[str] = {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
 
 # Bash command separators
 _COMMAND_SEPARATORS: Set[str] = {"&&", "||", ";", "|", "&"}
@@ -203,14 +246,21 @@ def check_bash_directory_boundary(
 
         base_command = Path(cmd_tokens[0]).name
 
-        # Read-only commands are always allowed
-        if base_command in _READ_ONLY_COMMANDS:
+        # Read-only commands that take no filesystem path are always allowed.
+        if base_command in _READ_ONLY_NO_PATH_COMMANDS:
             continue
 
         # Determine if this specific command in the chain needs path validation
         needs_check = False
         if base_command == "find":
-            needs_check = any(t in _FIND_MUTATING_ACTIONS for t in cmd_tokens[1:])
+            # ``find`` always takes a search path; check it so a read/list of an
+            # external tree (and any -exec/-delete it performs there) is caught
+            # even with no mutating action and a disabled sandbox.
+            needs_check = True
+        elif base_command in _READ_ONLY_PATH_COMMANDS:
+            # Read-only but path-taking: check the paths so an out-of-root read
+            # (e.g. ``cat /etc/passwd``) can't slip past a disabled sandbox.
+            needs_check = True
         elif base_command in _FS_MODIFYING_COMMANDS:
             needs_check = True
         elif base_command in _NETWORK_OR_INTERP_COMMANDS:

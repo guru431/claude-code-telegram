@@ -1239,12 +1239,28 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     Sends a confirmation message then triggers SIGTERM so systemd
     (or any process manager with restart-on-exit) brings the bot back up.
 
-    Auth: protected by the auth middleware (group -2) which raises
-    ``ApplicationHandlerStop`` for unauthenticated users before any
-    handler in group 10 runs.  No per-handler check is needed.
+    Auth: the auth middleware (group -2) gates authentication, but restart is
+    a privileged DoS lever, so it is additionally restricted to admins
+    (ADMIN_USERS, falling back to ALLOWED_USERS) via ``Settings.is_admin``.
     """
+    settings: Settings = context.bot_data["settings"]
     audit_logger: AuditLogger = context.bot_data.get("audit_logger")
     user_id = update.effective_user.id
+
+    if not settings.is_admin(user_id):
+        await update.message.reply_text(
+            "🔒 <b>Admin only</b>\n\nThis command is restricted to administrators.",
+            parse_mode="HTML",
+        )
+        if audit_logger:
+            await audit_logger.log_security_violation(
+                user_id=user_id,
+                violation_type="unauthorized_admin_command",
+                details="/restart denied (not an admin)",
+                severity="medium",
+            )
+        logger.warning("Unauthorized /restart attempt", user_id=user_id)
+        return
 
     await update.message.reply_text(
         "🔄 <b>Restarting bot…</b>\n\nBack shortly.",

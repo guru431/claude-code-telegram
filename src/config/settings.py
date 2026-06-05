@@ -44,6 +44,15 @@ class Settings(BaseSettings):
     allowed_users: Optional[List[int]] = Field(
         None, description="Allowed Telegram user IDs"
     )
+    admin_users: Optional[List[int]] = Field(
+        None,
+        description=(
+            "Telegram user IDs permitted to run privileged commands (e.g. "
+            "/restart). If unset, falls back to ALLOWED_USERS (every allowed "
+            "user is an admin); set explicitly in multi-user deployments to "
+            "restrict who can restart the bot."
+        ),
+    )
     allow_all_users: bool = Field(
         False,
         description=(
@@ -309,7 +318,9 @@ class Settings(BaseSettings):
         env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
     )
 
-    @field_validator("allowed_users", "notification_chat_ids", mode="before")
+    @field_validator(
+        "allowed_users", "admin_users", "notification_chat_ids", mode="before"
+    )
     @classmethod
     def parse_int_list(cls, v: Any) -> Optional[List[int]]:
         """Parse comma-separated integer lists."""
@@ -478,6 +489,25 @@ class Settings(BaseSettings):
     def is_production(self) -> bool:
         """Check if running in production mode."""
         return not (self.debug or self.development_mode)
+
+    def is_admin(self, user_id: int) -> bool:
+        """Whether *user_id* may run privileged commands (e.g. /restart).
+
+        ADMIN_USERS semantics distinguish unset from explicitly empty:
+        - unset (``None``) -> fall back to ALLOWED_USERS, so single-user
+          deployments keep working without extra config;
+        - explicitly empty (``ADMIN_USERS=``) -> ``[]``, meaning *no* user is an
+          admin, a kill-switch for the restart lever;
+        - non-empty -> only those IDs are admins.
+
+        Also returns ``False`` when neither list is configured (e.g.
+        ALLOW_ALL_USERS dev mode), so restart is never exposed to an unbounded
+        user set.
+        """
+        admins = (
+            self.admin_users if self.admin_users is not None else self.allowed_users
+        )
+        return bool(admins) and user_id in admins
 
     @property
     def database_path(self) -> Optional[Path]:

@@ -839,9 +839,15 @@ class TestCanUseToolCallback:
         assert isinstance(result, PermissionResultAllow)
 
     async def test_allows_bash_read_only_command(self, callback, context):
-        """Read-only bash commands pass through even with external paths."""
-        result = await callback("Bash", {"command": "cat /etc/hosts"}, context)
+        """Read-only bash commands with no filesystem path pass through."""
+        result = await callback("Bash", {"command": "whoami"}, context)
         assert isinstance(result, PermissionResultAllow)
+
+    async def test_denies_read_only_command_outside_boundary(self, callback, context):
+        """Read-only commands reading outside the approved root are denied."""
+        result = await callback("Bash", {"command": "cat /etc/hosts"}, context)
+        assert isinstance(result, PermissionResultDeny)
+        assert "boundary violation" in result.message.lower()
 
     async def test_file_tool_without_path_allowed(self, callback, context):
         """File tool call without a path key is allowed (no path to validate)."""

@@ -205,8 +205,10 @@ async def test_restart_command_sends_sigterm(deps):
     update.effective_user.id = 123
     update.message.reply_text = AsyncMock()
 
+    settings = MagicMock()
+    settings.is_admin = MagicMock(return_value=True)
     context = MagicMock()
-    context.bot_data = {"audit_logger": None}
+    context.bot_data = {"audit_logger": None, "settings": settings}
 
     with patch("src.bot.handlers.command.os.kill") as mock_kill:
         await restart_command(update, context)
@@ -221,6 +223,87 @@ async def test_restart_command_sends_sigterm(deps):
     update.message.reply_text.assert_called_once()
     msg = update.message.reply_text.call_args[0][0]
     assert "Restarting" in msg
+
+
+async def test_restart_command_denied_for_non_admin(deps):
+    """A non-admin user cannot restart the bot — no signal is sent."""
+    from unittest.mock import patch
+
+    from src.bot.handlers.command import restart_command
+
+    update = MagicMock()
+    update.effective_user.id = 999
+    update.message.reply_text = AsyncMock()
+
+    settings = MagicMock()
+    settings.is_admin = MagicMock(return_value=False)
+    audit_logger = MagicMock()
+    audit_logger.log_security_violation = AsyncMock()
+    context = MagicMock()
+    context.bot_data = {"audit_logger": audit_logger, "settings": settings}
+
+    with patch("src.bot.handlers.command.os.kill") as mock_kill:
+        await restart_command(update, context)
+
+    mock_kill.assert_not_called()
+    settings.is_admin.assert_called_once_with(999)
+    audit_logger.log_security_violation.assert_awaited_once()
+    msg = update.message.reply_text.call_args[0][0]
+    assert "Admin only" in msg
+
+
+async def test_repo_scoped_to_thread_project_root_rejects_sibling(
+    agentic_settings, deps, tmp_dir
+):
+    """In thread mode /repo cannot switch to a sibling outside the project root.
+
+    The sibling lives inside the approved root but outside the topic's project
+    root; without scoping, the switch would be accepted then silently reverted.
+    """
+    (tmp_dir / "proj").mkdir()
+    (tmp_dir / "other").mkdir()
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.text = "/repo other"
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {"_thread_context": {"project_root": str(tmp_dir / "proj")}}
+    context.bot_data = {}
+
+    await orchestrator.agentic_repo(update, context)
+
+    msg = update.message.reply_text.call_args[0][0]
+    assert "Directory not found" in msg
+    assert "current_directory" not in context.user_data
+
+
+async def test_repo_scoped_to_thread_project_root_allows_child(
+    agentic_settings, deps, tmp_dir
+):
+    """A child of the topic's project root is a valid /repo target."""
+    proj = tmp_dir / "proj"
+    (proj / "sub").mkdir(parents=True)
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.text = "/repo sub"
+    update.message.reply_text = AsyncMock()
+
+    claude = MagicMock()
+    claude._find_resumable_session = AsyncMock(return_value=None)
+    context = MagicMock()
+    context.user_data = {"_thread_context": {"project_root": str(proj)}}
+    context.bot_data = {"claude_integration": claude}
+
+    await orchestrator.agentic_repo(update, context)
+
+    assert context.user_data["current_directory"] == (proj / "sub").resolve()
+    msg = update.message.reply_text.call_args[0][0]
+    assert "Switched to" in msg
 
 
 async def test_agentic_start_no_keyboard(agentic_settings, deps):

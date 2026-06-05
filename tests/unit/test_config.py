@@ -60,6 +60,67 @@ def test_allowed_users_parsing():
         assert settings.allowed_users == [123, 456, 789]
 
 
+def test_is_admin_falls_back_to_allowed_users():
+    """When ADMIN_USERS is unset, every ALLOWED_USERS entry is an admin."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        settings = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+            allowed_users="123,456",
+        )
+
+        assert settings.admin_users is None
+        assert settings.is_admin(123) is True
+        assert settings.is_admin(456) is True
+        assert settings.is_admin(999) is False
+
+
+def test_is_admin_restricts_to_admin_users_when_set():
+    """ADMIN_USERS narrows the privileged set below ALLOWED_USERS."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        settings = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+            allowed_users="123,456",
+            admin_users="123",
+        )
+
+        assert settings.admin_users == [123]
+        assert settings.is_admin(123) is True
+        # An allowed-but-not-admin user is no longer privileged.
+        assert settings.is_admin(456) is False
+
+
+def test_is_admin_empty_admin_users_disables_everyone():
+    """Explicit empty ADMIN_USERS= is a kill-switch distinct from unset."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        settings = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+            allowed_users="123,456",
+            admin_users="",
+        )
+
+        assert settings.admin_users == []
+        assert settings.is_admin(123) is False
+        assert settings.is_admin(456) is False
+
+
+def test_is_admin_false_when_no_lists_configured():
+    """With neither list set (e.g. allow-all dev mode), nobody is an admin."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        settings = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+        )
+
+        assert settings.is_admin(123) is False
+
+
 def test_allowed_users_parsing_with_spaces():
     """Test parsing with spaces around user IDs."""
     with tempfile.TemporaryDirectory() as tmp_dir:
