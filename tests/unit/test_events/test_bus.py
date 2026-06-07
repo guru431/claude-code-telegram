@@ -150,3 +150,45 @@ class TestEventBus:
         await bus.start()
         await bus.stop()
         await bus.stop()  # Should not raise
+
+    async def test_stop_drains_queued_events(self) -> None:
+        """A graceful stop dispatches events still sitting in the queue."""
+        bus = EventBus()
+        received = []
+
+        async def handler(event: Event) -> None:
+            received.append(event)
+
+        bus.subscribe(BusTestEvent, handler)
+        await bus.start()
+
+        # Enqueue several events and stop before the processor drains them.
+        for i in range(5):
+            await bus.publish(BusTestEvent(data=str(i)))
+        await bus.stop()
+
+        assert len(received) == 5
+
+    async def test_stop_completes_in_flight_event(self) -> None:
+        """An event already inside a handler must finish, not be cancelled."""
+        bus = EventBus()
+        received = []
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def handler(event: Event) -> None:
+            started.set()
+            await release.wait()
+            received.append(event)
+
+        bus.subscribe(BusTestEvent, handler)
+        await bus.start()
+        await bus.publish(BusTestEvent(data="x"))
+
+        await started.wait()  # worker is now inside the handler (in-flight)
+        stop_task = asyncio.create_task(bus.stop())
+        await asyncio.sleep(0)  # let stop() begin awaiting the worker
+        release.set()  # allow the in-flight handler to finish
+        await stop_task
+
+        assert len(received) == 1

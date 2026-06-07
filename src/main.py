@@ -33,6 +33,7 @@ from src.scheduler.scheduler import JobScheduler
 from src.security.audit import AuditLogger, InMemoryAuditStorage
 from src.security.auth import (
     AuthenticationManager,
+    AuthProvider,
     InMemoryTokenStorage,
     TokenAuthProvider,
     WhitelistAuthProvider,
@@ -96,19 +97,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def create_application(config: Settings) -> Dict[str, Any]:
-    """Create and configure the application components."""
+def _build_auth_providers(config: Settings) -> list[AuthProvider]:
+    """Build the ordered list of authentication providers from config.
+
+    Extracted from ``create_application`` so the wiring is unit-testable.
+    """
     logger = structlog.get_logger()
-    logger.info("Creating application components")
-
-    features = FeatureFlags(config)
-
-    # Initialize storage system
-    storage = Storage(config.database_url)
-    await storage.initialize()
-
-    # Create security components
-    providers = []
+    providers: list[AuthProvider] = []
 
     # Add whitelist provider if users are configured
     if config.allowed_users:
@@ -133,7 +128,16 @@ async def create_application(config: Settings) -> Dict[str, Any]:
             "restart (development only)."
         )
         token_storage = InMemoryTokenStorage()
-        providers.append(TokenAuthProvider(config.auth_token_secret, token_storage))
+        # TokenAuthProvider expects a plain str secret (it calls .encode());
+        # auth_secret_str unwraps the SecretStr, auth_token_secret would not.
+        # Settings validation already guarantees this, but assert would be
+        # stripped under ``python -O``; raise explicitly to keep fail-closed.
+        secret = config.auth_secret_str
+        if secret is None:
+            raise ConfigurationError(
+                "ENABLE_TOKEN_AUTH is set but AUTH_TOKEN_SECRET is missing."
+            )
+        providers.append(TokenAuthProvider(secret, token_storage))
 
     # Fall back to allowing all users ONLY when explicitly opted in via
     # ALLOW_ALL_USERS=true AND in development mode. The bot exposes Claude
@@ -152,6 +156,23 @@ async def create_application(config: Settings) -> Dict[str, Any]:
             "comma-separated list of Telegram IDs, enable ENABLE_TOKEN_AUTH, or "
             "(development only) set ALLOW_ALL_USERS=true to allow any user."
         )
+
+    return providers
+
+
+async def create_application(config: Settings) -> Dict[str, Any]:
+    """Create and configure the application components."""
+    logger = structlog.get_logger()
+    logger.info("Creating application components")
+
+    features = FeatureFlags(config)
+
+    # Initialize storage system
+    storage = Storage(config.database_url)
+    await storage.initialize()
+
+    # Create security components
+    providers = _build_auth_providers(config)
 
     auth_manager = AuthenticationManager(providers)
     security_validator = SecurityValidator(

@@ -31,6 +31,11 @@ class Event:
 
 EventHandler = Callable[[Event], Coroutine[Any, Any, None]]
 
+# Sentinel enqueued by stop() to wake an idle worker promptly without
+# cancelling it (cancellation would drop an in-flight, already-dequeued event).
+# A real Event instance so the typed queue accepts it; compared by identity.
+_SHUTDOWN: Event = Event(source="__shutdown_sentinel__")
+
 
 class EventBus:
     """Async event bus with typed subscriptions.
@@ -84,16 +89,28 @@ class EventBus:
         logger.info("Event bus started")
 
     async def stop(self) -> None:
-        """Stop processing events and drain the queue."""
+        """Stop processing events, finishing the in-flight event and backlog.
+
+        The worker is not cancelled up front: cancelling it while it is inside
+        ``_dispatch`` would drop an event already taken off the queue. Instead
+        we clear the running flag and wake the worker with a sentinel; it
+        finishes the current dispatch, drains the queue, and exits. Cancellation
+        is only a last-resort guard if a handler hangs past the timeout.
+        """
         if not self._running:
             return
         self._running = False
-        if self._processor_task:
-            self._processor_task.cancel()
+        task = self._processor_task
+        if task:
+            self._queue.put_nowait(_SHUTDOWN)
             try:
-                await self._processor_task
-            except asyncio.CancelledError:
-                pass
+                await asyncio.wait_for(task, timeout=30.0)
+            except asyncio.TimeoutError:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         logger.info("Event bus stopped")
 
     async def _process_events(self) -> None:
@@ -106,7 +123,22 @@ class EventBus:
             except asyncio.CancelledError:
                 break
 
+            if event is _SHUTDOWN:
+                break
             await self._dispatch(event)
+
+        # Graceful drain: dispatch events still queued at shutdown so they are
+        # not dropped. The in-flight event above always completes because the
+        # worker is never cancelled mid-dispatch.
+        drained = 0
+        while not self._queue.empty():
+            event = self._queue.get_nowait()
+            if event is _SHUTDOWN:
+                continue
+            await self._dispatch(event)
+            drained += 1
+        if drained:
+            logger.info("Drained queued events on shutdown", count=drained)
 
     async def _dispatch(self, event: Event) -> None:
         """Dispatch event to all matching handlers concurrently."""

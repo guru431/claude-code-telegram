@@ -5,7 +5,8 @@ through the Telegram bot API with rate limiting (1 msg/sec per chat).
 """
 
 import asyncio
-from typing import List, Optional
+import re
+from typing import List, Optional, Tuple
 
 import structlog
 from telegram import Bot
@@ -19,6 +20,64 @@ logger = structlog.get_logger()
 
 # Telegram rate limit: ~30 msgs/sec globally, ~1 msg/sec per chat
 SEND_INTERVAL_SECONDS = 1.1
+
+# Sentinel enqueued by stop() to wake an idle sender promptly without
+# cancelling it (cancellation would drop an in-flight, already-dequeued send).
+# A real event instance so the typed queue accepts it; compared by identity.
+_SHUTDOWN: AgentResponseEvent = AgentResponseEvent(source="__shutdown_sentinel__")
+
+# Matches an HTML start/end tag (Telegram's subset: b, i, code, pre, a, …).
+_TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9-]*)(\s[^>]*)?>")
+
+
+def _open_tags_at(html: str) -> List[Tuple[str, str]]:
+    """Return formatting tags left open at the end of *html*.
+
+    Each item is ``(full_opening_tag, tag_name)`` in nesting order, so callers
+    can close them in reverse and reopen them verbatim (preserving attributes
+    such as an anchor's ``href``).
+    """
+    stack: List[Tuple[str, str]] = []
+    for m in _TAG_RE.finditer(html):
+        name = m.group(2).lower()
+        if m.group(1) == "/":  # closing tag: pop the nearest matching open
+            for i in range(len(stack) - 1, -1, -1):
+                if stack[i][1] == name:
+                    del stack[i]
+                    break
+        else:
+            stack.append((m.group(0), name))
+    return stack
+
+
+def _choose_split_point(text: str, max_length: int) -> int:
+    """Pick an index <= max_length to cut *text*, never inside an HTML tag.
+
+    Prefers a paragraph break, then a newline, then a space; falls back to a
+    hard cut at ``max_length``. If the chosen point lands inside a ``<...>``
+    tag, it is moved back to just before that tag.
+    """
+    window = text[:max_length]
+    pos = max_length
+    for sep in ("\n\n", "\n", " "):
+        idx = window.rfind(sep)
+        if idx != -1:
+            pos = idx
+            break
+
+    # Never cut in the middle of a tag: if the last '<' before pos is not yet
+    # closed by a '>', back up to that '<'.
+    last_open = text.rfind("<", 0, pos)
+    if last_open != -1 and text.find(">", last_open, pos) == -1:
+        pos = last_open
+
+    # Likewise, never cut inside an HTML entity (&...;). Entities are short, so
+    # only look back a small window for an unterminated '&'.
+    amp = text.rfind("&", max(0, pos - 12), pos)
+    if amp != -1 and text.find(";", amp, pos) == -1:
+        pos = amp
+
+    return pos if pos > 0 else max_length
 
 
 class NotificationService:
@@ -51,16 +110,28 @@ class NotificationService:
         logger.info("Notification service started")
 
     async def stop(self) -> None:
-        """Stop the send queue processor."""
+        """Stop the sender, finishing the in-flight send and any backlog.
+
+        The worker is not cancelled up front: cancelling it mid-send would drop
+        a message already taken off the queue. We clear the running flag and
+        wake the worker with a sentinel; it finishes the current send, drains
+        the queue, and exits. Cancellation is only a last-resort guard if a send
+        hangs past the timeout.
+        """
         if not self._running:
             return
         self._running = False
-        if self._sender_task:
-            self._sender_task.cancel()
+        task = self._sender_task
+        if task:
+            self._send_queue.put_nowait(_SHUTDOWN)
             try:
-                await self._sender_task
-            except asyncio.CancelledError:
-                pass
+                await asyncio.wait_for(task, timeout=30.0)
+            except asyncio.TimeoutError:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         logger.info("Notification service stopped")
 
     async def handle_response(self, event: Event) -> None:
@@ -79,9 +150,27 @@ class NotificationService:
             except asyncio.CancelledError:
                 break
 
-            chat_ids = self._resolve_chat_ids(event)
-            for chat_id in chat_ids:
-                await self._rate_limited_send(chat_id, event)
+            if event is _SHUTDOWN:
+                break
+            await self._deliver(event)
+
+        # Graceful drain: deliver messages still queued at shutdown. The
+        # in-flight send above always completes (the worker is never cancelled
+        # mid-send).
+        drained = 0
+        while not self._send_queue.empty():
+            event = self._send_queue.get_nowait()
+            if event is _SHUTDOWN:
+                continue
+            await self._deliver(event)
+            drained += 1
+        if drained:
+            logger.info("Drained queued notifications on shutdown", count=drained)
+
+    async def _deliver(self, event: AgentResponseEvent) -> None:
+        """Send one event to all its resolved chats with rate limiting."""
+        for chat_id in self._resolve_chat_ids(event):
+            await self._rate_limited_send(chat_id, event)
 
     def _resolve_chat_ids(self, event: AgentResponseEvent) -> List[int]:
         """Determine which chats to send to."""
@@ -99,12 +188,13 @@ class NotificationService:
         if wait_time > 0:
             await asyncio.sleep(wait_time)
 
-        try:
-            # Split long messages (Telegram limit: 4096 chars)
-            text = event.text
-            chunks = self._split_message(text)
+        # Split long messages (Telegram limit: 4096 chars)
+        text = event.text
+        chunks = self._split_message(text)
+        chunk_index = 0
 
-            for chunk in chunks:
+        try:
+            for chunk_index, chunk in enumerate(chunks):
                 await self.bot.send_message(
                     chat_id=chat_id,
                     text=chunk,
@@ -124,37 +214,60 @@ class NotificationService:
                 originating_event=event.originating_event_id,
             )
         except TelegramError as e:
+            # Record which chunk failed so a partial multi-part delivery is
+            # diagnosable (and which agent run it belonged to).
             logger.error(
                 "Failed to send notification",
                 chat_id=chat_id,
                 error=str(e),
                 event_id=event.id,
+                originating_event=event.originating_event_id,
+                failed_chunk=chunk_index,
+                total_chunks=len(chunks),
             )
 
     def _split_message(self, text: str, max_length: int = 4096) -> List[str]:
-        """Split long messages at paragraph boundaries."""
+        """Split long messages without breaking Telegram HTML tags.
+
+        Messages are sent with ``ParseMode.HTML``; a naive positional split can
+        cut a ``<code>``/``<a>`` tag or leave one unbalanced, which Telegram
+        rejects (``TelegramError``) and the notification is lost. Each emitted
+        chunk is kept well-formed: tags still open at a cut are closed at the
+        chunk's end and reopened (with their attributes) at the next chunk's
+        start.
+        """
         if len(text) <= max_length:
             return [text]
 
         chunks: List[str] = []
-        while text:
-            if len(text) <= max_length:
-                chunks.append(text)
+        carry_open: List[str] = []  # opening tags to reopen on the next chunk
+        rest = text
+
+        while rest:
+            prefix = "".join(carry_open)
+            if len(prefix) + len(rest) <= max_length:
+                chunks.append(prefix + rest)
                 break
 
-            # Try to split at a paragraph boundary
-            split_pos = text.rfind("\n\n", 0, max_length)
-            if split_pos == -1:
-                # Try single newline
-                split_pos = text.rfind("\n", 0, max_length)
-            if split_pos == -1:
-                # Try space
-                split_pos = text.rfind(" ", 0, max_length)
-            if split_pos == -1:
-                # Hard split
-                split_pos = max_length
+            budget = max_length - len(prefix)
+            split_len = _choose_split_point(rest, budget)
+            segment = rest[:split_len]
+            open_now = _open_tags_at(prefix + segment)
+            closing = "".join(f"</{name}>" for _, name in reversed(open_now))
 
-            chunks.append(text[:split_pos])
-            text = text[split_pos:].lstrip()
+            # If the closing tags push the chunk past the limit, re-cut leaving
+            # room for them. Plain text has no closing tags, so the exact cut is
+            # preserved.
+            if closing and len(prefix) + split_len + len(closing) > max_length:
+                budget = max_length - len(prefix) - len(closing)
+                split_len = _choose_split_point(rest, budget)
+                segment = rest[:split_len]
+                open_now = _open_tags_at(prefix + segment)
+                closing = "".join(f"</{name}>" for _, name in reversed(open_now))
+
+            chunks.append(prefix + segment + closing)
+            carry_open = [full for full, _ in open_now]
+            # Drop leading whitespace of the next part (matches old behavior).
+            rest = rest[split_len:].lstrip()
 
         return chunks

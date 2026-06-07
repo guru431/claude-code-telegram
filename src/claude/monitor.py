@@ -107,9 +107,10 @@ _READ_ONLY_COMMANDS: Set[str] = _READ_ONLY_PATH_COMMANDS | _READ_ONLY_NO_PATH_CO
 
 # Commands that fetch remote content or run arbitrary interpreted code.
 # They take paths/URLs/scripts whose static analysis is unreliable, so we
-# treat them like FS-modifying commands and require boundary checks (a URL
-# argument won't resolve to a path inside approved_directory, so it will be
-# rejected — that is intentional).
+# treat them like FS-modifying commands and require boundary checks. A
+# ``scheme://`` argument resolves to a literal subdir *inside* the working dir
+# (so a naive path check would wrongly pass it); it is rejected explicitly via
+# ``_URL_SCHEME_RE`` in the token loop below.
 _NETWORK_OR_INTERP_COMMANDS: Set[str] = {
     "curl",
     "wget",
@@ -150,6 +151,10 @@ _INTERP_COMMANDS: Set[str] = {
     "sh",
     "zsh",
 }
+
+# Matches a ``scheme://`` prefix (http, https, ftp, file, …). Used to spot URL
+# arguments to network commands, which are remote fetches rather than paths.
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
 
 # Flags that introduce inline code / opaque module execution across the
 # interpreters above (python -c/-m, node -e/-p/--eval/--print,
@@ -303,7 +308,34 @@ def check_bash_directory_boundary(
             # Skip flags only before ``--`` to prevent attackers smuggling paths
             # past the boundary by prefixing them with ``-`` (e.g. ``rm -- -foo``).
             if not seen_double_dash and token.startswith("-"):
+                # A long option can still carry a URL (``curl --url=https://…``);
+                # check the value side before waving the flag through.
+                if base_command in _NETWORK_OR_INTERP_COMMANDS and "=" in token:
+                    value = token.split("=", 1)[1]
+                    if _URL_SCHEME_RE.match(value):
+                        return False, (
+                            f"Directory boundary violation: '{base_command}' "
+                            f"fetches remote URL '{value}', which cannot be "
+                            f"validated against approved directory "
+                            f"'{resolved_approved}'"
+                        )
                 continue
+
+            # A ``scheme://`` argument to a network command (curl/wget/fetch …)
+            # is a remote fetch, not a filesystem path. Resolving it against the
+            # working dir lands it *inside* the boundary as a literal subdir
+            # (e.g. ``cwd/https:/evil.com``) and would falsely pass, so reject
+            # such commands outright — they can't be validated against the dir
+            # boundary. Checked before the ``=`` split so query strings
+            # (``?a=b``) don't strip the scheme.
+            if base_command in _NETWORK_OR_INTERP_COMMANDS and _URL_SCHEME_RE.match(
+                token
+            ):
+                return False, (
+                    f"Directory boundary violation: '{base_command}' fetches "
+                    f"remote URL '{token}', which cannot be validated against "
+                    f"approved directory '{resolved_approved}'"
+                )
 
             # ``key=value`` operands (e.g. ``dd of=/etc/shadow``) hide the real
             # path on the right of ``=``; resolving the whole token would treat
@@ -311,14 +343,19 @@ def check_bash_directory_boundary(
             # miss the escape. Check the value part instead.
             if "=" in token:
                 token = token.split("=", 1)[1]
+                # The value side may itself be a URL (e.g. ``url=https://…``);
+                # re-apply the scheme check the whole-token match missed.
+                if (
+                    base_command in _NETWORK_OR_INTERP_COMMANDS
+                    and _URL_SCHEME_RE.match(token)
+                ):
+                    return False, (
+                        f"Directory boundary violation: '{base_command}' fetches "
+                        f"remote URL '{token}', which cannot be validated against "
+                        f"approved directory '{resolved_approved}'"
+                    )
                 if not token:
                     continue
-
-            # For network/interp commands a non-flag token that *looks* like
-            # a URL/scheme is not a filesystem path; rejecting it via path
-            # resolution still works because Path("https://...").resolve()
-            # yields a path inside working_directory that won't escape.
-            # The check below handles both cases uniformly.
 
             # Resolve both absolute and relative paths against the working
             # directory so that traversal sequences like ``../../evil`` are
