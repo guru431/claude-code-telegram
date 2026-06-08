@@ -3,6 +3,7 @@
 Provides simple interface for bot handlers.
 """
 
+import asyncio
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -39,6 +40,8 @@ class ClaudeIntegration:
         on_stream: Optional[Callable[[StreamUpdate], None]] = None,
         force_new: bool = False,
         allowed_tools_override: Optional[List[str]] = None,
+        images: Optional[List[Dict[str, str]]] = None,
+        interrupt_event: Optional["asyncio.Event"] = None,
     ) -> ClaudeResponse:
         """Run Claude Code command with full integration.
 
@@ -94,6 +97,8 @@ class ClaudeIntegration:
                     continue_session=should_continue,
                     stream_callback=on_stream,
                     allowed_tools_override=allowed_tools_override,
+                    images=images,
+                    interrupt_event=interrupt_event,
                 )
             except Exception as resume_error:
                 # If resume failed (e.g., session expired/missing on Claude's side),
@@ -124,6 +129,8 @@ class ClaudeIntegration:
                         continue_session=False,
                         stream_callback=on_stream,
                         allowed_tools_override=allowed_tools_override,
+                        images=images,
+                        interrupt_event=interrupt_event,
                     )
                 else:
                     raise
@@ -168,6 +175,8 @@ class ClaudeIntegration:
         continue_session: bool = False,
         stream_callback: Optional[Callable] = None,
         allowed_tools_override: Optional[List[str]] = None,
+        images: Optional[List[Dict[str, str]]] = None,
+        interrupt_event: Optional[asyncio.Event] = None,
     ) -> ClaudeResponse:
         """Execute command via SDK."""
         return await self.sdk_manager.execute_command(
@@ -177,6 +186,8 @@ class ClaudeIntegration:
             continue_session=continue_session,
             stream_callback=stream_callback,
             allowed_tools_override=allowed_tools_override,
+            images=images,
+            interrupt_event=interrupt_event,
         )
 
     async def _find_resumable_session(

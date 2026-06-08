@@ -8,7 +8,9 @@ Features:
 """
 
 import asyncio
+import os
 from typing import Any, Callable, Dict, Optional
+from urllib.parse import urlsplit
 
 import structlog
 from telegram import Update
@@ -55,11 +57,33 @@ class ClaudeCodeBot:
         builder.defaults(Defaults(do_quote=self.settings.reply_quote))
         builder.rate_limiter(AIORateLimiter(max_retries=1))
 
+        # Sequential update processing with priority bypass for stop: callbacks,
+        # so the Stop button can interrupt a running handler.
+        from .update_processor import StopAwareUpdateProcessor
+
+        builder.concurrent_updates(StopAwareUpdateProcessor())
+
         # Configure connection settings
         builder.connect_timeout(30)
         builder.read_timeout(30)
         builder.write_timeout(30)
         builder.pool_timeout(30)
+
+        # Explicitly set proxy from environment variables. python-telegram-bot's
+        # Application.builder() does not automatically use HTTP_PROXY/HTTPS_PROXY.
+        # Without this, the httpx connection pool can become corrupted when running
+        # behind a proxy (Clash, V2Ray), causing the bot to stop responding.
+        proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+        if proxy_url:
+            builder.proxy(proxy_url)
+            # Log only host:port — the proxy URL may embed credentials
+            # (http://user:pass@host) that must not leak into logs.
+            parsed = urlsplit(proxy_url)
+            logger.info(
+                "Proxy configured",
+                proxy_host=parsed.hostname,
+                proxy_port=parsed.port,
+            )
 
         self.app = builder.build()
 

@@ -3,7 +3,7 @@
 import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 import structlog
 from claude_agent_sdk import (
@@ -52,6 +52,7 @@ class ClaudeResponse:
     is_error: bool = False
     error_type: Optional[str] = None
     tools_used: List[Dict[str, Any]] = field(default_factory=list)
+    interrupted: bool = False
 
 
 @dataclass
@@ -146,6 +147,17 @@ class ClaudeSDKManager:
         else:
             logger.info("No API key provided, using existing Claude CLI authentication")
 
+    def _is_retryable_error(self, exc: BaseException) -> bool:
+        """Return True for transient errors that warrant a retry.
+
+        asyncio.TimeoutError is intentional (user-configured timeout) — not
+        retried. Only non-MCP CLIConnectionError is considered transient.
+        """
+        if isinstance(exc, CLIConnectionError):
+            msg = str(exc).lower()
+            return "mcp" not in msg  # "server" alone is too broad
+        return False
+
     async def execute_command(
         self,
         prompt: str,
@@ -154,6 +166,8 @@ class ClaudeSDKManager:
         continue_session: bool = False,
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
         allowed_tools_override: Optional[List[str]] = None,
+        images: Optional[List[Dict[str, str]]] = None,
+        interrupt_event: Optional[asyncio.Event] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -293,6 +307,7 @@ class ClaudeSDKManager:
 
             # Collect messages via ClaudeSDKClient
             messages: List[Message] = []
+            interrupted = False
 
             async def _run_client() -> None:
                 # Use connect(None) + query(prompt) pattern because
@@ -302,7 +317,37 @@ class ClaudeSDKManager:
                 client = ClaudeSDKClient(options)
                 try:
                     await client.connect()
-                    await client.query(prompt)
+
+                    if images:
+                        content_blocks: List[Dict[str, Any]] = []
+                        for img in images:
+                            media_type = img.get("media_type", "image/png")
+                            content_blocks.append(
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": img["data"],
+                                    },
+                                }
+                            )
+                        content_blocks.append({"type": "text", "text": prompt})
+
+                        multimodal_msg = {
+                            "type": "user",
+                            "message": {
+                                "role": "user",
+                                "content": content_blocks,
+                            },
+                        }
+
+                        async def _multimodal_prompt() -> AsyncIterator[Dict[str, Any]]:
+                            yield multimodal_msg
+
+                        await client.query(_multimodal_prompt())
+                    else:
+                        await client.query(prompt)
 
                     # Iterate over raw messages and parse them ourselves
                     # so that MessageParseError (e.g. from rate_limit_event)
@@ -353,11 +398,98 @@ class ClaudeSDKManager:
                 finally:
                     await client.disconnect()
 
-            # Execute with timeout
-            await asyncio.wait_for(
-                _run_client(),
-                timeout=self.config.claude_timeout_seconds,
-            )
+            # Execute with timeout and retry on transient connection errors.
+            max_attempts = max(1, self.config.claude_retry_max_attempts)
+            last_exc: Optional[BaseException] = None
+
+            for attempt in range(max_attempts):
+                # Reset message accumulator each attempt so a failed attempt
+                # does not pollute the next with partial/duplicate messages.
+                # _run_client() closes over `messages` by reference, so clearing
+                # it here is seen by every new call.
+                messages.clear()
+
+                if attempt > 0:
+                    delay = min(
+                        self.config.claude_retry_base_delay
+                        * (self.config.claude_retry_backoff_factor ** (attempt - 1)),
+                        self.config.claude_retry_max_delay,
+                    )
+                    logger.warning(
+                        "Retrying Claude SDK command",
+                        attempt=attempt + 1,
+                        max_attempts=max_attempts,
+                        delay_seconds=delay,
+                    )
+                    await asyncio.sleep(delay)
+
+                # Race the client against timeout and optional user interrupt.
+                run_task = asyncio.create_task(_run_client())
+
+                interrupt_watcher: Optional["asyncio.Task[None]"] = None
+                if interrupt_event is not None:
+
+                    async def _cancel_on_interrupt() -> None:
+                        nonlocal interrupted
+                        await interrupt_event.wait()
+                        interrupted = True
+                        run_task.cancel()
+
+                    interrupt_watcher = asyncio.create_task(_cancel_on_interrupt())
+
+                # Note: asyncio.TimeoutError is intentionally NOT retried —
+                # it reflects a user-configured hard limit and propagates out.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(run_task),
+                        timeout=self.config.claude_timeout_seconds,
+                    )
+                    break  # success — exit retry loop
+                except asyncio.CancelledError:
+                    if not interrupted:
+                        raise
+                    # Interrupt cancelled the task — wait for cleanup
+                    try:
+                        await run_task
+                    except asyncio.CancelledError:
+                        pass
+                    break  # user interrupted — don't retry
+                except asyncio.TimeoutError:
+                    # shield() keeps run_task alive past wait_for's timeout, so
+                    # cancel it explicitly to avoid leaking the background task.
+                    run_task.cancel()
+                    try:
+                        await run_task
+                    except asyncio.CancelledError:
+                        pass
+                    raise  # timeout — don't retry
+                except CLIConnectionError as exc:
+                    # Only retry when NOTHING was received yet. Once any message
+                    # has streamed in, the prompt reached Claude and tool calls
+                    # (Bash/Edit/Write) may already have executed — replaying the
+                    # whole request could run a mutating operation twice. A
+                    # connection error before the first message is safe to retry
+                    # (it failed during connect/query, before any side effects).
+                    if (
+                        not messages
+                        and self._is_retryable_error(exc)
+                        and attempt < max_attempts - 1
+                    ):
+                        last_exc = exc
+                        logger.warning(
+                            "Transient connection error before first message, "
+                            "will retry",
+                            attempt=attempt + 1,
+                            error=str(exc),
+                        )
+                        continue
+                    raise  # non-retryable, side effects possible, or exhausted
+                finally:
+                    if interrupt_watcher is not None:
+                        interrupt_watcher.cancel()
+            else:
+                if last_exc is not None:
+                    raise last_exc
 
             # Extract cost, tools, and session_id from result message
             cost = 0.0
@@ -442,6 +574,7 @@ class ClaudeSDKManager:
                     ]
                 ),
                 tools_used=tools_used,
+                interrupted=interrupted,
             )
 
         except asyncio.TimeoutError:

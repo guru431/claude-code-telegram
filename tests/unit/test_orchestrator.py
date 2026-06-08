@@ -150,10 +150,10 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
         if isinstance(call[0][0], CallbackQueryHandler)
     ]
 
-    # 4 message handlers (text, document, photo, voice)
-    assert len(msg_handlers) == 4
-    # 2 callback handlers (cd: for repo switch, resume: for /sessions)
-    assert len(cb_handlers) == 2
+    # 5 message handlers (text, unknown-command passthrough, document, photo, voice)
+    assert len(msg_handlers) == 5
+    # 3 callback handlers (stop:, cd: for repo switch, resume: for /sessions)
+    assert len(cb_handlers) == 3
 
 
 async def test_agentic_bot_commands(agentic_settings, deps):
@@ -442,11 +442,12 @@ async def test_agentic_callbacks_scoped_to_cd_and_resume_patterns(
         if isinstance(call[0][0], CallbackQueryHandler)
     ]
 
-    assert len(cb_handlers) == 2
+    assert len(cb_handlers) == 3
     # Every handler is scoped to a specific prefix (no catch-all).
     assert all(h.pattern is not None for h in cb_handlers)
     assert any(h.pattern.match("cd:my_project") for h in cb_handlers)
     assert any(h.pattern.match("resume:abc123") for h in cb_handlers)
+    assert any(h.pattern.match("stop:123") for h in cb_handlers)
 
 
 async def test_agentic_document_rejects_large_files(agentic_settings, deps):
