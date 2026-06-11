@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Optional, Set, Tuple
 
 # Subdirectories under ~/.claude/ that Claude Code uses internally.
-_CLAUDE_INTERNAL_SUBDIRS: Set[str] = {"plans", "todos", "settings.json"}
+# NOTE: settings.json is intentionally excluded — writing ~/.claude/settings.json
+# allows arbitrary hook execution, so it must fall through to validate_path.
+_CLAUDE_INTERNAL_SUBDIRS: Set[str] = {"plans", "todos"}
 
 # Commands that modify the filesystem or change context and should have paths checked
 _FS_MODIFYING_COMMANDS: Set[str] = {
@@ -181,6 +183,12 @@ _ENV_ASSIGN_RE: re.Pattern[str] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # Bash command separators
 _COMMAND_SEPARATORS: Set[str] = {"&&", "||", ";", "|", "&"}
 
+# Redirection operators. The token *following* one of these is a filesystem
+# path the command writes to / reads from (e.g. ``echo x > /etc/cron.d/y``),
+# and must be boundary-checked even when the lead command takes no path of its
+# own (``echo``). shlex.split keeps these as standalone tokens.
+_REDIRECTION_OPERATORS: Set[str] = {">", ">>", "<", "<>", ">|", "&>", "&>>"}
+
 # Bash subshell / command-substitution patterns. shlex.split silently absorbs
 # these into a token (e.g. "$(rm -rf /)" becomes a single token), bypassing
 # per-command boundary checks. Reject them outright.
@@ -210,12 +218,25 @@ def check_bash_directory_boundary(
                 "command-substitution syntax which cannot be safely validated"
             )
 
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        # If we can't parse the command, let it through —
-        # the sandbox will catch it at the OS level
-        return True, None
+    # Newlines are command separators in bash, but shlex.split collapses them
+    # into ordinary whitespace — so ``echo a\nrm -rf /outside`` would be parsed
+    # as a single ``echo``-led chain and skip path validation. Split on newlines
+    # first and tokenize each physical line independently so each line becomes
+    # its own command chain.
+    tokens: list[str] = []
+    for line in command.replace("\r", "\n").split("\n"):
+        if not line.strip():
+            continue
+        try:
+            line_tokens = shlex.split(line)
+        except ValueError:
+            # If we can't parse the line, let it through —
+            # the sandbox will catch it at the OS level
+            return True, None
+        if tokens and line_tokens:
+            # Treat the line break as a separator between chains.
+            tokens.append(";")
+        tokens.extend(line_tokens)
 
     if not tokens:
         return True, None
@@ -237,6 +258,18 @@ def check_bash_directory_boundary(
 
     resolved_approved = approved_directory.resolve()
 
+    def _path_escapes(path_token: str) -> bool:
+        """Return True if *path_token* resolves outside the approved directory."""
+        try:
+            if path_token.startswith("/"):
+                resolved = Path(path_token).resolve()
+            else:
+                resolved = (working_directory / path_token).resolve()
+            return not _is_within_directory(resolved, resolved_approved)
+        except (ValueError, OSError):
+            # Unresolvable: rely on the OS-level sandbox rather than guessing.
+            return False
+
     # Check each command in the chain
     for cmd_tokens in command_chains:
         if not cmd_tokens:
@@ -250,6 +283,20 @@ def check_bash_directory_boundary(
             continue
 
         base_command = Path(cmd_tokens[0]).name
+
+        # Redirection targets are filesystem paths the command writes to / reads
+        # from regardless of the lead command. Validate the token after each
+        # redirection operator even for no-path commands like ``echo`` (so
+        # ``echo x > /etc/cron.d/y`` is caught).
+        for idx, token in enumerate(cmd_tokens):
+            if token in _REDIRECTION_OPERATORS and idx + 1 < len(cmd_tokens):
+                target = cmd_tokens[idx + 1]
+                if _path_escapes(target):
+                    return False, (
+                        f"Directory boundary violation: redirection targets "
+                        f"'{target}' which is outside approved directory "
+                        f"'{resolved_approved}'"
+                    )
 
         # Read-only commands that take no filesystem path are always allowed.
         if base_command in _READ_ONLY_NO_PATH_COMMANDS:

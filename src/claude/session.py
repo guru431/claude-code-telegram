@@ -233,6 +233,35 @@ class SessionManager:
             message_count=session.message_count,
         )
 
+    async def migrate_session_id(
+        self, session: ClaudeSession, new_session_id: str
+    ) -> None:
+        """Re-key a session to *new_session_id* after Claude forked the id.
+
+        On resume Claude may return a different session_id than the one we
+        sent (a fork). Without re-keying, the stored session keeps the old id
+        and the fresh conversation can no longer be resumed. This moves the
+        session under the new id in both the in-memory cache and storage.
+        """
+        old_session_id = session.session_id
+        if not new_session_id or new_session_id == old_session_id:
+            return
+
+        if old_session_id in self.active_sessions:
+            del self.active_sessions[old_session_id]
+
+        session.session_id = new_session_id
+        self.active_sessions[new_session_id] = session
+        await self.storage.save_session(session)
+        if old_session_id:
+            await self.storage.delete_session(old_session_id)
+
+        logger.info(
+            "Migrated session to forked Claude session id",
+            old_session_id=old_session_id,
+            new_session_id=new_session_id,
+        )
+
     async def remove_session(self, session_id: str) -> None:
         """Remove session."""
         if session_id in self.active_sessions:

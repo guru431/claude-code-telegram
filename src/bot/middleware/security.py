@@ -226,7 +226,7 @@ async def validate_file_upload(
     """Validate file uploads for security."""
 
     filename = getattr(document, "file_name", "unknown")
-    file_size = getattr(document, "file_size", 0)
+    file_size = document.file_size or 0
     mime_type = getattr(document, "mime_type", "unknown")
 
     # Validate filename

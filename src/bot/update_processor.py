@@ -1,6 +1,8 @@
 """Selective-concurrency update processor for PTB.
 
-Regular updates (messages, commands) process sequentially -- one at a time.
+Regular updates (messages, commands) process sequentially *per user* -- one at
+a time for a given user, but different users run concurrently so one user's
+long Claude run never blocks everyone else.
 Priority callbacks (stop:*) bypass the queue and run immediately so they can
 interrupt the currently-running handler.
 """
@@ -21,8 +23,8 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
 
     For priority callbacks (``stop:*``): we just ``await coroutine`` -- runs
     immediately.
-    For everything else: we acquire ``_sequential_lock`` first -- only one
-    runs at a time.
+    For everything else: we acquire that user's lock first -- only one update
+    per user runs at a time, while distinct users proceed concurrently.
 
     A stop callback arrives while a text handler holds the lock -> stop
     callback runs concurrently -> fires the ``asyncio.Event`` -> the watcher
@@ -32,14 +34,15 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
     Caveat — the priority bypass is not absolute. ``BaseUpdateProcessor``
     acquires a shared semaphore (size :attr:`_MAX_CONCURRENT`) *before*
     dispatching to ``do_process_update``, and regular updates waiting on
-    ``_sequential_lock`` keep holding their semaphore slot while they wait.
+    their per-user lock keep holding their semaphore slot while they wait.
     If more than :attr:`_MAX_CONCURRENT` regular updates are queued at once,
     every slot is held by a waiter and a ``stop:`` callback would have to wait
     for a slot too. The limit is therefore set very high so this only matters
     under extreme flooding; with it sized so, the bypass holds in practice.
-    Regular updates are still serialized one-at-a-time by ``_sequential_lock``
-    regardless of the limit, so the high value does not increase real
-    concurrency — it only governs how many updates may sit queued.
+    Regular updates are still serialized one-at-a-time per user by their
+    per-user lock regardless of the limit, so the high value does not increase
+    real per-user concurrency — it only governs how many updates may sit
+    queued.
     """
 
     _PRIORITY_PREFIXES = ("stop:",)
@@ -51,7 +54,10 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
         # max_concurrent is overridable mainly so tests can exercise the
         # saturation edge with a small slot pool.
         super().__init__(max_concurrent_updates=max_concurrent or self._MAX_CONCURRENT)
-        self._sequential_lock = asyncio.Lock()
+        # One lock per user id so distinct users run concurrently; a single
+        # fallback lock serializes updates that carry no effective_user.
+        self._user_locks: dict[int, asyncio.Lock] = {}
+        self._fallback_lock = asyncio.Lock()
 
     @classmethod
     def _is_priority_callback(cls, update: object) -> bool:
@@ -75,9 +81,23 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
             # Run immediately -- no sequential lock
             await coroutine
         else:
-            # One at a time for everything else
-            async with self._sequential_lock:
+            # One at a time per user; distinct users run concurrently.
+            async with self._lock_for(update):
                 await coroutine
+
+    def _lock_for(self, update: object) -> asyncio.Lock:
+        """Return the serialization lock for this update's user.
+
+        Updates without an effective_user share a single fallback lock.
+        """
+        if isinstance(update, Update) and update.effective_user:
+            user_id = update.effective_user.id
+            lock = self._user_locks.get(user_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._user_locks[user_id] = lock
+            return lock
+        return self._fallback_lock
 
     async def initialize(self) -> None:
         """Initialize the processor (no-op)."""

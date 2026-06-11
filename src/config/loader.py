@@ -165,6 +165,9 @@ def _validate_config(settings: Settings) -> None:
     if settings.rate_limit_window <= 0:
         raise InvalidConfigError("rate_limit_window must be positive")
 
+    if settings.rate_limit_burst <= 0:
+        raise InvalidConfigError("rate_limit_burst must be positive")
+
     if settings.claude_timeout_seconds <= 0:
         raise InvalidConfigError("claude_timeout_seconds must be positive")
 

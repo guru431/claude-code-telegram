@@ -367,6 +367,50 @@ class TestCheckBashDirectoryBoundary:
         assert not valid
         assert "boundary" in error.lower()
 
+    # --- redirection and newline separators ---
+
+    def test_redirection_to_outside_path_blocked(self) -> None:
+        """``echo x > /etc/passwd`` writes outside via redirection; block it.
+
+        The lead command ``echo`` takes no path of its own, so without checking
+        the redirection target the write to /etc/passwd would slip through.
+        """
+        valid, error = check_bash_directory_boundary(
+            "echo x > /etc/passwd", self.cwd, self.approved
+        )
+        assert not valid
+        assert "directory boundary violation" in error.lower()
+        assert "/etc/passwd" in error
+
+    def test_append_redirection_to_outside_path_blocked(self) -> None:
+        """``echo x >> /etc/cron.d/y`` (append) must also be blocked."""
+        valid, error = check_bash_directory_boundary(
+            "echo x >> /etc/cron.d/y", self.cwd, self.approved
+        )
+        assert not valid
+        assert "/etc/cron.d/y" in error
+
+    def test_redirection_inside_boundary_passes(self) -> None:
+        """Redirection to a path inside the approved dir is fine."""
+        valid, error = check_bash_directory_boundary(
+            "echo x > out.txt", self.cwd, self.approved
+        )
+        assert valid
+        assert error is None
+
+    def test_newline_separated_command_outside_blocked(self) -> None:
+        """A newline separates commands; ``rm`` outside the dir must be caught.
+
+        shlex collapses newlines into whitespace, so the second command would
+        otherwise be parsed as arguments to the first (``echo``) and skipped.
+        """
+        valid, error = check_bash_directory_boundary(
+            "echo a\nrm -rf /outside", self.cwd, self.approved
+        )
+        assert not valid
+        assert "directory boundary violation" in error.lower()
+        assert "/outside" in error
+
     def test_curl_url_in_long_option_is_rejected(self) -> None:
         """A URL in a ``--opt=URL`` long option must be blocked too.
 
@@ -399,13 +443,14 @@ class TestIsClaudeInternalPath:
             todo_file.touch()
             assert _is_claude_internal_path(str(todo_file)) is True
 
-    def test_settings_json_is_internal(self, tmp_path: Path) -> None:
-        """~/.claude/settings.json should be recognised as internal."""
+    def test_settings_json_is_not_internal(self, tmp_path: Path) -> None:
+        """~/.claude/settings.json must NOT be internal — writing it enables
+        arbitrary hook execution, so it falls through to validate_path."""
         with patch("src.claude.monitor.Path.home", return_value=tmp_path):
             (tmp_path / ".claude").mkdir(parents=True)
             settings_file = tmp_path / ".claude" / "settings.json"
             settings_file.touch()
-            assert _is_claude_internal_path(str(settings_file)) is True
+            assert _is_claude_internal_path(str(settings_file)) is False
 
     def test_arbitrary_file_under_claude_dir_rejected(self, tmp_path: Path) -> None:
         """Files directly under ~/.claude/ (not in known subdirs) are rejected."""

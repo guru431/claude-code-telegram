@@ -96,16 +96,17 @@ class TestStorageFacade:
         assert len(tool_usage) == 1
         assert tool_usage[0].tool_name == "Read"
 
-        # Check user stats were updated
+        # Check user stats were updated (atomic increment)
         updated_user = await storage.users.get_user(12347)
         assert updated_user.total_cost == 0.05
         assert updated_user.message_count == 1
 
-        # Check session stats were updated
+        # Session counters are owned by SessionManager/SQLiteSessionStorage and
+        # are NOT incremented by save_claude_interaction (avoids double-count).
         updated_session = await storage.sessions.get_session("claude-session")
-        assert updated_session.total_cost == 0.05
-        assert updated_session.message_count == 1
-        assert updated_session.total_turns == 1
+        assert updated_session.total_cost == 0.0
+        assert updated_session.message_count == 0
+        assert updated_session.total_turns == 0
 
     async def test_is_user_allowed(self, storage):
         """Test checking user permissions."""
@@ -149,10 +150,11 @@ class TestStorageFacade:
         summary = await storage.get_user_session_summary(12350)
         assert summary["total_sessions"] == 3
         assert summary["active_sessions"] == 3
-        assert (
-            abs(summary["total_cost"] - 0.3) < 0.0001
-        )  # Handle floating point precision
-        assert summary["total_messages"] == 3
+        # Session-row cost/message counters are owned by SessionManager and are
+        # not written by save_claude_interaction, so they remain 0 in this
+        # facade-only path (no double-count).
+        assert abs(summary["total_cost"] - 0.0) < 0.0001
+        assert summary["total_messages"] == 0
         assert len(summary["projects"]) == 3
 
     async def test_get_session_history(self, storage):

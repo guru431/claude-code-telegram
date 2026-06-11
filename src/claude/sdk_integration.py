@@ -103,6 +103,27 @@ def _make_can_use_tool_callback(
                     )
                     return PermissionResultDeny(message=error or "Invalid file path")
 
+                # validate_path only enforces the directory boundary; it does
+                # NOT block secret/forbidden basenames (.env, .ssh, id_rsa,
+                # *.pem, …). Re-check the basename against the secret blocklist
+                # so a Read of an in-boundary secret like <approved_dir>/.env is
+                # still denied. We deliberately use is_forbidden_secret_file
+                # (not validate_filename) so legitimate in-repo files such as
+                # .editorconfig / config.cfg are not over-blocked.
+                forbidden, name_error = security_validator.is_forbidden_secret_file(
+                    Path(file_path).name
+                )
+                if forbidden:
+                    logger.warning(
+                        "can_use_tool denied forbidden filename",
+                        tool_name=tool_name,
+                        file_path=file_path,
+                        error=name_error,
+                    )
+                    return PermissionResultDeny(
+                        message=name_error or "Forbidden filename"
+                    )
+
         # Bash directory boundary validation
         if tool_name in _BASH_TOOLS:
             command = tool_input.get("command", "")
@@ -496,11 +517,19 @@ class ClaudeSDKManager:
             tools_used: List[Dict[str, Any]] = []
             claude_session_id = None
             result_content = None
+            is_error = False
+            error_type: Optional[str] = None
+            saw_result_message = False
             for message in messages:
                 if isinstance(message, ResultMessage):
+                    saw_result_message = True
                     cost = getattr(message, "total_cost_usd", 0.0) or 0.0
                     claude_session_id = getattr(message, "session_id", None)
                     result_content = getattr(message, "result", None)
+                    # Surface Claude-reported failures instead of treating them
+                    # as success (cost/session would otherwise look clean).
+                    is_error = bool(getattr(message, "is_error", False))
+                    error_type = getattr(message, "subtype", None)
                     current_time = asyncio.get_event_loop().time()
                     for msg in messages:
                         if isinstance(msg, AssistantMessage):
@@ -531,6 +560,17 @@ class ClaudeSDKManager:
                             session_id=claude_session_id,
                         )
                         break
+
+            # If no ResultMessage ever arrived (e.g. the final one hit a
+            # MessageParseError and was skipped), cost/session_id are lost and
+            # the run would otherwise look successful. Make the failure visible.
+            if not saw_result_message:
+                logger.warning(
+                    "No ResultMessage received; cost and session_id may be lost",
+                    message_count=len(messages),
+                )
+                is_error = True
+                error_type = error_type or "no_result_message"
 
             # Calculate duration
             duration_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
@@ -573,6 +613,8 @@ class ClaudeSDKManager:
                         if isinstance(m, (UserMessage, AssistantMessage))
                     ]
                 ),
+                is_error=is_error,
+                error_type=error_type,
                 tools_used=tools_used,
                 interrupted=interrupted,
             )

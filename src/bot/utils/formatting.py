@@ -7,7 +7,7 @@ from typing import List, Optional
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ...config.settings import Settings
-from .html_format import escape_html, markdown_to_telegram_html
+from .html_format import escape_html, markdown_to_telegram_html, tg_len
 
 
 @dataclass
@@ -37,22 +37,16 @@ class ResponseFormatter:
     def format_claude_response(
         self, text: str, context: Optional[dict] = None
     ) -> List[FormattedMessage]:
-        """Enhanced formatting with context awareness and semantic chunking."""
-        # Clean and prepare text
+        """Convert Claude's markdown to HTML and split tag-safely for Telegram."""
+        # Clean and prepare text (markdown -> Telegram HTML)
         text = self._clean_text(text)
 
-        # Check if we need semantic chunking (for complex content)
-        if self._should_use_semantic_chunking(text):
-            # Use enhanced semantic chunking for complex content
-            chunks = self._semantic_chunk(text, context)
-            messages = []
-            for chunk in chunks:
-                formatted = self._format_chunk(chunk)
-                messages.extend(formatted)
-        else:
-            # Use original simple formatting for basic content
-            text = self._format_code_blocks(text)
-            messages = self._split_message(text)
+        # Truncate oversized code blocks, then split with the tag-aware splitter.
+        # Splitting must run on the converted HTML so it never cuts inside a
+        # <pre>/<b>/<a> tag (semantic chunking on markers no longer present in
+        # the HTML would split mid-tag and trigger Telegram 400s).
+        text = self._format_code_blocks(text)
+        messages = self._split_message(text)
 
         # Add context-aware quick actions to the last message
         if messages and self.settings.enable_quick_actions:
@@ -66,28 +60,6 @@ class ResponseFormatter:
             if messages
             else [FormattedMessage("<i>(No content to display)</i>")]
         )
-
-    def _should_use_semantic_chunking(self, text: str) -> bool:
-        """Determine if semantic chunking is needed."""
-        # Use semantic chunking for complex content with multiple code blocks,
-        # file operations, or very long text
-        code_block_count = text.count("```")
-        has_file_operations = any(
-            indicator in text
-            for indicator in [
-                "Creating file",
-                "Editing file",
-                "Reading file",
-                "Writing to",
-                "Modified file",
-                "Deleted file",
-                "File created",
-                "File updated",
-            ]
-        )
-        is_very_long = len(text) > self.max_message_length * 2
-
-        return code_block_count > 2 or has_file_operations or is_very_long
 
     def format_error_message(
         self, error: str, error_type: str = "Error"
@@ -188,224 +160,6 @@ class ResponseFormatter:
 
         return FormattedMessage(text, parse_mode="HTML")
 
-    def _semantic_chunk(self, text: str, context: Optional[dict]) -> List[dict]:
-        """Split text into semantic chunks based on content type."""
-        chunks = []
-
-        # Identify different content sections
-        sections = self._identify_sections(text)
-
-        for section in sections:
-            if section["type"] == "code_block":
-                chunks.extend(self._chunk_code_block(section))
-            elif section["type"] == "explanation":
-                chunks.extend(self._chunk_explanation(section))
-            elif section["type"] == "file_operations":
-                chunks.append(self._format_file_operations_section(section))
-            elif section["type"] == "mixed":
-                chunks.extend(self._chunk_mixed_content(section))
-            else:
-                # Default text chunking
-                chunks.extend(self._chunk_text(section))
-
-        return chunks
-
-    def _identify_sections(self, text: str) -> List[dict]:
-        """Identify different content types in the text."""
-        sections = []
-        lines = text.split("\n")
-        current_section = {"type": "text", "content": "", "start_line": 0}
-        in_code_block = False
-
-        for i, line in enumerate(lines):
-            # Check for code block markers
-            if line.strip().startswith("```"):
-                if not in_code_block:
-                    # Start of code block
-                    if current_section["content"].strip():
-                        sections.append(current_section)
-                    in_code_block = True
-                    current_section = {
-                        "type": "code_block",
-                        "content": line + "\n",
-                        "start_line": i,
-                    }
-                else:
-                    # End of code block
-                    current_section["content"] += line + "\n"
-                    sections.append(current_section)
-                    in_code_block = False
-                    current_section = {
-                        "type": "text",
-                        "content": "",
-                        "start_line": i + 1,
-                    }
-            elif in_code_block:
-                current_section["content"] += line + "\n"
-            else:
-                # Check for file operation patterns
-                if self._is_file_operation_line(line):
-                    if current_section["type"] != "file_operations":
-                        if current_section["content"].strip():
-                            sections.append(current_section)
-                        current_section = {
-                            "type": "file_operations",
-                            "content": line + "\n",
-                            "start_line": i,
-                        }
-                    else:
-                        current_section["content"] += line + "\n"
-                else:
-                    # Regular text
-                    if current_section["type"] != "text":
-                        if current_section["content"].strip():
-                            sections.append(current_section)
-                        current_section = {
-                            "type": "text",
-                            "content": line + "\n",
-                            "start_line": i,
-                        }
-                    else:
-                        current_section["content"] += line + "\n"
-
-        # Add the last section
-        if current_section["content"].strip():
-            sections.append(current_section)
-
-        return sections
-
-    def _is_file_operation_line(self, line: str) -> bool:
-        """Check if a line indicates file operations."""
-        file_indicators = [
-            "Creating file",
-            "Editing file",
-            "Reading file",
-            "Writing to",
-            "Modified file",
-            "Deleted file",
-            "File created",
-            "File updated",
-        ]
-        return any(indicator in line for indicator in file_indicators)
-
-    def _chunk_code_block(self, section: dict) -> List[dict]:
-        """Handle code block chunking."""
-        content = section["content"]
-        if len(content) <= self.max_code_block_length:
-            return [{"type": "code_block", "content": content, "format": "single"}]
-
-        # Split large code blocks
-        chunks = []
-        lines = content.split("\n")
-        current_chunk = lines[0] + "\n"  # Start with the ``` line
-
-        for line in lines[1:-1]:  # Skip first and last ``` lines
-            if len(current_chunk + line + "\n```\n") > self.max_code_block_length:
-                current_chunk += "```"
-                chunks.append(
-                    {"type": "code_block", "content": current_chunk, "format": "split"}
-                )
-                current_chunk = "```\n" + line + "\n"
-            else:
-                current_chunk += line + "\n"
-
-        current_chunk += lines[-1]  # Add the closing ```
-        chunks.append(
-            {"type": "code_block", "content": current_chunk, "format": "split"}
-        )
-
-        return chunks
-
-    def _chunk_explanation(self, section: dict) -> List[dict]:
-        """Handle explanation text chunking."""
-        content = section["content"]
-        if len(content) <= self.max_message_length:
-            return [{"type": "explanation", "content": content}]
-
-        # Split by paragraphs first
-        paragraphs = content.split("\n\n")
-        chunks = []
-        current_chunk = ""
-
-        for paragraph in paragraphs:
-            if len(current_chunk + paragraph + "\n\n") > self.max_message_length:
-                if current_chunk:
-                    chunks.append(
-                        {"type": "explanation", "content": current_chunk.strip()}
-                    )
-                current_chunk = paragraph + "\n\n"
-            else:
-                current_chunk += paragraph + "\n\n"
-
-        if current_chunk:
-            chunks.append({"type": "explanation", "content": current_chunk.strip()})
-
-        return chunks
-
-    def _chunk_mixed_content(self, section: dict) -> List[dict]:
-        """Handle mixed content sections."""
-        # For now, treat as regular text
-        return self._chunk_text(section)
-
-    def _chunk_text(self, section: dict) -> List[dict]:
-        """Handle regular text chunking."""
-        content = section["content"]
-        if len(content) <= self.max_message_length:
-            return [{"type": "text", "content": content}]
-
-        # Split at natural break points
-        chunks = []
-        current_chunk = ""
-
-        sentences = content.split(". ")
-        for sentence in sentences:
-            test_chunk = current_chunk + sentence + ". "
-            if len(test_chunk) > self.max_message_length:
-                if current_chunk:
-                    chunks.append({"type": "text", "content": current_chunk.strip()})
-                current_chunk = sentence + ". "
-            else:
-                current_chunk = test_chunk
-
-        if current_chunk:
-            chunks.append({"type": "text", "content": current_chunk.strip()})
-
-        return chunks
-
-    def _format_file_operations_section(self, section: dict) -> dict:
-        """Format file operations section."""
-        return {"type": "file_operations", "content": section["content"]}
-
-    def _format_chunk(self, chunk: dict) -> List[FormattedMessage]:
-        """Format individual chunks into FormattedMessage objects."""
-        chunk_type = chunk["type"]
-        content = chunk["content"]
-
-        if chunk_type == "code_block":
-            # Format code blocks with proper styling
-            if chunk.get("format") == "split":
-                title = (
-                    "📄 <b>Code (continued)</b>"
-                    if "continued" in content
-                    else "📄 <b>Code</b>"
-                )
-            else:
-                title = "📄 <b>Code</b>"
-
-            text = f"{title}\n\n{content}"
-
-        elif chunk_type == "file_operations":
-            text = f"📁 <b>File Operations</b>\n\n{content}"
-
-        elif chunk_type == "explanation":
-            text = content
-
-        else:
-            text = content
-
-        # Split if still too long
-        return self._split_message(text)
-
     def _get_contextual_keyboard(
         self, context: Optional[dict]
     ) -> Optional[InlineKeyboardMarkup]:
@@ -473,11 +227,51 @@ class ResponseFormatter:
             flags=re.DOTALL,
         )
 
+    def _split_long_line(self, line: str) -> List[str]:
+        """Split a single overlong line into tag-safe chunks.
+
+        Prefer breaking at the last whitespace that is not inside an HTML
+        ``<...>`` tag or an ``&...;`` entity before the offset; fall back to a
+        hard offset cut when no safe boundary exists. Length is measured in
+        Telegram's UTF-16 units via ``tg_len``.
+        """
+        step = self.max_message_length - 100
+        chunks: List[str] = []
+        rest = line
+
+        while tg_len(rest) > step:
+            # Candidate hard cut at code-point offset `step` (UTF-16 length is
+            # >= code-point length, so this stays within the budget).
+            cut = step
+            # Find the last whitespace before `cut` that is not inside a
+            # `<...>` tag or a `&...;` entity.
+            safe = -1
+            in_tag = False
+            in_entity = False
+            for i, ch in enumerate(rest[:cut]):
+                if ch == "<":
+                    in_tag = True
+                elif ch == ">":
+                    in_tag = False
+                elif ch == "&":
+                    in_entity = True
+                elif ch == ";":
+                    in_entity = False
+                elif ch.isspace() and not in_tag and not in_entity:
+                    safe = i
+            split_at = safe if safe > 0 else cut
+            chunks.append(rest[:split_at])
+            rest = rest[split_at:]
+
+        if rest:
+            chunks.append(rest)
+        return chunks
+
     def _split_message(self, text: str) -> List[FormattedMessage]:
         """Split long messages while preserving formatting."""
         if not text or not text.strip():
             return []
-        if len(text) <= self.max_message_length:
+        if tg_len(text) <= self.max_message_length:
             return [FormattedMessage(text)]
 
         messages = []
@@ -488,7 +282,7 @@ class ResponseFormatter:
         lines = text.split("\n")
 
         for line in lines:
-            line_length = len(line) + 1  # +1 for newline
+            line_length = tg_len(line) + 1  # +1 for newline
 
             # Track HTML <pre> code block state
             if "<pre>" in line or "<pre><code" in line:
@@ -498,12 +292,10 @@ class ResponseFormatter:
 
             # If this is a very long line that exceeds limit by itself, split it
             if line_length > self.max_message_length:
-                chunks = []
-                for i in range(0, len(line), self.max_message_length - 100):
-                    chunks.append(line[i : i + self.max_message_length - 100])
+                chunks = self._split_long_line(line)
 
                 for chunk in chunks:
-                    chunk_length = len(chunk) + 1
+                    chunk_length = tg_len(chunk) + 1
 
                     if (
                         current_length + chunk_length > self.max_message_length

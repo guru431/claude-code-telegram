@@ -206,3 +206,69 @@ class TestNotificationService:
         event = Event(source="test")
         await service.handle_response(event)
         assert service._send_queue.qsize() == 0
+
+    async def test_retry_after_sleeps_and_retries(
+        self, service: NotificationService, mock_bot: AsyncMock
+    ) -> None:
+        """RetryAfter (429) sleeps the server delay and retries once, not drops."""
+        from telegram.error import RetryAfter
+
+        mock_bot.send_message = AsyncMock(side_effect=[RetryAfter(1), None])
+        event = AgentResponseEvent(chat_id=123, text="hello")
+        await service._rate_limited_send(123, event)
+
+        assert mock_bot.send_message.call_count == 2
+
+    async def test_retry_after_bounded_to_two_attempts(
+        self, service: NotificationService, mock_bot: AsyncMock
+    ) -> None:
+        """Persistent RetryAfter is bounded — it does not retry forever."""
+        from telegram.error import RetryAfter
+
+        mock_bot.send_message = AsyncMock(side_effect=RetryAfter(0))
+        event = AgentResponseEvent(chat_id=123, text="hello")
+        # Re-raised RetryAfter is caught by the TelegramError handler (no raise).
+        await service._rate_limited_send(123, event)
+
+        assert mock_bot.send_message.call_count == 2
+
+    async def test_worker_survives_bad_delivery(
+        self, service: NotificationService, mock_bot: AsyncMock
+    ) -> None:
+        """A non-TelegramError on one delivery must not kill the sender worker."""
+        sent: list[str] = []
+
+        async def flaky(**kwargs: object) -> None:
+            if kwargs.get("chat_id") == 100:
+                raise RuntimeError("boom")
+            sent.append(str(kwargs.get("text")))
+
+        mock_bot.send_message = AsyncMock(side_effect=flaky)
+
+        await service.start()
+        await service.handle_response(AgentResponseEvent(chat_id=100, text="bad"))
+        await service.handle_response(AgentResponseEvent(chat_id=200, text="good"))
+        await service.stop()
+
+        # The second message is still delivered despite the first one raising.
+        assert "good" in sent
+
+    async def test_secrets_redacted_before_send(
+        self, service: NotificationService, mock_bot: AsyncMock
+    ) -> None:
+        """High-confidence secrets are redacted before delivery."""
+        # Assemble secret-looking values at runtime so the source literals do
+        # not trip secret scanners (this is a public repo); the assembled
+        # strings still match the redaction patterns and exercise the logic.
+        fake_key = "sk-" "ant-" + "0123456789abcdef0123"
+        fake_gh = "ghp_" + "abcdef0123456789abcdef"
+        event = AgentResponseEvent(
+            chat_id=123,
+            text=f"key {fake_key} and GITHUB_TOKEN={fake_gh}",
+        )
+        await service._rate_limited_send(123, event)
+
+        sent_text = mock_bot.send_message.call_args.kwargs["text"]
+        assert fake_key not in sent_text
+        assert fake_gh not in sent_text
+        assert "***" in sent_text

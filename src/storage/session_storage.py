@@ -47,6 +47,7 @@ class SQLiteSessionStorage(SessionStorage):
                     INSERT INTO users
                     (user_id, telegram_username, first_seen, last_active)
                     VALUES (?, ?, ?, ?)
+                    ON CONFLICT(user_id) DO NOTHING
                     """,
                     (
                         user_id,
@@ -237,7 +238,7 @@ class SQLiteSessionStorage(SessionStorage):
                 """
                 UPDATE sessions
                 SET is_active = FALSE
-                WHERE last_used < datetime('now', '-' || ? || ' hours')
+                WHERE datetime(last_used) < datetime('now', '-' || ? || ' hours')
                   AND is_active = TRUE
             """,
                 (timeout_hours,),

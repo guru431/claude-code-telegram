@@ -7,6 +7,7 @@ from typing import List, Optional
 import structlog
 import telegram
 
+from src.bot.utils.html_format import tg_len
 from src.utils.constants import TELEGRAM_MAX_MESSAGE_LENGTH
 
 logger = structlog.get_logger()
@@ -113,9 +114,12 @@ class DraftStreamer:
         if not draft_text.strip():
             return
 
-        # Tail-truncate if over Telegram limit
-        if len(draft_text) > TELEGRAM_MAX_MESSAGE_LENGTH:
+        # Tail-truncate if over Telegram limit (measured in UTF-16 units)
+        if tg_len(draft_text) > TELEGRAM_MAX_MESSAGE_LENGTH:
             draft_text = "\u2026" + draft_text[-(TELEGRAM_MAX_MESSAGE_LENGTH - 1) :]
+            # Trim further if astral chars still push UTF-16 length over the limit
+            while tg_len(draft_text) > TELEGRAM_MAX_MESSAGE_LENGTH:
+                draft_text = "\u2026" + draft_text[2:]
 
         try:
             kwargs = {

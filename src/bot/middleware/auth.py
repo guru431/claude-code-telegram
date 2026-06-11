@@ -1,11 +1,18 @@
 """Telegram bot authentication middleware."""
 
+import time
 from datetime import UTC, datetime
 from typing import Any, Callable, Dict
 
 import structlog
 
 logger = structlog.get_logger()
+
+# Throttle for auth-rejection replies: at most one reply per user per window.
+# The rate-limit middleware (group -1) is never reached for rejected users, so
+# we throttle here to avoid spamming a reply + audit row per inbound message.
+_REJECTION_REPLY_WINDOW = 60.0
+_last_rejection_reply: Dict[int, float] = {}
 
 
 async def auth_middleware(handler: Callable, event: Any, data: Dict[str, Any]) -> Any:
@@ -96,7 +103,12 @@ async def auth_middleware(handler: Callable, event: Any, data: Dict[str, Any]) -
         # Authentication failed
         logger.warning("Authentication failed", user_id=user_id, username=username)
 
-        if event.effective_message:
+        # Throttle the rejection reply to at most once per window per user. The
+        # audit attempt above is still recorded for every message.
+        now = time.monotonic()
+        last_reply = _last_rejection_reply.get(user_id, 0.0)
+        if event.effective_message and now - last_reply >= _REJECTION_REPLY_WINDOW:
+            _last_rejection_reply[user_id] = now
             await event.effective_message.reply_text(
                 "🔒 <b>Authentication Required</b>\n\n"
                 "You are not authorized to use this bot.\n"

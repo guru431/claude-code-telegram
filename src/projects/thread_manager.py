@@ -49,7 +49,12 @@ class ProjectThreadManager:
         self.registry = registry
         self.repository = repository
         self.sync_action_interval_seconds = max(0.0, sync_action_interval_seconds)
+        # Paces individual Telegram sync API calls (see _call_sync_api).
         self._sync_api_lock = asyncio.Lock()
+        # Serializes whole sync_topics runs. Nightly sync, /sync_threads and
+        # startup sync can overlap; without this, check-then-create races across
+        # awaits produce duplicate forum topics (the first becomes an orphan).
+        self._sync_lock = asyncio.Lock()
         self._last_sync_api_call_at: Optional[float] = None
 
     async def sync_topics(
@@ -65,102 +70,105 @@ class ProjectThreadManager:
         (full reconcile, which recreates active mappings whose topic was
         deleted out of band).
         """
-        result = TopicSyncResult()
+        # Serialize whole runs so concurrent callers (nightly/​startup/manual)
+        # cannot interleave check-then-create and duplicate topics.
+        async with self._sync_lock:
+            result = TopicSyncResult()
 
-        enabled = self.registry.list_enabled()
-        active_slugs = [project.slug for project in enabled]
+            enabled = self.registry.list_enabled()
+            active_slugs = [project.slug for project in enabled]
 
-        for project in enabled:
-            try:
-                existing = await self.repository.get_by_chat_project(
-                    chat_id,
-                    project.slug,
-                )
+            for project in enabled:
+                try:
+                    existing = await self.repository.get_by_chat_project(
+                        chat_id,
+                        project.slug,
+                    )
 
-                if existing:
-                    handled = await self._sync_existing_mapping(
+                    if existing:
+                        handled = await self._sync_existing_mapping(
+                            bot=bot,
+                            project=project,
+                            mapping=existing,
+                            result=result,
+                            probe_usable=probe_usable,
+                        )
+                        if handled:
+                            continue
+
+                    await self._create_and_map_topic(
                         bot=bot,
                         project=project,
-                        mapping=existing,
+                        chat_id=chat_id,
                         result=result,
-                        probe_usable=probe_usable,
                     )
-                    if handled:
-                        continue
 
-                await self._create_and_map_topic(
-                    bot=bot,
-                    project=project,
-                    chat_id=chat_id,
-                    result=result,
-                )
+                except TelegramError as e:
+                    if self._is_private_topics_unavailable_error(e):
+                        raise PrivateTopicsUnavailableError(
+                            "Private chat topics are not enabled for this bot chat."
+                        ) from e
+                    result.failed += 1
+                    logger.error(
+                        "Failed to sync project topic",
+                        project_slug=project.slug,
+                        chat_id=chat_id,
+                        error=str(e),
+                    )
+                except Exception as e:
+                    result.failed += 1
+                    logger.error(
+                        "Failed to sync project topic",
+                        project_slug=project.slug,
+                        chat_id=chat_id,
+                        error=str(e),
+                    )
 
-            except TelegramError as e:
-                if self._is_private_topics_unavailable_error(e):
-                    raise PrivateTopicsUnavailableError(
-                        "Private chat topics are not enabled for this bot chat."
-                    ) from e
-                result.failed += 1
-                logger.error(
-                    "Failed to sync project topic",
-                    project_slug=project.slug,
-                    chat_id=chat_id,
-                    error=str(e),
-                )
-            except Exception as e:
-                result.failed += 1
-                logger.error(
-                    "Failed to sync project topic",
-                    project_slug=project.slug,
-                    chat_id=chat_id,
-                    error=str(e),
-                )
-
-        stale_mappings = await self.repository.list_stale_active_mappings(
-            chat_id=chat_id,
-            active_project_slugs=active_slugs,
-        )
-        for stale in stale_mappings:
-            try:
-                await self._call_sync_api(
-                    lambda: bot.delete_forum_topic(
-                        chat_id=stale.chat_id,
-                        message_thread_id=stale.message_thread_id,
-                    ),
-                )
-                result.closed += 1
-            except TelegramError as e:
-                if self._is_private_topics_unavailable_error(e):
-                    raise PrivateTopicsUnavailableError(
-                        "Private chat topics are not enabled for this bot chat."
-                    ) from e
-                # Fall back to closing if delete is not supported
+            stale_mappings = await self.repository.list_stale_active_mappings(
+                chat_id=chat_id,
+                active_project_slugs=active_slugs,
+            )
+            for stale in stale_mappings:
                 try:
                     await self._call_sync_api(
-                        lambda: bot.close_forum_topic(
+                        lambda: bot.delete_forum_topic(
                             chat_id=stale.chat_id,
                             message_thread_id=stale.message_thread_id,
                         ),
                     )
                     result.closed += 1
-                except TelegramError:
-                    result.failed += 1
-                    logger.warning(
-                        "Could not delete/close stale topic",
+                except TelegramError as e:
+                    if self._is_private_topics_unavailable_error(e):
+                        raise PrivateTopicsUnavailableError(
+                            "Private chat topics are not enabled for this bot chat."
+                        ) from e
+                    # Fall back to closing if delete is not supported
+                    try:
+                        await self._call_sync_api(
+                            lambda: bot.close_forum_topic(
+                                chat_id=stale.chat_id,
+                                message_thread_id=stale.message_thread_id,
+                            ),
+                        )
+                        result.closed += 1
+                    except TelegramError:
+                        result.failed += 1
+                        logger.warning(
+                            "Could not delete/close stale topic",
+                            chat_id=stale.chat_id,
+                            message_thread_id=stale.message_thread_id,
+                            project_slug=stale.project_slug,
+                            error=str(e),
+                        )
+                finally:
+                    await self.repository.set_active(
                         chat_id=stale.chat_id,
-                        message_thread_id=stale.message_thread_id,
                         project_slug=stale.project_slug,
-                        error=str(e),
+                        is_active=False,
                     )
-            finally:
-                await self.repository.set_active(
-                    chat_id=stale.chat_id,
-                    project_slug=stale.project_slug,
-                    is_active=False,
-                )
-                result.deactivated += 1
+                    result.deactivated += 1
 
-        return result
+            return result
 
     async def _call_sync_api(
         self,

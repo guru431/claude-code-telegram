@@ -4,6 +4,7 @@ Scans APPROVED_DIRECTORY for subdirectories not yet listed in projects.yaml
 and adds them automatically.
 """
 
+import os
 import re
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
@@ -160,10 +161,15 @@ def discover_new_projects(
     existing_projects.extend(new_projects)
     data["projects"] = existing_projects
 
-    with open(config_path, "w", encoding="utf-8") as f:
+    # Atomic write: dump to a temp file in the same dir, then os.replace. A crash
+    # mid-write must not leave a truncated projects.yaml that fails to load on the
+    # next startup (which would take the bot down).
+    tmp_path = config_path.with_suffix(".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
         yaml.dump(
             data, f, default_flow_style=False, allow_unicode=True, sort_keys=False
         )
+    os.replace(tmp_path, config_path)
 
     logger.info(
         "New projects discovered and added to config",

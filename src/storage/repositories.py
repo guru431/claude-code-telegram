@@ -51,6 +51,7 @@ class UserRepository:
                 (user_id, telegram_username, first_seen,
                  last_active, is_allowed)
                 VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO NOTHING
             """,
                 (
                     user.user_id,
@@ -85,6 +86,31 @@ class UserRepository:
                     user.session_count,
                     user.user_id,
                 ),
+            )
+            await conn.commit()
+
+    async def increment_stats(
+        self,
+        user_id: int,
+        cost: float,
+        messages: int = 1,
+        last_active: Optional[datetime] = None,
+    ):
+        """Atomically increment user cost/message counters.
+
+        Avoids the lost-update race of read-modify-write under concurrent
+        interactions (mirrors CostTrackingRepository.update_daily_cost).
+        """
+        async with self.db.get_connection() as conn:
+            await conn.execute(
+                """
+                UPDATE users
+                SET total_cost = total_cost + ?,
+                    message_count = message_count + ?,
+                    last_active = ?
+                WHERE user_id = ?
+            """,
+                (cost, messages, last_active or datetime.now(UTC), user_id),
             )
             await conn.commit()
 
@@ -202,7 +228,7 @@ class SessionRepository:
                 """
                 UPDATE sessions
                 SET is_active = FALSE
-                WHERE last_used < datetime('now', '-' || ? || ' days')
+                WHERE datetime(last_used) < datetime('now', '-' || ? || ' days')
                   AND is_active = TRUE
             """,
                 (days,),
@@ -453,7 +479,7 @@ class MessageRepository:
             cursor = await conn.execute(
                 """
                 SELECT * FROM messages
-                WHERE timestamp > datetime('now', '-' || ? || ' hours')
+                WHERE datetime(timestamp) > datetime('now', '-' || ? || ' hours')
                 ORDER BY timestamp DESC
             """,
                 (hours,),
@@ -598,7 +624,7 @@ class AuditLogRepository:
             cursor = await conn.execute(
                 """
                 SELECT * FROM audit_log
-                WHERE timestamp > datetime('now', '-' || ? || ' hours')
+                WHERE datetime(timestamp) > datetime('now', '-' || ? || ' hours')
                 ORDER BY timestamp DESC
             """,
                 (hours,),

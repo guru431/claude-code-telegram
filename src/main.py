@@ -497,7 +497,11 @@ async def run_application(app: Dict[str, Any]) -> None:
         logger.error("Application error", error=str(e))
         raise
     finally:
-        # Ordered shutdown: scheduler -> API -> notification -> bot -> claude -> storage
+        # Ordered shutdown: scheduler -> bus -> notification -> bot -> claude -> storage
+        # The notification service must stop AFTER event_bus.stop(): draining the
+        # bus can emit AgentResponseEvents -> NotificationService.handle_response
+        # -> queue. Stopping notifications first would let those late events queue
+        # behind an exited sender and be lost silently.
         logger.info("Shutting down application")
 
         try:
@@ -505,9 +509,9 @@ async def run_application(app: Dict[str, Any]) -> None:
                 discovery_scheduler.shutdown(wait=False)
             if scheduler:
                 await scheduler.stop()
+            await event_bus.stop()
             if notification_service:
                 await notification_service.stop()
-            await event_bus.stop()
             await bot.stop()
             await claude_integration.shutdown()
             await storage.close()

@@ -390,12 +390,19 @@ class MessageOrchestrator:
         self._known_commands = frozenset(cmd for cmd, _ in handlers)
 
         for cmd, handler in handlers:
-            app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
+            app.add_handler(
+                CommandHandler(
+                    cmd,
+                    self._inject_deps(handler),
+                    filters=filters.UpdateType.MESSAGE,
+                )
+            )
 
-        # Text messages -> Claude
+        # Text messages -> Claude. UpdateType.MESSAGE ignores edited_message
+        # updates (which would crash handlers reading update.message.text).
         app.add_handler(
             MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
+                filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND,
                 self._inject_deps(self.agentic_text),
             ),
             group=10,
@@ -408,7 +415,7 @@ class MessageOrchestrator:
         # double-firing.
         app.add_handler(
             MessageHandler(
-                filters.COMMAND,
+                filters.UpdateType.MESSAGE & filters.COMMAND,
                 self._inject_deps(self._handle_unknown_command),
             ),
             group=10,
@@ -417,20 +424,27 @@ class MessageOrchestrator:
         # File uploads -> Claude
         app.add_handler(
             MessageHandler(
-                filters.Document.ALL, self._inject_deps(self.agentic_document)
+                filters.UpdateType.MESSAGE & filters.Document.ALL,
+                self._inject_deps(self.agentic_document),
             ),
             group=10,
         )
 
         # Photo uploads -> Claude
         app.add_handler(
-            MessageHandler(filters.PHOTO, self._inject_deps(self.agentic_photo)),
+            MessageHandler(
+                filters.UpdateType.MESSAGE & filters.PHOTO,
+                self._inject_deps(self.agentic_photo),
+            ),
             group=10,
         )
 
         # Voice messages -> transcribe -> Claude
         app.add_handler(
-            MessageHandler(filters.VOICE, self._inject_deps(self.agentic_voice)),
+            MessageHandler(
+                filters.UpdateType.MESSAGE & filters.VOICE,
+                self._inject_deps(self.agentic_voice),
+            ),
             group=10,
         )
 
@@ -484,27 +498,42 @@ class MessageOrchestrator:
             handlers.append(("sync_threads", command.sync_threads))
 
         for cmd, handler in handlers:
-            app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
+            app.add_handler(
+                CommandHandler(
+                    cmd,
+                    self._inject_deps(handler),
+                    filters=filters.UpdateType.MESSAGE,
+                )
+            )
 
+        # UpdateType.MESSAGE ignores edited_message updates (which would crash
+        # handlers reading update.message.text).
         app.add_handler(
             MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
+                filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND,
                 self._inject_deps(message.handle_text_message),
             ),
             group=10,
         )
         app.add_handler(
             MessageHandler(
-                filters.Document.ALL, self._inject_deps(message.handle_document)
+                filters.UpdateType.MESSAGE & filters.Document.ALL,
+                self._inject_deps(message.handle_document),
             ),
             group=10,
         )
         app.add_handler(
-            MessageHandler(filters.PHOTO, self._inject_deps(message.handle_photo)),
+            MessageHandler(
+                filters.UpdateType.MESSAGE & filters.PHOTO,
+                self._inject_deps(message.handle_photo),
+            ),
             group=10,
         )
         app.add_handler(
-            MessageHandler(filters.VOICE, self._inject_deps(message.handle_voice)),
+            MessageHandler(
+                filters.UpdateType.MESSAGE & filters.VOICE,
+                self._inject_deps(message.handle_voice),
+            ),
             group=10,
         )
         app.add_handler(
@@ -988,13 +1017,10 @@ class MessageOrchestrator:
             message_length=len(message_text),
         )
 
-        # Rate limit check
+        # Rate limiting was already enforced by rate_limit_middleware (group -1);
+        # re-checking here would double-charge the token bucket. We only need the
+        # rate_limiter reference later to record the run's actual cost.
         rate_limiter = context.bot_data.get("rate_limiter")
-        if rate_limiter:
-            allowed, limit_message = await rate_limiter.check_rate_limit(user_id, 0.001)
-            if not allowed:
-                await update.message.reply_text(f"⏱️ {limit_message}")
-                return
 
         chat = update.message.chat
         await chat.send_action("typing")
@@ -1246,11 +1272,12 @@ class MessageOrchestrator:
                 await update.message.reply_text(f"File rejected: {error}")
                 return
 
-        # Size check
+        # Size check (file_size is Optional — Telegram may omit it)
         max_size = 10 * 1024 * 1024
-        if document.file_size > max_size:
+        file_size = document.file_size or 0
+        if file_size > max_size:
             await update.message.reply_text(
-                f"File too large ({document.file_size / 1024 / 1024:.1f}MB). Max: 10MB."
+                f"File too large ({file_size / 1024 / 1024:.1f}MB). Max: 10MB."
             )
             return
 
@@ -1379,14 +1406,30 @@ class MessageOrchestrator:
 
             if not caption_sent:
                 for i, message in enumerate(formatted_messages):
-                    await update.message.reply_text(
-                        message.text,
-                        parse_mode=message.parse_mode,
-                        reply_markup=None,
-                        reply_to_message_id=(
-                            update.message.message_id if i == 0 else None
-                        ),
-                    )
+                    if not message.text or not message.text.strip():
+                        continue
+                    try:
+                        await update.message.reply_text(
+                            message.text,
+                            parse_mode=message.parse_mode,
+                            reply_markup=None,
+                            reply_to_message_id=(
+                                update.message.message_id if i == 0 else None
+                            ),
+                        )
+                    except Exception as send_err:
+                        logger.warning(
+                            "Failed to send HTML response, retrying as plain text",
+                            error=str(send_err),
+                            message_index=i,
+                        )
+                        await update.message.reply_text(
+                            message.text,
+                            reply_markup=None,
+                            reply_to_message_id=(
+                                update.message.message_id if i == 0 else None
+                            ),
+                        )
                     if i < len(formatted_messages) - 1:
                         await asyncio.sleep(0.5)
 
@@ -1403,7 +1446,11 @@ class MessageOrchestrator:
         except Exception as e:
             from .handlers.message import _format_error_message
 
-            await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
+            # progress_msg may already be deleted at this point — reply fresh
+            # instead of editing a deleted message (which would mask the error).
+            await update.effective_message.reply_text(
+                _format_error_message(e), parse_mode="HTML"
+            )
             logger.error("Claude file processing failed", error=str(e), user_id=user_id)
         finally:
             heartbeat.cancel()
@@ -1450,7 +1497,11 @@ class MessageOrchestrator:
         except Exception as e:
             from .handlers.message import _format_error_message
 
-            await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
+            # progress_msg may already be deleted by the media handler — reply
+            # fresh instead of editing a deleted message (which masks the error).
+            await update.effective_message.reply_text(
+                _format_error_message(e), parse_mode="HTML"
+            )
             logger.error(
                 "Claude photo processing failed", error=str(e), user_id=user_id
             )
@@ -1491,7 +1542,11 @@ class MessageOrchestrator:
         except Exception as e:
             from .handlers.message import _format_error_message
 
-            await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
+            # progress_msg may already be deleted by the media handler — reply
+            # fresh instead of editing a deleted message (which masks the error).
+            await update.effective_message.reply_text(
+                _format_error_message(e), parse_mode="HTML"
+            )
             logger.error(
                 "Claude voice processing failed", error=str(e), user_id=user_id
             )
@@ -1618,12 +1673,28 @@ class MessageOrchestrator:
             for i, message in enumerate(formatted_messages):
                 if not message.text or not message.text.strip():
                     continue
-                await update.message.reply_text(
-                    message.text,
-                    parse_mode=message.parse_mode,
-                    reply_markup=None,
-                    reply_to_message_id=(update.message.message_id if i == 0 else None),
-                )
+                try:
+                    await update.message.reply_text(
+                        message.text,
+                        parse_mode=message.parse_mode,
+                        reply_markup=None,
+                        reply_to_message_id=(
+                            update.message.message_id if i == 0 else None
+                        ),
+                    )
+                except Exception as send_err:
+                    logger.warning(
+                        "Failed to send HTML response, retrying as plain text",
+                        error=str(send_err),
+                        message_index=i,
+                    )
+                    await update.message.reply_text(
+                        message.text,
+                        reply_markup=None,
+                        reply_to_message_id=(
+                            update.message.message_id if i == 0 else None
+                        ),
+                    )
                 if i < len(formatted_messages) - 1:
                     await asyncio.sleep(0.5)
 
@@ -1890,8 +1961,12 @@ class MessageOrchestrator:
         # Scope to the approved directory: never list sessions whose working
         # directory lives outside it, or resuming one would move the bot's
         # current_directory past the approved root.
-        local_sessions = list_all_local_sessions(
-            limit=15, within=self.settings.approved_directory
+        # Synchronous JSONL filesystem scan — offload to a thread so it does not
+        # block the event loop.
+        local_sessions = await asyncio.to_thread(
+            list_all_local_sessions,
+            limit=15,
+            within=self.settings.approved_directory,
         )
 
         if not local_sessions:
@@ -1970,9 +2045,10 @@ class MessageOrchestrator:
         # Find the session's working directory from local storage
         from ..claude.local_sessions import _claude_projects_dir, _parse_session_head
 
-        projects_dir = _claude_projects_dir()
-        cwd = None
-        if projects_dir.is_dir():
+        def _find_session_cwd() -> Optional[str]:
+            projects_dir = _claude_projects_dir()
+            if not projects_dir.is_dir():
+                return None
             for project_dir in projects_dir.iterdir():
                 if not project_dir.is_dir():
                     continue
@@ -1980,8 +2056,13 @@ class MessageOrchestrator:
                 if jsonl.is_file():
                     first = _parse_session_head(jsonl)
                     if first:
-                        cwd = first.get("cwd")
-                    break
+                        return first.get("cwd")
+                    return None
+            return None
+
+        # Synchronous directory iteration + JSONL parse — offload to a thread so
+        # it does not block the event loop.
+        cwd = await asyncio.to_thread(_find_session_cwd)
 
         # Reject sessions whose working directory escapes the approved root —
         # otherwise resuming would point subsequent prompts outside it.

@@ -99,7 +99,13 @@ class SessionModel:
         if not self.last_used:
             return True
 
-        age = datetime.now(UTC) - self.last_used
+        # Legacy persisted sessions may contain naive timestamps; treat them
+        # as UTC to mirror ClaudeSession.is_expired and avoid a TypeError.
+        last_used = self.last_used
+        if last_used.tzinfo is None:
+            last_used = last_used.replace(tzinfo=UTC)
+
+        age = datetime.now(UTC) - last_used
         return age.total_seconds() > (timeout_hours * 3600)
 
 

@@ -103,6 +103,40 @@ def _parse_session_head(jsonl_path: Path) -> Optional[dict]:
         return None
 
 
+def _build_local_session(entry: Path) -> Optional[LocalSession]:
+    """Parse one JSONL file into a LocalSession (None if unparseable)."""
+    first = _parse_session_head(entry)
+    if not first:
+        return None
+
+    cwd = first.get("cwd", "")
+    ts_str = first.get("timestamp", "")
+    try:
+        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        ts = datetime.fromtimestamp(entry.stat().st_mtime, tz=UTC)
+
+    return LocalSession(
+        session_id=entry.stem,  # Session ID is the file stem (UUID)
+        cwd=cwd,
+        timestamp=ts,
+        jsonl_path=entry,
+        first_message=first.get("first_message", ""),
+    )
+
+
+def _entries_by_mtime(target_dir: Path) -> List[Path]:
+    """Return ``.jsonl`` entries in *target_dir* sorted by mtime (newest first).
+
+    Sorting on the cheap ``stat().st_mtime`` *before* parsing lets callers
+    parse lazily (e.g. stop at the first non-excluded match) instead of reading
+    every file up front.
+    """
+    entries = [e for e in target_dir.iterdir() if e.suffix == ".jsonl" and e.is_file()]
+    entries.sort(key=lambda e: e.stat().st_mtime, reverse=True)
+    return entries
+
+
 def find_local_sessions(working_directory: Path) -> List[LocalSession]:
     """Find all Claude Code sessions on disk for *working_directory*.
 
@@ -124,40 +158,13 @@ def find_local_sessions(working_directory: Path) -> List[LocalSession]:
         )
         return []
 
+    # Sort by cheap st_mtime first, then parse (newest first — more reliable
+    # than the first-line timestamp which is the session *creation* time).
     sessions: List[LocalSession] = []
-
-    for entry in target_dir.iterdir():
-        if entry.suffix != ".jsonl" or not entry.is_file():
-            continue
-
-        # Session ID is the file stem (UUID)
-        session_id = entry.stem
-
-        # Read session metadata and first user message
-        first = _parse_session_head(entry)
-        if not first:
-            continue
-
-        cwd = first.get("cwd", "")
-        ts_str = first.get("timestamp", "")
-        try:
-            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-        except (ValueError, AttributeError):
-            ts = datetime.fromtimestamp(entry.stat().st_mtime, tz=UTC)
-
-        sessions.append(
-            LocalSession(
-                session_id=session_id,
-                cwd=cwd,
-                timestamp=ts,
-                jsonl_path=entry,
-                first_message=first.get("first_message", ""),
-            )
-        )
-
-    # Sort newest first (by file modification time — more reliable than
-    # the timestamp in the first line which is the session *creation* time).
-    sessions.sort(key=lambda s: s.jsonl_path.stat().st_mtime, reverse=True)
+    for entry in _entries_by_mtime(target_dir):
+        session = _build_local_session(entry)
+        if session is not None:
+            sessions.append(session)
 
     logger.debug(
         "Found local sessions",
@@ -174,12 +181,24 @@ def find_latest_local_session(
     """Return the most recently modified session for *working_directory*.
 
     Sessions whose ID is in *exclude_ids* are skipped (e.g. sessions the
-    bot already knows about).
+    bot already knows about). Entries are ordered by the cheap ``st_mtime``
+    first and parsed lazily, so the common case (newest session matches) reads
+    only one file instead of parsing the whole directory up front.
     """
-    for session in find_local_sessions(working_directory):
-        if exclude_ids and session.session_id in exclude_ids:
+    projects_dir = _claude_projects_dir()
+    if not projects_dir.is_dir():
+        return None
+
+    target_dir = projects_dir / _encode_path(working_directory)
+    if not target_dir.is_dir():
+        return None
+
+    for entry in _entries_by_mtime(target_dir):
+        if exclude_ids and entry.stem in exclude_ids:
             continue
-        return session
+        session = _build_local_session(entry)
+        if session is not None:
+            return session
     return None
 
 

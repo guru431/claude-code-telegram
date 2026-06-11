@@ -11,7 +11,7 @@ from typing import List, Optional, Tuple
 import structlog
 from telegram import Bot
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram.error import RetryAfter, TelegramError
 
 from ..events.bus import Event, EventBus
 from ..events.types import AgentResponseEvent
@@ -20,6 +20,42 @@ logger = structlog.get_logger()
 
 # Telegram rate limit: ~30 msgs/sec globally, ~1 msg/sec per chat
 SEND_INTERVAL_SECONDS = 1.1
+
+# Defense-in-depth: notification/webhook responses are delivered verbatim, so
+# redact high-confidence secret patterns before sending. A minimal, conservative
+# local copy of the orchestrator's redactor (importing that module here would
+# pull in the whole bot stack), kept deliberately narrow to avoid mangling text.
+_SECRET_PATTERNS: List[re.Pattern[str]] = [
+    # OpenAI / Anthropic-style keys (sk-..., sk-ant-...)
+    re.compile(r"\b(sk-(?:ant-)?)[A-Za-z0-9_-]{16,}"),
+    # GitHub tokens (ghp_, gho_, ghu_, ghs_, ghr_)
+    re.compile(r"\b(gh[poprsu]_)[A-Za-z0-9]{16,}"),
+    # AWS access keys
+    re.compile(r"\b((?:AKIA|ASIA)[0-9A-Z]{4})[0-9A-Z]{12}"),
+    # Bearer auth tokens
+    re.compile(r"(Bearer )[A-Za-z0-9+/_.:-]{8,}"),
+    # Inline env assignments like SECRET=value
+    re.compile(
+        r"((?:TOKEN|SECRET|PASSWORD|PASSWD|PASS|API_KEY|APIKEY"
+        r"|AUTH_TOKEN|PRIVATE_KEY|ACCESS_KEY|ACCESS_TOKEN"
+        r"|CLIENT_SECRET|WEBHOOK_SECRET|BOT_TOKEN|GITHUB_TOKEN)"
+        r"=)['\"]?[^\s'\"]{8,}['\"]?"
+    ),
+]
+
+
+def _redact_match(match: "re.Match[str]") -> str:
+    groups = [g for g in match.groups() if g is not None]
+    return f"{groups[0]}***" if groups else "***"
+
+
+def _redact_secrets(text: str) -> str:
+    """Replace high-confidence secrets/credentials with redacted placeholders."""
+    result = text
+    for pattern in _SECRET_PATTERNS:
+        result = pattern.sub(_redact_match, result)
+    return result
+
 
 # Sentinel enqueued by stop() to wake an idle sender promptly without
 # cancelling it (cancellation would drop an in-flight, already-dequeued send).
@@ -152,7 +188,17 @@ class NotificationService:
 
             if event is _SHUTDOWN:
                 break
-            await self._deliver(event)
+            # Never let one bad delivery kill the worker — that would stall all
+            # future notifications (they would queue forever). TelegramError is
+            # already handled inside _rate_limited_send; this guards anything else.
+            try:
+                await self._deliver(event)
+            except Exception as e:
+                logger.error(
+                    "Notification delivery failed, continuing",
+                    error=str(e),
+                    event_id=getattr(event, "id", None),
+                )
 
         # Graceful drain: deliver messages still queued at shutdown. The
         # in-flight send above always completes (the worker is never cancelled
@@ -162,7 +208,14 @@ class NotificationService:
             event = self._send_queue.get_nowait()
             if event is _SHUTDOWN:
                 continue
-            await self._deliver(event)
+            try:
+                await self._deliver(event)
+            except Exception as e:
+                logger.error(
+                    "Notification delivery failed during drain",
+                    error=str(e),
+                    event_id=getattr(event, "id", None),
+                )
             drained += 1
         if drained:
             logger.info("Drained queued notifications on shutdown", count=drained)
@@ -188,18 +241,15 @@ class NotificationService:
         if wait_time > 0:
             await asyncio.sleep(wait_time)
 
-        # Split long messages (Telegram limit: 4096 chars)
-        text = event.text
+        # Redact high-confidence secrets before delivery (untrusted/verbatim
+        # webhook + scheduled responses), then split (Telegram limit: 4096 chars).
+        text = _redact_secrets(event.text)
         chunks = self._split_message(text)
         chunk_index = 0
 
         try:
             for chunk_index, chunk in enumerate(chunks):
-                await self.bot.send_message(
-                    chat_id=chat_id,
-                    text=chunk,
-                    parse_mode=(ParseMode.HTML if event.parse_mode == "HTML" else None),
-                )
+                await self._send_chunk(chat_id, chunk, event)
                 self._last_send_per_chat[chat_id] = loop.time()
 
                 # Rate limit between chunks too
@@ -225,6 +275,33 @@ class NotificationService:
                 failed_chunk=chunk_index,
                 total_chunks=len(chunks),
             )
+
+    async def _send_chunk(
+        self, chat_id: int, chunk: str, event: AgentResponseEvent
+    ) -> None:
+        """Send one chunk, honouring Telegram's explicit RetryAfter (429) delay.
+
+        On RetryAfter (flood control), sleep the server-provided delay and retry
+        once rather than dropping the message. Bounded to 2 attempts total.
+        """
+        parse_mode = ParseMode.HTML if event.parse_mode == "HTML" else None
+        for attempt in range(2):
+            try:
+                await self.bot.send_message(
+                    chat_id=chat_id,
+                    text=chunk,
+                    parse_mode=parse_mode,
+                )
+                return
+            except RetryAfter as e:
+                if attempt + 1 >= 2:
+                    raise
+                logger.warning(
+                    "Telegram flood control, retrying after delay",
+                    chat_id=chat_id,
+                    retry_after=e.retry_after,
+                )
+                await asyncio.sleep(e.retry_after)
 
     def _split_message(self, text: str, max_length: int = 4096) -> List[str]:
         """Split long messages without breaking Telegram HTML tags.

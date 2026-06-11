@@ -56,6 +56,7 @@ def bot(mock_settings):
 def mock_update():
     """Create a mock Telegram Update with an unauthenticated user."""
     update = MagicMock()
+    update.callback_query = None
     update.effective_user = MagicMock()
     update.effective_user.id = 999999
     update.effective_user.username = "attacker"
@@ -188,6 +189,33 @@ class TestMiddlewareBlocksSubsequentGroups:
 
         with pytest.raises(ApplicationHandlerStop):
             await wrapper(mock_update, mock_context)
+
+    async def test_rate_limit_middleware_lets_stop_callback_through(
+        self, bot, mock_update, mock_context
+    ):
+        """stop: callbacks bypass the rate limiter without consuming tokens."""
+        from src.bot.middleware.rate_limit import rate_limit_middleware
+
+        rate_limiter = MagicMock()
+        # Would reject if consulted -- the bypass must skip this entirely.
+        rate_limiter.check_rate_limit = AsyncMock(
+            return_value=(False, "Rate limit exceeded.")
+        )
+        bot.deps["rate_limiter"] = rate_limiter
+
+        mock_update.callback_query = MagicMock()
+        mock_update.callback_query.data = "stop:999999"
+
+        handler_called = False
+
+        async def handler(event, data):
+            nonlocal handler_called
+            handler_called = True
+
+        await rate_limit_middleware(handler, mock_update, bot.deps)
+
+        assert handler_called is True
+        rate_limiter.check_rate_limit.assert_not_called()
 
     async def test_dependencies_injected_before_middleware_runs(
         self, bot, mock_update, mock_context

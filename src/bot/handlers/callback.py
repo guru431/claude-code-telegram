@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional
 
 import structlog
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import ContextTypes
 
 from ...claude.facade import ClaudeIntegration
@@ -75,6 +75,18 @@ async def handle_callback_query(
         handler = handlers.get(action)
         if handler:
             await handler(query, param, context)
+        elif data == "continue":
+            # Bare "continue" button emitted by the response-formatting
+            # keyboards — wire it to the existing continue-session logic.
+            await _handle_continue_action(query, context)
+        elif data in ("explain", "save_code", "show_files", "debug"):
+            # Contextual formatting buttons without a backend implementation.
+            # Surface a brief toast instead of the generic "Unknown Action".
+            await query.answer(
+                "This action isn't available yet — "
+                "send a message to ask Claude directly.",
+                show_alert=False,
+            )
         else:
             await query.edit_message_text(
                 "❌ <b>Unknown Action</b>\n\n"
@@ -99,12 +111,19 @@ async def handle_callback_query(
                 parse_mode="HTML",
             )
         except Exception:
-            # If we can't edit the message, send a new one
-            await query.message.reply_text(
+            # If we can't edit the message, send a new one. ``query.message``
+            # may be ``None``/``InaccessibleMessage`` for buttons older than
+            # 48h, so fall back to sending directly to the user.
+            text = (
                 "❌ <b>Error Processing Action</b>\n\n"
-                "An error occurred while processing your request.",
-                parse_mode="HTML",
+                "An error occurred while processing your request."
             )
+            if isinstance(query.message, Message):
+                await query.message.reply_text(text, parse_mode="HTML")
+            else:
+                await context.bot.send_message(
+                    query.from_user.id, text, parse_mode="HTML"
+                )
 
 
 async def handle_cd_callback(
@@ -425,9 +444,11 @@ async def _handle_new_session_action(query, context: ContextTypes.DEFAULT_TYPE) 
     """Handle new session action."""
     settings: Settings = context.bot_data["settings"]
 
-    # Clear session
+    # Clear session and force a fresh start so the next message does not
+    # auto-resume the previous session.
     context.user_data["claude_session_id"] = None
     context.user_data["session_started"] = True
+    context.user_data["force_new_session"] = True
 
     current_dir = context.user_data.get(
         "current_directory", settings.approved_directory
@@ -496,10 +517,12 @@ async def _handle_end_session_action(query, context: ContextTypes.DEFAULT_TYPE) 
     )
     relative_path = current_dir.relative_to(settings.approved_directory)
 
-    # Clear session data
+    # Clear session data and force a fresh start so the next message does not
+    # auto-resume the just-ended session.
     context.user_data["claude_session_id"] = None
     context.user_data["session_started"] = False
     context.user_data["last_message"] = None
+    context.user_data["force_new_session"] = True
 
     # Create quick action buttons
     keyboard = [
@@ -555,7 +578,7 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
         claude_session_id = context.user_data.get("claude_session_id")
 
         if claude_session_id:
-            # Continue with the existing session (no prompt = use --continue)
+            # Continue with the existing session.
             await query.edit_message_text(
                 f"🔄 <b>Continuing Session</b>\n\n"
                 f"Session ID: <code>{escape_html(claude_session_id[:8])}...</code>\n"
@@ -565,7 +588,7 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
             )
 
             claude_response = await claude_integration.run_command(
-                prompt="",  # Empty prompt triggers --continue
+                prompt="Please continue where we left off",
                 working_directory=current_dir,
                 user_id=user_id,
                 session_id=claude_session_id,
@@ -877,8 +900,9 @@ async def handle_quick_action_callback(
     """Handle quick action callbacks."""
     user_id = query.from_user.id
 
-    # Get quick actions manager from bot data if available
-    quick_actions = context.bot_data.get("quick_actions")
+    # Get quick actions manager via the feature registry if available.
+    features = context.bot_data.get("features")
+    quick_actions = features.get_quick_actions() if features else None
 
     if not quick_actions:
         await query.edit_message_text(
@@ -935,10 +959,16 @@ async def handle_quick_action_callback(
                     response_text[:4000] + "...\n\n<i>(Response truncated)</i>"
                 )
 
-            await query.message.reply_text(
-                f"✅ <b>{action.icon} {escape_html(action.name)} Complete</b>\n\n{response_text}",
-                parse_mode="HTML",
+            done_text = (
+                f"✅ <b>{action.icon} {escape_html(action.name)} Complete</b>\n\n"
+                f"{response_text}"
             )
+            if isinstance(query.message, Message):
+                await query.message.reply_text(done_text, parse_mode="HTML")
+            else:
+                await context.bot.send_message(
+                    query.from_user.id, done_text, parse_mode="HTML"
+                )
         else:
             await query.edit_message_text(
                 f"❌ <b>Action Failed</b>\n\n"
@@ -961,8 +991,9 @@ async def handle_followup_callback(
     """Handle follow-up suggestion callbacks."""
     user_id = query.from_user.id
 
-    # Get conversation enhancer from bot data if available
-    conversation_enhancer = context.bot_data.get("conversation_enhancer")
+    # Get conversation enhancer via the feature registry if available.
+    features = context.bot_data.get("features")
+    conversation_enhancer = features.get_conversation_enhancer() if features else None
 
     if not conversation_enhancer:
         await query.edit_message_text(
@@ -1031,13 +1062,18 @@ async def handle_conversation_callback(
 
     elif action_type == "end":
         # End the current session
-        conversation_enhancer = context.bot_data.get("conversation_enhancer")
+        features = context.bot_data.get("features")
+        conversation_enhancer = (
+            features.get_conversation_enhancer() if features else None
+        )
         if conversation_enhancer:
             conversation_enhancer.clear_context(user_id)
 
-        # Clear session data
+        # Clear session data so the next message starts fresh instead of
+        # auto-resuming the just-ended session.
         context.user_data["claude_session_id"] = None
         context.user_data["session_started"] = False
+        context.user_data["force_new_session"] = True
 
         current_dir = context.user_data.get(
             "current_directory", settings.approved_directory
@@ -1287,17 +1323,27 @@ async def handle_export_callback(
         file_bytes = BytesIO(exported_session.content.encode("utf-8"))
         file_bytes.name = exported_session.filename
 
-        await query.message.reply_document(
-            document=file_bytes,
-            filename=exported_session.filename,
-            caption=(
-                f"📤 <b>Session Export Complete</b>\n\n"
-                f"Format: {escape_html(exported_session.format.upper())}\n"
-                f"Size: {exported_session.size_bytes:,} bytes\n"
-                f"Created: {exported_session.created_at.strftime('%Y-%m-%d %H:%M:%S')}"
-            ),
-            parse_mode="HTML",
+        caption = (
+            f"📤 <b>Session Export Complete</b>\n\n"
+            f"Format: {escape_html(exported_session.format.value.upper())}\n"
+            f"Size: {exported_session.size_bytes:,} bytes\n"
+            f"Created: {exported_session.created_at.strftime('%Y-%m-%d %H:%M:%S')}"
         )
+        if isinstance(query.message, Message):
+            await query.message.reply_document(
+                document=file_bytes,
+                filename=exported_session.filename,
+                caption=caption,
+                parse_mode="HTML",
+            )
+        else:
+            await context.bot.send_document(
+                chat_id=query.from_user.id,
+                document=file_bytes,
+                filename=exported_session.filename,
+                caption=caption,
+                parse_mode="HTML",
+            )
 
         # Update the original message
         await query.edit_message_text(

@@ -906,6 +906,8 @@ class TestCanUseToolCallback:
         """Create a mock SecurityValidator."""
         validator = MagicMock()
         validator.validate_path = MagicMock(return_value=(True, Path("/ok"), None))
+        validator.validate_filename = MagicMock(return_value=(True, None))
+        validator.is_forbidden_secret_file = MagicMock(return_value=(False, None))
         return validator
 
     @pytest.fixture
@@ -974,6 +976,25 @@ class TestCanUseToolCallback:
         """File tool call without a path key is allowed (no path to validate)."""
         result = await callback("Read", {"content": "something"}, context)
         assert isinstance(result, PermissionResultAllow)
+
+    async def test_denies_forbidden_basename_in_boundary(
+        self, callback, context, security_validator
+    ):
+        """A Read of an in-boundary secret (.env) is denied via the blocklist.
+
+        validate_path enforces only the directory boundary, so the basename
+        secret-blocklist must be re-applied to catch secrets inside the
+        approved dir. We use is_forbidden_secret_file (not validate_filename)
+        to avoid over-blocking legitimate in-repo files.
+        """
+        security_validator.is_forbidden_secret_file.return_value = (
+            True,
+            "Forbidden filename: .env",
+        )
+        result = await callback("Read", {"file_path": ".env"}, context)
+        assert isinstance(result, PermissionResultDeny)
+        assert "Forbidden filename" in result.message
+        security_validator.is_forbidden_secret_file.assert_called_once_with(".env")
 
     async def test_wired_into_sdk_manager(self, tmp_path):
         """SecurityValidator is wired into options.can_use_tool by execute_command."""

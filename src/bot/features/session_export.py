@@ -70,15 +70,48 @@ class SessionExporter:
         Raises:
             ValueError: If session not found or invalid format
         """
-        # Get session data
-        session = await self.storage.get_session(user_id, session_id)
-        if not session:
+        # Get session data. The storage facade exposes repositories; the
+        # session lookup is keyed by session_id only, so we verify ownership
+        # explicitly afterwards.
+        session_model = await self.storage.sessions.get_session(session_id)
+        if not session_model:
+            raise ValueError(f"Session {session_id} not found")
+        if session_model.user_id != user_id:
             raise ValueError(f"Session {session_id} not found")
 
-        # Get session messages
-        messages = await self.storage.get_session_messages(
+        # Get session messages (each row holds a user prompt + Claude response).
+        message_models = await self.storage.messages.get_session_messages(
             session_id, limit=MAX_SESSION_LENGTH
         )
+
+        # Normalise storage models into the dict shape the formatters expect.
+        # Messages are stored newest-first; reverse to chronological order and
+        # expand each row into a user turn followed by a Claude turn.
+        session = {
+            "id": session_model.session_id,
+            "user_id": session_model.user_id,
+            "created_at": session_model.created_at,
+            "updated_at": session_model.last_used,
+        }
+        messages: list[dict[str, Any]] = []
+        for msg in reversed(message_models):
+            messages.append(
+                {
+                    "id": msg.message_id,
+                    "role": "user",
+                    "content": msg.prompt or "",
+                    "created_at": msg.timestamp,
+                }
+            )
+            if msg.response:
+                messages.append(
+                    {
+                        "id": msg.message_id,
+                        "role": "assistant",
+                        "content": msg.response,
+                        "created_at": msg.timestamp,
+                    }
+                )
 
         # Export based on format
         if format == ExportFormat.MARKDOWN:
@@ -288,17 +321,23 @@ class SessionExporter:
         Returns:
             HTML content
         """
+        import re
         from html import escape as html_escape
 
         html = html_escape(markdown, quote=False)
 
         # Headers — operate on the *escaped* string so user text can never
-        # introduce angle brackets that survive into the output.
-        html = html.replace("# ", "<h1>").replace("\n\n", "</h1>\n\n", 1)
-        html = html.replace("### ", "<h3>").replace("\n", "</h3>\n", 3)
+        # introduce angle brackets that survive into the output. Convert per
+        # line (longest marker first) so an arbitrary number of message headers
+        # are each wrapped in a properly closed tag.
+        def _wrap_headers(match: "re.Match[str]") -> str:
+            hashes, text = match.group(1), match.group(2)
+            level = 1 if len(hashes) == 1 else 3
+            return f"<h{level}>{text}</h{level}>"
+
+        html = re.sub(r"^(#{1,3}) (.*)$", _wrap_headers, html, flags=re.MULTILINE)
 
         # Bold
-        import re
 
         html = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", html)
 

@@ -1,9 +1,10 @@
 """Tests for StopAwareUpdateProcessor.
 
 Covers:
-- Stop callbacks bypass the sequential lock (run immediately)
-- Regular updates are serialized (only one at a time)
-- Non-stop callbacks (e.g. cd:) go through the sequential lock
+- Stop callbacks bypass the per-user lock (run immediately)
+- Regular updates from the same user are serialized (only one at a time)
+- Regular updates from different users run concurrently
+- Non-stop callbacks (e.g. cd:) go through the per-user lock
 """
 
 import asyncio
@@ -18,8 +19,12 @@ from src.bot.update_processor import StopAwareUpdateProcessor
 # ---------------------------------------------------------------------------
 
 
-def _make_update(callback_data: str | None = None) -> Update:
-    """Build a minimal Update mock with optional callback_query data."""
+def _make_update(callback_data: str | None = None, user_id: int | None = 1) -> Update:
+    """Build a minimal Update mock with optional callback_query data.
+
+    ``user_id`` controls which per-user lock the update maps to; pass ``None``
+    to simulate an update with no effective_user (uses the fallback lock).
+    """
     update = MagicMock(spec=Update)
     if callback_data is not None:
         cb = MagicMock(spec=CallbackQuery)
@@ -27,6 +32,12 @@ def _make_update(callback_data: str | None = None) -> Update:
         update.callback_query = cb
     else:
         update.callback_query = None
+    if user_id is None:
+        update.effective_user = None
+    else:
+        user = MagicMock()
+        user.id = user_id
+        update.effective_user = user
     return update
 
 
@@ -113,8 +124,8 @@ class TestStopCallbackBypassesLock:
 
 
 class TestRegularUpdatesSequential:
-    async def test_two_regular_updates_do_not_overlap(self):
-        """Two regular updates are serialized by the sequential lock."""
+    async def test_two_regular_updates_same_user_do_not_overlap(self):
+        """Two regular updates from the same user are serialized."""
         processor = StopAwareUpdateProcessor()
 
         execution_log: list[str] = []
@@ -129,8 +140,8 @@ class TestRegularUpdatesSequential:
             await asyncio.sleep(0.05)
             execution_log.append("b_end")
 
-        update_a = _make_update(None)
-        update_b = _make_update(None)
+        update_a = _make_update(None, user_id=7)
+        update_b = _make_update(None, user_id=7)
 
         task_a = asyncio.create_task(
             processor.do_process_update(update_a, coroutine_a())
@@ -145,6 +156,71 @@ class TestRegularUpdatesSequential:
         await asyncio.gather(task_a, task_b)
 
         # b should not start until a has finished
+        assert execution_log == ["a_start", "a_end", "b_start", "b_end"]
+
+    async def test_different_users_run_concurrently(self):
+        """Updates from different users are not serialized against each other."""
+        processor = StopAwareUpdateProcessor()
+
+        execution_log: list[str] = []
+        a_started = asyncio.Event()
+
+        async def coroutine_a():
+            execution_log.append("a_start")
+            a_started.set()
+            await asyncio.sleep(0.05)
+            execution_log.append("a_end")
+
+        async def coroutine_b():
+            execution_log.append("b_start")
+            execution_log.append("b_end")
+
+        update_a = _make_update(None, user_id=1)
+        update_b = _make_update(None, user_id=2)
+
+        task_a = asyncio.create_task(
+            processor.do_process_update(update_a, coroutine_a())
+        )
+        await a_started.wait()
+
+        task_b = asyncio.create_task(
+            processor.do_process_update(update_b, coroutine_b())
+        )
+
+        await asyncio.gather(task_a, task_b)
+
+        # b ran while a was still in progress (different user -> different lock).
+        assert execution_log == ["a_start", "b_start", "b_end", "a_end"]
+
+    async def test_updates_without_user_share_fallback_lock(self):
+        """Updates lacking effective_user serialize on the fallback lock."""
+        processor = StopAwareUpdateProcessor()
+
+        execution_log: list[str] = []
+
+        async def coroutine_a():
+            execution_log.append("a_start")
+            await asyncio.sleep(0.05)
+            execution_log.append("a_end")
+
+        async def coroutine_b():
+            execution_log.append("b_start")
+            execution_log.append("b_end")
+
+        update_a = _make_update(None, user_id=None)
+        update_b = _make_update(None, user_id=None)
+
+        task_a = asyncio.create_task(
+            processor.do_process_update(update_a, coroutine_a())
+        )
+        await asyncio.sleep(0)
+
+        task_b = asyncio.create_task(
+            processor.do_process_update(update_b, coroutine_b())
+        )
+
+        await asyncio.gather(task_a, task_b)
+
         assert execution_log == ["a_start", "a_end", "b_start", "b_end"]
 
 
@@ -188,7 +264,7 @@ class TestNonStopCallbackSequential:
 
 
 class TestSemaphoreSaturation:
-    """Documents the bypass limit: regular updates waiting on the sequential
+    """Documents the bypass limit: regular updates waiting on their per-user
     lock keep holding their semaphore slot, so when every slot is occupied a
     stop: callback is starved until one frees. This is why _MAX_CONCURRENT is
     sized far above any realistic backlog in production.

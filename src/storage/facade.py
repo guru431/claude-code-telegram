@@ -112,22 +112,12 @@ class Storage:
         # Update cost tracking
         await self.costs.update_daily_cost(user_id, response.cost)
 
-        # Update user stats
-        user = await self.users.get_user(user_id)
-        if user:
-            user.total_cost += response.cost
-            user.message_count += 1
-            user.last_active = datetime.now(UTC)
-            await self.users.update_user(user)
-
-        # Update session stats
-        session = await self.sessions.get_session(session_id)
-        if session:
-            session.total_cost += response.cost
-            session.total_turns += response.num_turns
-            session.message_count += 1
-            session.last_used = datetime.now(UTC)
-            await self.sessions.update_session(session)
+        # Update user stats (atomic increment to avoid lost updates under
+        # concurrent interactions). Session counters are owned by
+        # SessionManager/SQLiteSessionStorage and must NOT be incremented here.
+        await self.users.increment_stats(
+            user_id, response.cost, messages=1, last_active=datetime.now(UTC)
+        )
 
         # Log audit event
         audit_event = AuditLogModel(

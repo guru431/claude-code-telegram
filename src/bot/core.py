@@ -212,8 +212,12 @@ class ClaudeCodeBot:
             self.is_running = True
 
             if self.settings.webhook_url:
-                # Webhook mode
-                await self.app.run_webhook(
+                # Webhook mode. Use the granular API (mirrors polling below)
+                # because ``run_webhook`` is a synchronous PTB entrypoint that
+                # runs its own event loop -- calling it from a live loop raises
+                # RuntimeError.
+                await self.app.start()
+                await self.app.updater.start_webhook(
                     listen="0.0.0.0",
                     port=self.settings.webhook_port,
                     url_path=self.settings.webhook_path,
@@ -221,6 +225,10 @@ class ClaudeCodeBot:
                     drop_pending_updates=True,
                     allowed_updates=Update.ALL_TYPES,
                 )
+
+                # Keep running until manually stopped
+                while self.is_running:
+                    await asyncio.sleep(1)
             else:
                 # Polling mode. ``initialize()`` above already called
                 # ``self.app.initialize()`` (PTB's initializer is

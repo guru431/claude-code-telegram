@@ -8,6 +8,7 @@ Features:
 - Diff generation
 """
 
+import asyncio
 import shutil
 import sys
 import tarfile
@@ -26,6 +27,10 @@ from src.security.validators import SecurityValidator
 
 # Hard limit on number of files in an archive (zip-bomb mitigation).
 MAX_ARCHIVE_FILES = 10000
+
+# Cap on inlined file content per file (chars) to keep prompts bounded,
+# matching the fallback in handlers/message.py.
+MAX_INLINE_CONTENT = 50000
 
 
 @dataclass
@@ -196,7 +201,18 @@ class FileHandler:
             return "binary"
 
     async def _process_archive(self, archive_path: Path, context: str) -> ProcessedFile:
-        """Extract and analyze archive contents"""
+        """Extract and analyze archive contents.
+
+        The extraction/analysis is CPU- and IO-bound (up to 100MB, multiple
+        rglob passes, per-file reads), so run it off the event loop to avoid
+        freezing the typing heartbeat and other users.
+        """
+        return await asyncio.to_thread(
+            self._process_archive_sync, archive_path, context
+        )
+
+    def _process_archive_sync(self, archive_path: Path, context: str) -> ProcessedFile:
+        """Extract and analyze archive contents (synchronous worker)."""
 
         # Create extraction directory
         extract_dir = self.temp_dir / f"extract_{uuid.uuid4()}"
@@ -220,6 +236,12 @@ class FileHandler:
 
                     # Extract with security checks
                     for file_info in zf.filelist:
+                        # Skip directory entries — they are written as files
+                        # otherwise, which collides with later members nested
+                        # under them (FileExistsError on parent mkdir).
+                        if file_info.is_dir():
+                            continue
+
                         # Prevent path traversal
                         file_path = Path(file_info.filename)
                         if file_path.is_absolute() or ".." in file_path.parts:
@@ -347,6 +369,8 @@ class FileHandler:
     async def _process_code_file(self, file_path: Path, context: str) -> ProcessedFile:
         """Process single code file"""
         content = file_path.read_text(encoding="utf-8", errors="ignore")
+        if len(content) > MAX_INLINE_CONTENT:
+            content = content[:MAX_INLINE_CONTENT] + "\n...[truncated]"
 
         # Detect language
         language = self._detect_language(file_path.suffix)
@@ -367,6 +391,8 @@ class FileHandler:
     async def _process_text_file(self, file_path: Path, context: str) -> ProcessedFile:
         """Process text file"""
         content = file_path.read_text(encoding="utf-8", errors="ignore")
+        if len(content) > MAX_INLINE_CONTENT:
+            content = content[:MAX_INLINE_CONTENT] + "\n...[truncated]"
 
         # Create prompt
         prompt = f"{context}\n\nFile: {file_path.name}\n\n{content}"

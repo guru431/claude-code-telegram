@@ -331,6 +331,32 @@ class SecurityValidator:
         logger.debug("Filename validation successful", filename=filename)
         return True, None
 
+    def is_forbidden_secret_file(self, filename: str) -> Tuple[bool, Optional[str]]:
+        """Check only the secret/credential blocklist for a basename.
+
+        Unlike :meth:`validate_filename` (built for *uploads*: extension
+        allowlist + hidden-file ban), this checks ONLY the secret-specific
+        rules — ``FORBIDDEN_FILENAMES`` and ``DANGEROUS_FILE_PATTERNS`` — so it
+        can gate Claude tool calls (Read/Write/Edit) without over-blocking
+        legitimate in-repo files like ``.editorconfig`` or ``config.cfg``.
+
+        Returns:
+            Tuple of (is_forbidden, reason). ``is_forbidden`` is True when the
+            basename matches a secret/credential rule.
+        """
+        if not filename:
+            return False, None
+        name = filename.strip()
+
+        if name.lower() in {n.lower() for n in self.FORBIDDEN_FILENAMES}:
+            return True, f"Forbidden filename: {name}"
+
+        for pattern in self.DANGEROUS_FILE_PATTERNS:
+            if re.match(pattern, name, re.IGNORECASE):
+                return True, f"File type not allowed: {name}"
+
+        return False, None
+
     def sanitize_command_input(self, text: str) -> str:
         """Sanitize text input for commands.
 

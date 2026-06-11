@@ -138,8 +138,16 @@ class ClaudeIntegration:
             # Update session (assigns real session_id for new sessions)
             await self.session_manager.update_session(session, response)
 
-            # Ensure response has the session's final ID
-            response.session_id = session.session_id
+            # On resume Claude may fork to a *new* session_id. Don't clobber a
+            # valid, differing response.session_id with the stale in-memory id —
+            # re-key the session to the forked id so the conversation stays
+            # resumable. Otherwise fall back to the session's stored id.
+            if response.session_id and response.session_id != session.session_id:
+                await self.session_manager.migrate_session_id(
+                    session, response.session_id
+                )
+            else:
+                response.session_id = session.session_id
 
             if not response.session_id:
                 logger.warning(

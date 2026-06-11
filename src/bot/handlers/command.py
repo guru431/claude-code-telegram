@@ -489,7 +489,7 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(
             f"❌ <b>Error Continuing Session</b>\n\n"
             f"An error occurred while trying to continue your session:\n\n"
-            f"<code>{error_msg}</code>\n\n"
+            f"<code>{escape_html(error_msg)}</code>\n\n"
             f"<b>Suggestions:</b>\n"
             f"• Try starting a new session with <code>/new</code>\n"
             f"• Check your session status with <code>/status</code>\n"
@@ -648,7 +648,8 @@ async def change_directory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
                 if not valid:
                     await update.message.reply_text(
-                        f"❌ <b>Access Denied</b>\n\n{error}"
+                        f"❌ <b>Access Denied</b>\n\n{escape_html(error)}",
+                        parse_mode="HTML",
                     )
 
                     # Log security violation
@@ -675,13 +676,17 @@ async def change_directory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # Check if directory exists and is actually a directory
         if not resolved_path.exists():
             await update.message.reply_text(
-                f"❌ <b>Directory Not Found</b>\n\n<code>{target_path}</code> does not exist."
+                f"❌ <b>Directory Not Found</b>\n\n"
+                f"<code>{escape_html(target_path)}</code> does not exist.",
+                parse_mode="HTML",
             )
             return
 
         if not resolved_path.is_dir():
             await update.message.reply_text(
-                f"❌ <b>Not a Directory</b>\n\n<code>{target_path}</code> is not a directory."
+                f"❌ <b>Not a Directory</b>\n\n"
+                f"<code>{escape_html(target_path)}</code> is not a directory.",
+                parse_mode="HTML",
             )
             return
 
@@ -1036,10 +1041,12 @@ async def end_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
     relative_path = current_dir.relative_to(settings.approved_directory)
 
-    # Clear session data
+    # Clear session data and force a fresh start so the next message does not
+    # auto-resume the just-ended session.
     context.user_data["claude_session_id"] = None
     context.user_data["session_started"] = False
     context.user_data["last_message"] = None
+    context.user_data["force_new_session"] = True
 
     # Create quick action buttons
     keyboard = [
@@ -1138,7 +1145,10 @@ async def quick_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
     except Exception as e:
-        await update.message.reply_text(f"❌ <b>Error Loading Actions</b>\n\n{str(e)}")
+        await update.message.reply_text(
+            f"❌ <b>Error Loading Actions</b>\n\n{escape_html(str(e))}",
+            parse_mode="HTML",
+        )
         logger.error("Error in quick_actions command", error=str(e), user_id=user_id)
 
 
@@ -1229,7 +1239,10 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
 
     except Exception as e:
-        await update.message.reply_text(f"❌ <b>Git Error</b>\n\n{str(e)}")
+        await update.message.reply_text(
+            f"❌ <b>Git Error</b>\n\n{escape_html(str(e))}",
+            parse_mode="HTML",
+        )
         logger.error("Error in git_command", error=str(e), user_id=user_id)
 
 

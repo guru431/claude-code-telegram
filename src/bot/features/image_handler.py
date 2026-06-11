@@ -44,6 +44,11 @@ class ImageHandler:
         file = await photo.get_file()
         image_bytes = await file.download_as_bytearray()
 
+        # Validate size and format before processing
+        is_valid, error = await self.validate_image(bytes(image_bytes))
+        if not is_valid:
+            raise ValueError(error or "Invalid image")
+
         # Detect image type
         image_type = self._detect_image_type(image_bytes)
 

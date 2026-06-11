@@ -143,6 +143,20 @@ class TestDraftStreamerTruncation:
         call_kwargs = mock_bot.send_message_draft.call_args[1]
         assert call_kwargs["text"] == exact_text
 
+    async def test_astral_emoji_counted_as_utf16_units(self, streamer, mock_bot):
+        """Astral emoji count as 2 UTF-16 units; truncation must respect that."""
+        from src.bot.utils.html_format import tg_len
+
+        # Each 😀 is 1 code point but 2 UTF-16 units. 3000 of them = 6000 units.
+        streamer._accumulated_text = "😀" * 3000
+        await streamer.flush()
+
+        call_kwargs = mock_bot.send_message_draft.call_args[1]
+        sent_text = call_kwargs["text"]
+        # Must be truncated and within Telegram's UTF-16 budget
+        assert tg_len(sent_text) <= TELEGRAM_MAX_MESSAGE_LENGTH
+        assert sent_text[0] == "…"
+
 
 class TestDraftStreamerSelfDisable:
     async def test_api_error_disables_streamer(self, streamer, mock_bot):

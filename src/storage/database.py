@@ -314,6 +314,16 @@ class DatabaseManager:
                     ON project_threads(project_slug);
                 """,
             ),
+            (
+                5,
+                """
+                -- Performance indexes for tool-usage and per-user message lookups
+                CREATE INDEX IF NOT EXISTS idx_tool_usage_session
+                    ON tool_usage(session_id);
+                CREATE INDEX IF NOT EXISTS idx_messages_user_id
+                    ON messages(user_id, timestamp);
+                """,
+            ),
         ]
 
     async def _init_pool(self):
@@ -358,6 +368,10 @@ class DatabaseManager:
             try:
                 yield transient_conn
             finally:
+                # Roll back any half-finished write so it isn't implicitly
+                # committed/leaked on close (e.g. on cancellation or error).
+                if transient_conn.in_transaction:
+                    await transient_conn.rollback()
                 await transient_conn.close()
             return
 
@@ -378,6 +392,13 @@ class DatabaseManager:
         finally:
             released = False
             if conn is not None:
+                # Roll back any open write transaction before the connection
+                # goes back to the pool. If a task was cancelled or raised
+                # between execute() and commit(), an open transaction would
+                # otherwise be inherited by the next borrower and either
+                # implicitly committed or cause "database is locked".
+                if conn.in_transaction:
+                    await conn.rollback()
                 async with self._pool_lock:
                     if len(self._connection_pool) < self._pool_size:
                         self._connection_pool.append(conn)

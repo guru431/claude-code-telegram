@@ -569,6 +569,9 @@ async def test_agentic_voice_transcription_failure_surfaces_user_error(
     update.message.caption = None
     update.message.chat.send_action = AsyncMock()
     update.message.reply_text = AsyncMock()
+    # The except block replies fresh via effective_message (the progress
+    # message may already be deleted by the media handler).
+    update.effective_message.reply_text = AsyncMock()
 
     progress_msg = AsyncMock()
     progress_msg.edit_text = AsyncMock()
@@ -584,10 +587,10 @@ async def test_agentic_voice_transcription_failure_surfaces_user_error(
 
     await orchestrator.agentic_voice(update, context)
 
-    progress_msg.edit_text.assert_awaited_once()
-    error_text = progress_msg.edit_text.call_args.args[0]
+    update.effective_message.reply_text.assert_awaited_once()
+    error_text = update.effective_message.reply_text.call_args.args[0]
     assert "Mistral transcription request failed" in error_text
-    assert progress_msg.edit_text.call_args.kwargs["parse_mode"] == "HTML"
+    assert update.effective_message.reply_text.call_args.kwargs["parse_mode"] == "HTML"
     claude_integration.run_command.assert_not_awaited()
 
 

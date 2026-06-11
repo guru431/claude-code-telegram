@@ -18,6 +18,15 @@ def escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def tg_len(text: str) -> int:
+    """Length as Telegram counts it: UTF-16 code units, not code points.
+
+    Telegram measures message length in UTF-16 units, so any astral character
+    (most emoji) counts as 2. Use this for length checks against the 4096 limit.
+    """
+    return len(text.encode("utf-16-le")) // 2
+
+
 def markdown_to_telegram_html(text: str) -> str:
     """Convert Claude's markdown output to Telegram-compatible HTML.
 
@@ -48,7 +57,7 @@ def markdown_to_telegram_html(text: str) -> str:
 
     # --- 1. Extract fenced code blocks ---
     def _replace_fenced(m: re.Match) -> str:  # type: ignore[type-arg]
-        lang = m.group(1) or ""
+        lang = (m.group(1) or "").strip()
         code = m.group(2)
         escaped_code = escape_html(code)
         if lang:
@@ -58,7 +67,7 @@ def markdown_to_telegram_html(text: str) -> str:
         return _make_placeholder(html)
 
     text = re.sub(
-        r"```(\w+)?\n(.*?)```",
+        r"```([^\n`]*)\n(.*?)```",
         _replace_fenced,
         text,
         flags=re.DOTALL,
@@ -85,9 +94,14 @@ def markdown_to_telegram_html(text: str) -> str:
     text = re.sub(r"(?<!\w)_(\S.*?\S|\S)_(?!\w)", r"<i>\1</i>", text)
 
     # --- 6. Links: [text](url) ---
+    def _replace_link(m: re.Match) -> str:  # type: ignore[type-arg]
+        label = m.group(1)
+        url = m.group(2).replace('"', "&quot;")
+        return f'<a href="{url}">{label}</a>'
+
     text = re.sub(
         r"\[([^\]]+)\]\(([^)]+)\)",
-        r'<a href="\2">\1</a>',
+        _replace_link,
         text,
     )
 

@@ -260,6 +260,30 @@ class TestResponseFormatter:
             # Should be balanced or have one extra opening (continued in next message)
             assert abs(opening_count - closing_count) <= 1
 
+    def test_long_response_not_split_inside_pre_tag(self, formatter):
+        """A long HTML response with a <pre> block must not be cut mid-tag.
+
+        Goes through the full pipeline: every chunk must have balanced/continued
+        <pre><code> tags and must never contain a truncated opening/closing tag.
+        """
+        # ~6000 chars of code in one fenced block -> forces a split
+        code = "\n".join(f"line_{i} = compute({i})" for i in range(300))
+        text = f"Here is the code:\n```python\n{code}\n```\nDone."
+
+        messages = formatter.format_claude_response(text)
+
+        assert len(messages) > 1
+        for msg in messages:
+            t = msg.text
+            # No truncated tag fragments left dangling at the boundaries.
+            assert "<pre" not in t or "<pre><code" in t
+            opening = t.count("<pre><code")
+            closing = t.count("</code></pre>")
+            # Balanced, or one extra opening that continues in the next message.
+            assert abs(opening - closing) <= 1
+            # The split must not land in the middle of a <...> tag.
+            assert t.count("<") == t.count(">")
+
 
 class TestEscapeHtml:
     """Test HTML escaping utility."""
@@ -312,6 +336,19 @@ class TestMarkdownToTelegramHtml:
     def test_link(self):
         result = markdown_to_telegram_html("[text](https://example.com)")
         assert '<a href="https://example.com">text</a>' in result
+
+    def test_link_url_with_quote_escaped(self):
+        result = markdown_to_telegram_html('[text](https://x.com/a?q="b")')
+        # The double-quote in the URL must be escaped so the href stays valid
+        assert '<a href="https://x.com/a?q=&quot;b&quot;">text</a>' in result
+
+    def test_fenced_code_block_non_word_language(self):
+        # Languages with non-word chars (c++, objective-c) must still extract
+        result = markdown_to_telegram_html("```c++\nint a = 1 < 2;\n```")
+        assert "<pre>" in result
+        assert 'class="language-c++"' in result
+        # Content escaped, not mangled by italic/bold conversion
+        assert "&lt;" in result
 
     def test_header(self):
         result = markdown_to_telegram_html("# My Header")
@@ -447,8 +484,8 @@ class TestOversizedResponseIntegration:
     """End-to-end tests ensuring no formatted chunk exceeds Telegram's 4096-char limit.
 
     These exercise the full format_claude_response pipeline: markdown→HTML
-    conversion, HTML escaping, code block handling, semantic chunking, and
-    message splitting.
+    conversion, HTML escaping, code block handling, and tag-aware message
+    splitting.
     """
 
     def test_large_plain_text_stays_under_limit(self, formatter):

@@ -18,6 +18,16 @@ async def rate_limit_middleware(
     3. Logs rate limit violations
     4. Provides helpful error messages
     """
+    # Stop button callbacks must pass through without consuming tokens/cost so
+    # an in-progress run can always be interrupted (auth is already applied
+    # upstream at group -2).
+    if (
+        event.callback_query
+        and event.callback_query.data
+        and event.callback_query.data.startswith("stop:")
+    ):
+        return await handler(event, data)
+
     user_id = event.effective_user.id if event.effective_user else None
     username = (
         getattr(event.effective_user, "username", None)

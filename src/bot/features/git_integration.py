@@ -143,7 +143,10 @@ class GitIntegration:
             if process.returncode != 0:
                 raise GitError(f"Git command failed: {stderr.decode()}")
 
-            return stdout.decode(), stderr.decode()
+            return (
+                stdout.decode("utf-8", errors="replace"),
+                stderr.decode("utf-8", errors="replace"),
+            )
 
         except asyncio.TimeoutError:
             if process is not None:

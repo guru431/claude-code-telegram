@@ -39,7 +39,10 @@ async def _format_progress_update(update_obj) -> Optional[str]:
             tool_name = update_obj.metadata.get("tool_name", "Tool")
 
         if update_obj.is_error():
-            return f"❌ <b>{tool_name} failed</b>\n\n<i>{update_obj.get_error_message()}</i>"
+            return (
+                f"❌ <b>{escape_html(tool_name)} failed</b>\n\n"
+                f"<i>{escape_html(update_obj.get_error_message() or '')}</i>"
+            )
         else:
             execution_time = ""
             if update_obj.metadata and update_obj.metadata.get("execution_time_ms"):
@@ -68,7 +71,10 @@ async def _format_progress_update(update_obj) -> Optional[str]:
 
     elif update_obj.type == "error":
         # Handle error messages
-        return f"❌ <b>Error</b>\n\n<i>{update_obj.get_error_message()}</i>"
+        return (
+            f"❌ <b>Error</b>\n\n"
+            f"<i>{escape_html(update_obj.get_error_message() or '')}</i>"
+        )
 
     elif update_obj.type == "assistant" and update_obj.tool_calls:
         # Show when tools are being called
@@ -329,16 +335,9 @@ async def handle_text_message(
     )
 
     try:
-        # Check rate limit with estimated cost for text processing
-        estimated_cost = _estimate_text_processing_cost(message_text)
-
-        if rate_limiter:
-            allowed, limit_message = await rate_limiter.check_rate_limit(
-                user_id, estimated_cost
-            )
-            if not allowed:
-                await update.message.reply_text(f"⏱️ {limit_message}")
-                return
+        # Rate limiting was already enforced by rate_limit_middleware (group -1);
+        # re-checking here would double-charge the token bucket. The real cost is
+        # recorded after the run via rate_limiter.record_actual_cost.
 
         # Send typing indicator
         await update.message.chat.send_action("typing")
@@ -354,6 +353,11 @@ async def handle_text_message(
         storage = context.bot_data.get("storage")
 
         if not claude_integration:
+            # Remove the orphaned progress message before bailing out.
+            try:
+                await progress_msg.delete()
+            except Exception:
+                logger.debug("Failed to delete progress message, ignoring")
             await update.message.reply_text(
                 "❌ <b>Claude integration not available</b>\n\n"
                 "The Claude Code integration is not properly configured. "
@@ -377,6 +381,10 @@ async def handle_text_message(
         # MCP image collection via stream intercept
         mcp_images: list[ImageAttachment] = []
 
+        # Throttle progress edits to at most once per 2s (mirrors the agentic
+        # orchestrator) — unthrottled edits hit Telegram rate limits.
+        last_edit = [0.0]
+
         # Enhanced stream updates handler with progress tracking
         async def stream_handler(update_obj):
             # Intercept send_image_to_user MCP tool calls.
@@ -396,14 +404,20 @@ async def handle_text_message(
                         if img:
                             mcp_images.append(img)
 
+            now = asyncio.get_event_loop().time()
+            if now - last_edit[0] < 2.0:
+                return
             try:
                 progress_text = await _format_progress_update(update_obj)
                 if progress_text:
                     await progress_msg.edit_text(progress_text, parse_mode="HTML")
+                    last_edit[0] = now
             except Exception as e:
                 logger.warning("Failed to update progress message", error=str(e))
 
-        # Run Claude command
+        # Run Claude command. Initialize so a failure inside run_command leaves
+        # claude_response bound (the inner except below references it).
+        claude_response = None
         try:
             claude_response = await claude_integration.run_command(
                 prompt=message_text,
@@ -880,21 +894,32 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 if i < len(formatted_messages) - 1:
                     await asyncio.sleep(0.5)
 
+            # Log successful file processing (only after responses are sent —
+            # a Claude failure must not be audited as a success).
+            if audit_logger:
+                await audit_logger.log_file_access(
+                    user_id=user_id,
+                    file_path=document.file_name,
+                    action="upload_processed",
+                    success=True,
+                    file_size=document.file_size,
+                )
+
         except Exception as e:
             await claude_progress_msg.edit_text(
                 _format_error_message(e), parse_mode="HTML"
             )
             logger.error("Claude file processing failed", error=str(e), user_id=user_id)
 
-        # Log successful file processing
-        if audit_logger:
-            await audit_logger.log_file_access(
-                user_id=user_id,
-                file_path=document.file_name,
-                action="upload_processed",
-                success=True,
-                file_size=document.file_size,
-            )
+            # Audit the failed Claude processing.
+            if audit_logger:
+                await audit_logger.log_file_access(
+                    user_id=user_id,
+                    file_path=document.file_name,
+                    action="upload_failed",
+                    success=False,
+                    file_size=document.file_size,
+                )
 
     except Exception as e:
         try:
@@ -1267,7 +1292,10 @@ def _update_working_directory_from_claude_response(
         r"(?:^|[\n\r])\s*Working directory:?\s*(\S+)",
     ]
 
-    content = claude_response.content.lower()
+    # Match against the original-case content — the patterns already use
+    # IGNORECASE, and lowercasing would corrupt the extracted paths
+    # (mixed-case dirs never resolve / .exists() fails).
+    content = claude_response.content
     current_dir = context.user_data.get(
         "current_directory", settings.approved_directory
     )

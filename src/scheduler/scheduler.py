@@ -4,6 +4,7 @@ Wraps APScheduler's AsyncIOScheduler and publishes ScheduledEvents
 to the event bus when jobs fire.
 """
 
+import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -32,7 +33,13 @@ class JobScheduler:
         self.event_bus = event_bus
         self.db_manager = db_manager
         self.default_working_directory = default_working_directory
-        self._scheduler = AsyncIOScheduler()
+        # misfire_grace_time=1h + coalesce: this bot runs as a Windows Scheduled
+        # Task on a workstation that sleeps/resumes. Without this, triggers that
+        # fire while busy or after a resume (past the 1s default grace) are
+        # silently skipped; coalesce collapses a backlog into a single run.
+        self._scheduler = AsyncIOScheduler(
+            job_defaults={"misfire_grace_time": 3600, "coalesce": True}
+        )
 
     async def start(self) -> None:
         """Load persisted jobs and start the scheduler."""
@@ -198,9 +205,21 @@ class JobScheduler:
                     )
 
             logger.info("Loaded scheduled jobs from database", count=len(rows))
+        except sqlite3.OperationalError as e:
+            # Only a genuinely missing table is a benign fresh-start. Anything
+            # else (e.g. "database is locked") must NOT be swallowed as "no
+            # table" — that would silently schedule zero jobs while active rows
+            # exist.
+            if "no such table" in str(e).lower():
+                logger.debug("No scheduled_jobs table found, starting fresh")
+            else:
+                logger.error(
+                    "Failed to load scheduled jobs from database", error=str(e)
+                )
+                raise
         except Exception:
-            # Table might not exist yet on first run
-            logger.debug("No scheduled_jobs table found, starting fresh")
+            logger.error("Failed to load scheduled jobs from database", exc_info=True)
+            raise
 
     async def _save_job(
         self,
