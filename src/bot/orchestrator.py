@@ -6,7 +6,6 @@ classic mode, delegates to existing full-featured handlers.
 """
 
 import asyncio
-import re
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -33,10 +32,12 @@ from telegram.ext import (
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
+from ..security.secret_patterns import redact_secrets
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
 from .utils.html_format import escape_html
 from .utils.image_extractor import (
     ImageAttachment,
+    should_send_as_animation,
     should_send_as_photo,
     validate_image_path,
 )
@@ -49,97 +50,6 @@ _MEDIA_TYPE_MAP = {
     "gif": "image/gif",
     "webp": "image/webp",
 }
-
-# Patterns that look like secrets/credentials in CLI arguments
-_SECRET_PATTERNS: List[re.Pattern[str]] = [
-    # API keys / tokens (sk-ant-..., sk-..., ghp_..., gho_..., github_pat_..., xoxb-...,
-    # gh[ps]_..., glpat-... GitLab, npm_..., AIzaSy... Google, hf_... HuggingFace,
-    # SG.... SendGrid)
-    re.compile(
-        r"(sk-ant-api\d*-[A-Za-z0-9_-]{10})[A-Za-z0-9_-]*"
-        r"|(sk-[A-Za-z0-9_-]{20})[A-Za-z0-9_-]*"
-        r"|(ghp_[A-Za-z0-9]{5})[A-Za-z0-9]*"
-        r"|(gho_[A-Za-z0-9]{5})[A-Za-z0-9]*"
-        r"|(ghs_[A-Za-z0-9]{5})[A-Za-z0-9]*"
-        r"|(ghr_[A-Za-z0-9]{5})[A-Za-z0-9]*"
-        r"|(ghu_[A-Za-z0-9]{5})[A-Za-z0-9]*"
-        r"|(github_pat_[A-Za-z0-9_]{5})[A-Za-z0-9_]*"
-        r"|(glpat-[A-Za-z0-9_-]{5})[A-Za-z0-9_-]*"
-        r"|(xoxb-[A-Za-z0-9]{5})[A-Za-z0-9-]*"
-        r"|(xoxp-[A-Za-z0-9-]{5})[A-Za-z0-9-]*"
-        r"|(xoxa-[A-Za-z0-9-]{5})[A-Za-z0-9-]*"
-        r"|(npm_[A-Za-z0-9]{5})[A-Za-z0-9]*"
-        r"|(AIzaSy[A-Za-z0-9_-]{5})[A-Za-z0-9_-]*"
-        r"|(hf_[A-Za-z0-9]{5})[A-Za-z0-9]*"
-        r"|(SG\.[A-Za-z0-9_-]{5})[A-Za-z0-9_.-]*"
-    ),
-    # Telegram bot token (digits:alphanum_-, ~46 chars)
-    re.compile(r"(\d{6,12}:AAE[A-Za-z0-9_-]{5})[A-Za-z0-9_-]*"),
-    # Anthropic / OpenAI / generic project key prefixes that vary in length
-    re.compile(r"(sk-proj-[A-Za-z0-9_-]{8})[A-Za-z0-9_-]*"),
-    # AWS access keys
-    re.compile(r"(AKIA[0-9A-Z]{4})[0-9A-Z]{12}"),
-    re.compile(r"(ASIA[0-9A-Z]{4})[0-9A-Z]{12}"),
-    # Generic long hex/base64 tokens after common flags/env patterns
-    re.compile(
-        r"((?:--token|--secret|--password|--api-key|--apikey|--auth"
-        r"|--access-key|--bearer|--client-secret|--private-key)"
-        r"[= ]+)['\"]?[A-Za-z0-9+/_.:-]{8,}['\"]?"
-    ),
-    # Inline env assignments like KEY=value
-    re.compile(
-        r"((?:TOKEN|SECRET|PASSWORD|PASSWD|PASS|API_KEY|APIKEY"
-        r"|AUTH_TOKEN|AUTH|PRIVATE_KEY|ACCESS_KEY|ACCESS_TOKEN"
-        r"|CLIENT_SECRET|WEBHOOK_SECRET|REFRESH_TOKEN|SESSION_TOKEN"
-        r"|BOT_TOKEN|GH_TOKEN|GITHUB_TOKEN|SLACK_TOKEN|DATABASE_URL"
-        r"|REDIS_URL)"
-        r"=)['\"]?[^\s'\"]{8,}['\"]?"
-    ),
-    # Bearer / Basic auth headers
-    re.compile(r"(Bearer )[A-Za-z0-9+/_.:-]{8,}" r"|(Basic )[A-Za-z0-9+/=]{8,}"),
-    # Connection strings with credentials  scheme://user:pass@host
-    # Two outer capture groups preserve the `scheme://user:` prefix and
-    # the `@host` suffix; the password between them is redacted.
-    re.compile(r"(://[^:/\s]+:)[^@\s]{4,}(@[^\s]+)"),
-    # Private key blocks
-    re.compile(
-        r"(-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----)"
-        r"[\s\S]+?(-----END (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----)"
-    ),
-    # JSON-like "password": "...", "token": "..."
-    re.compile(
-        r'("(?:password|passwd|pass|token|secret|api_?key|auth(?:_token)?)"'
-        r"\s*:\s*\")[^\"]{4,}(\")",
-        re.IGNORECASE,
-    ),
-]
-
-
-def _redact_match(match: "re.Match[str]") -> str:
-    """Replace a matched secret while preserving structural groups.
-
-    The patterns in :data:`_SECRET_PATTERNS` use capture groups for the
-    non-secret prefix (e.g. ``"Bearer "``, ``"sk-abc"``) and, where
-    relevant, a trailing suffix (``"@host"`` for connection strings).
-    We concatenate all non-None groups around a ``***`` placeholder so
-    that the redacted output keeps the surrounding context legible.
-    """
-    groups = [g for g in match.groups() if g is not None]
-    if not groups:
-        return "***"
-    if len(groups) == 1:
-        return f"{groups[0]}***"
-    # Two-group case: prefix + suffix wrap the redacted secret.
-    return f"{groups[0]}***{groups[1]}"
-
-
-def _redact_secrets(text: str) -> str:
-    """Replace likely secrets/credentials with redacted placeholders."""
-    result = text
-    for pattern in _SECRET_PATTERNS:
-        result = pattern.sub(_redact_match, result)
-    return result
-
 
 # Tool name -> friendly emoji mapping for verbose output
 _TOOL_ICONS: Dict[str, str] = {
@@ -381,6 +291,8 @@ class MessageOrchestrator:
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
             ("sessions", self.agentic_sessions),
+            ("schedule", self.cmd_schedule),
+            ("events", self.cmd_events),
             ("restart", command.restart_command),
         ]
         if self.settings.enable_project_threads:
@@ -552,6 +464,8 @@ class MessageOrchestrator:
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
                 BotCommand("sessions", "List sessions (local + bot)"),
+                BotCommand("schedule", "Manage scheduled jobs (admin)"),
+                BotCommand("events", "Show failed webhook events (admin)"),
                 BotCommand("restart", "Restart the bot"),
             ]
             if self.settings.enable_project_threads:
@@ -767,7 +681,7 @@ class MessageOrchestrator:
         if tool_name == "Bash":
             cmd = tool_input.get("command", "")
             if cmd:
-                return _redact_secrets(cmd[:100])[:80]
+                return redact_secrets(cmd[:100])[:80]
         if tool_name in ("WebFetch", "WebSearch"):
             return (tool_input.get("url", "") or tool_input.get("query", ""))[:60]
         if tool_name == "Task":
@@ -930,32 +844,78 @@ class MessageOrchestrator:
 
         Returns True if the caption was successfully embedded in the photo message.
         """
+        animations: List[ImageAttachment] = []
         photos: List[ImageAttachment] = []
         documents: List[ImageAttachment] = []
         for img in images:
-            if should_send_as_photo(img.path):
+            if should_send_as_animation(img.path):
+                # GIFs must go through reply_animation() — reply_photo flattens
+                # them into a static frame.
+                animations.append(img)
+            elif should_send_as_photo(img.path):
                 photos.append(img)
             else:
                 documents.append(img)
 
-        # Telegram caption limit
+        # Telegram caption limit. Only embed the response-text caption in a
+        # single photo (mixed animation/document batches send separately).
         use_caption = bool(
-            caption and len(caption) <= 1024 and photos and not documents
+            caption
+            and len(caption) <= 1024
+            and photos
+            and not documents
+            and not animations
         )
         caption_sent = False
+
+        # Send animations (GIFs) individually — they cannot be mixed into a
+        # photo album.
+        for img in animations:
+            try:
+                with open(img.path, "rb") as f:
+                    await update.message.reply_animation(
+                        animation=f,
+                        reply_to_message_id=reply_to_message_id,
+                    )
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.warning(
+                    "Failed to send animation",
+                    path=str(img.path),
+                    error=str(e),
+                )
 
         # Send raster photos as a single album (Telegram groups 2-10 items)
         if photos:
             try:
                 if len(photos) == 1:
-                    with open(photos[0].path, "rb") as f:
+                    # Prefer the per-image caption captured from the MCP
+                    # send_image_to_user call when one was supplied; otherwise
+                    # fall back to the response-text caption.
+                    single = photos[0]
+                    per_image_caption = (
+                        single.original_reference
+                        if single.original_reference
+                        and single.original_reference != str(single.path)
+                        else None
+                    )
+                    if per_image_caption:
+                        photo_caption: Optional[str] = per_image_caption
+                        photo_parse_mode: Optional[str] = None
+                    elif use_caption:
+                        photo_caption = caption
+                        photo_parse_mode = caption_parse_mode
+                    else:
+                        photo_caption = None
+                        photo_parse_mode = None
+                    with open(single.path, "rb") as f:
                         await update.message.reply_photo(
                             photo=f,
                             reply_to_message_id=reply_to_message_id,
-                            caption=caption if use_caption else None,
-                            parse_mode=caption_parse_mode if use_caption else None,
+                            caption=photo_caption,
+                            parse_mode=photo_parse_mode,
                         )
-                    caption_sent = use_caption
+                    caption_sent = use_caption and not per_image_caption
                 else:
                     media = []
                     file_handles = []
@@ -1110,43 +1070,64 @@ class MessageOrchestrator:
 
             context.user_data["claude_session_id"] = claude_response.session_id
 
-            # Charge the real cost so claude_max_cost_per_user is enforced.
-            if rate_limiter:
-                await rate_limiter.record_actual_cost(user_id, claude_response.cost)
+            # The run completed without raising but the SDK flagged an error
+            # (e.g. no ResultMessage / budget cap). Surface it explicitly and
+            # don't charge cost for a run that produced no usable result.
+            if claude_response.is_error:
+                success = False
+                from .handlers.message import _format_error_message
+                from .utils.formatting import FormattedMessage
 
-            # Track directory changes
-            from .handlers.message import _update_working_directory_from_claude_response
-
-            _update_working_directory_from_claude_response(
-                claude_response, context, self.settings, user_id
-            )
-
-            # Store interaction
-            storage = context.bot_data.get("storage")
-            if storage:
-                try:
-                    await storage.save_claude_interaction(
-                        user_id=user_id,
-                        session_id=claude_response.session_id,
-                        prompt=message_text,
-                        response=claude_response,
-                        ip_address=None,
+                formatted_messages = [
+                    FormattedMessage(
+                        _format_error_message(
+                            claude_response.error_type or "Claude returned an error."
+                        ),
+                        parse_mode="HTML",
                     )
-                except Exception as e:
-                    logger.warning("Failed to log interaction", error=str(e))
+                ]
+            else:
+                # Charge the real cost so claude_max_cost_per_user is enforced.
+                if rate_limiter:
+                    await rate_limiter.record_actual_cost(
+                        user_id, claude_response.cost
+                    )
 
-            # Format response (no reply_markup — strip keyboards)
-            from .utils.formatting import ResponseFormatter
+                # Track directory changes
+                from .handlers.message import (
+                    _update_working_directory_from_claude_response,
+                )
 
-            formatter = ResponseFormatter(self.settings)
+                _update_working_directory_from_claude_response(
+                    claude_response, context, self.settings, user_id
+                )
 
-            response_content = claude_response.content
-            if claude_response.interrupted:
-                response_content = (
-                    response_content or ""
-                ) + "\n\n_(Interrupted by user)_"
+                # Store interaction
+                storage = context.bot_data.get("storage")
+                if storage:
+                    try:
+                        await storage.save_claude_interaction(
+                            user_id=user_id,
+                            session_id=claude_response.session_id,
+                            prompt=message_text,
+                            response=claude_response,
+                            ip_address=None,
+                        )
+                    except Exception as e:
+                        logger.warning("Failed to log interaction", error=str(e))
 
-            formatted_messages = formatter.format_claude_response(response_content)
+                # Format response (no reply_markup — strip keyboards)
+                from .utils.formatting import ResponseFormatter
+
+                formatter = ResponseFormatter(self.settings)
+
+                # Redact secrets from the response body before it leaves the
+                # bot — tool OUTPUT (e.g. a printenv dump) can land here.
+                response_content = redact_secrets(claude_response.content or "")
+                if claude_response.interrupted:
+                    response_content = response_content + "\n\n_(Interrupted by user)_"
+
+                formatted_messages = formatter.format_claude_response(response_content)
 
         except Exception as e:
             success = False
@@ -1327,122 +1308,19 @@ class MessageOrchestrator:
             )
             return
 
-        current_dir = context.user_data.get(
-            "current_directory", self.settings.approved_directory
-        )
-        session_id = context.user_data.get("claude_session_id")
-
-        # Check if /new was used — skip auto-resume for this first message.
-        # Flag is only cleared after a successful run so retries keep the intent.
-        force_new = bool(context.user_data.get("force_new_session"))
-
-        verbose_level = self._get_verbose_level(context)
-        tool_log: List[Dict[str, Any]] = []
-        mcp_images_doc: List[ImageAttachment] = []
-        on_stream = self._make_stream_callback(
-            verbose_level,
-            progress_msg,
-            tool_log,
-            time.time(),
-            mcp_images=mcp_images_doc,
-            approved_directory=self.settings.approved_directory,
-        )
-
-        heartbeat = self._start_typing_heartbeat(chat)
+        # Route through the shared media handler: it owns the Stop keyboard,
+        # ActiveRequest registration, interrupt event, secret redaction, and
+        # is_error handling (so the document path inherits them, and a failed
+        # run can no longer leave a dead "Working..." message behind).
         try:
-            claude_response = await claude_integration.run_command(
+            await self._handle_agentic_media_message(
+                update=update,
+                context=context,
                 prompt=prompt,
-                working_directory=current_dir,
+                progress_msg=progress_msg,
                 user_id=user_id,
-                session_id=session_id,
-                on_stream=on_stream,
-                force_new=force_new,
+                chat=chat,
             )
-
-            if force_new:
-                context.user_data["force_new_session"] = False
-
-            context.user_data["claude_session_id"] = claude_response.session_id
-
-            rate_limiter = context.bot_data.get("rate_limiter")
-            if rate_limiter:
-                await rate_limiter.record_actual_cost(user_id, claude_response.cost)
-
-            from .handlers.message import _update_working_directory_from_claude_response
-
-            _update_working_directory_from_claude_response(
-                claude_response, context, self.settings, user_id
-            )
-
-            from .utils.formatting import ResponseFormatter
-
-            formatter = ResponseFormatter(self.settings)
-            formatted_messages = formatter.format_claude_response(
-                claude_response.content
-            )
-
-            try:
-                await progress_msg.delete()
-            except Exception:
-                logger.debug("Failed to delete progress message, ignoring")
-
-            # Use MCP-collected images (from send_image_to_user tool calls)
-            images: List[ImageAttachment] = mcp_images_doc
-
-            caption_sent = False
-            if images and len(formatted_messages) == 1:
-                msg = formatted_messages[0]
-                if msg.text and len(msg.text) <= 1024:
-                    try:
-                        caption_sent = await self._send_images(
-                            update,
-                            images,
-                            reply_to_message_id=update.message.message_id,
-                            caption=msg.text,
-                            caption_parse_mode=msg.parse_mode,
-                        )
-                    except Exception as img_err:
-                        logger.warning("Image+caption send failed", error=str(img_err))
-
-            if not caption_sent:
-                for i, message in enumerate(formatted_messages):
-                    if not message.text or not message.text.strip():
-                        continue
-                    try:
-                        await update.message.reply_text(
-                            message.text,
-                            parse_mode=message.parse_mode,
-                            reply_markup=None,
-                            reply_to_message_id=(
-                                update.message.message_id if i == 0 else None
-                            ),
-                        )
-                    except Exception as send_err:
-                        logger.warning(
-                            "Failed to send HTML response, retrying as plain text",
-                            error=str(send_err),
-                            message_index=i,
-                        )
-                        await update.message.reply_text(
-                            message.text,
-                            reply_markup=None,
-                            reply_to_message_id=(
-                                update.message.message_id if i == 0 else None
-                            ),
-                        )
-                    if i < len(formatted_messages) - 1:
-                        await asyncio.sleep(0.5)
-
-                if images:
-                    try:
-                        await self._send_images(
-                            update,
-                            images,
-                            reply_to_message_id=update.message.message_id,
-                        )
-                    except Exception as img_err:
-                        logger.warning("Image send failed", error=str(img_err))
-
         except Exception as e:
             from .handlers.message import _format_error_message
 
@@ -1452,8 +1330,6 @@ class MessageOrchestrator:
                 _format_error_message(e), parse_mode="HTML"
             )
             logger.error("Claude file processing failed", error=str(e), user_id=user_id)
-        finally:
-            heartbeat.cancel()
 
     async def agentic_photo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1619,6 +1495,15 @@ class MessageOrchestrator:
                 images=images,
                 interrupt_event=interrupt_event,
             )
+        except Exception:
+            # Clear the dead "Working..." progress message (with its now-useless
+            # Stop button) before the caller reports the error — otherwise it
+            # lingers forever in the chat.
+            try:
+                await progress_msg.delete()
+            except Exception:
+                logger.debug("Failed to delete progress message, ignoring")
+            raise
         finally:
             heartbeat.cancel()
             self._active_requests.pop(user_id, None)
@@ -1628,22 +1513,41 @@ class MessageOrchestrator:
 
         context.user_data["claude_session_id"] = claude_response.session_id
 
+        from .handlers.message import _update_working_directory_from_claude_response
+        from .utils.formatting import ResponseFormatter
+
+        # The run completed without raising but the SDK flagged an error
+        # (e.g. no ResultMessage / budget cap). Surface it and skip the cost
+        # charge for a 'no_result_message' run that produced nothing usable.
+        if claude_response.is_error:
+            from .handlers.message import _format_error_message
+
+            try:
+                await progress_msg.delete()
+            except Exception:
+                logger.debug("Failed to delete progress message, ignoring")
+            await update.effective_message.reply_text(
+                _format_error_message(
+                    claude_response.error_type or "Claude returned an error."
+                ),
+                parse_mode="HTML",
+            )
+            return
+
         rate_limiter = context.bot_data.get("rate_limiter")
         if rate_limiter:
             await rate_limiter.record_actual_cost(user_id, claude_response.cost)
-
-        from .handlers.message import _update_working_directory_from_claude_response
 
         _update_working_directory_from_claude_response(
             claude_response, context, self.settings, user_id
         )
 
-        from .utils.formatting import ResponseFormatter
-
         formatter = ResponseFormatter(self.settings)
-        response_content = claude_response.content
+        # Redact secrets from the response body before it leaves the bot —
+        # tool OUTPUT (e.g. a printenv dump) can land here.
+        response_content = redact_secrets(claude_response.content or "")
         if claude_response.interrupted:
-            response_content = (response_content or "") + "\n\n_(Interrupted by user)_"
+            response_content = response_content + "\n\n_(Interrupted by user)_"
         formatted_messages = formatter.format_claude_response(response_content)
 
         try:
@@ -1896,6 +1800,218 @@ class MessageOrchestrator:
             reply_markup=reply_markup,
         )
 
+    async def cmd_schedule(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Manage scheduled jobs (admin only).
+
+        /schedule list                       — list active jobs
+        /schedule add <cron(5 fields)> <prompt...>  — add a cron job
+        /schedule remove <job_id>            — remove a job
+        """
+        user_id = update.effective_user.id
+
+        # Admin gate — scheduling is a privileged automation lever.
+        if not self.settings.is_admin(user_id):
+            await update.message.reply_text(
+                "🔒 <b>Admin only</b>\n\nThis command is restricted to "
+                "administrators.",
+                parse_mode="HTML",
+            )
+            audit_logger = context.bot_data.get("audit_logger")
+            if audit_logger:
+                await audit_logger.log_security_violation(
+                    user_id=user_id,
+                    violation_type="unauthorized_admin_command",
+                    details="/schedule denied (not an admin)",
+                    severity="medium",
+                )
+            logger.warning("Unauthorized /schedule attempt", user_id=user_id)
+            return
+
+        scheduler = context.bot_data.get("scheduler")
+        if scheduler is None:
+            await update.message.reply_text(
+                "Scheduler is disabled (set <code>ENABLE_SCHEDULER=true</code>).",
+                parse_mode="HTML",
+            )
+            return
+
+        usage = (
+            "<b>Usage</b>\n"
+            "<code>/schedule list</code>\n"
+            "<code>/schedule add &lt;cron 5 fields&gt; &lt;prompt&gt;</code>\n"
+            "<code>/schedule remove &lt;job_id&gt;</code>"
+        )
+
+        args = update.message.text.split()[1:] if update.message.text else []
+        sub = args[0].lower() if args else ""
+
+        if sub == "list":
+            jobs = await scheduler.list_jobs()
+            if not jobs:
+                await update.message.reply_text("No scheduled jobs.")
+            else:
+                lines: List[str] = []
+                for job in jobs:
+                    job_id = job.get("job_id", "?")
+                    job_name = job.get("job_name", "?")
+                    cron_expr = job.get("cron_expression", "?")
+                    next_run = self._scheduler_next_run(scheduler, job_id)
+                    next_str = f" · next {next_run}" if next_run else ""
+                    lines.append(
+                        f"<code>{escape_html(str(job_id))}</code> · "
+                        f"<b>{escape_html(str(job_name))}</b> · "
+                        f"<code>{escape_html(str(cron_expr))}</code>{next_str}"
+                    )
+                await update.message.reply_text(
+                    "<b>Scheduled jobs</b>\n\n" + "\n".join(lines),
+                    parse_mode="HTML",
+                )
+
+        elif sub == "add":
+            # /schedule add <m> <h> <dom> <mon> <dow> <prompt...>
+            if len(args) < 7:
+                await update.message.reply_text(usage, parse_mode="HTML")
+                return
+            cron_expression = " ".join(args[1:6])
+            prompt = " ".join(args[6:]).strip()
+            if not prompt:
+                await update.message.reply_text(usage, parse_mode="HTML")
+                return
+            job_name = prompt.split()[0][:40] or "job"
+            try:
+                job_id = await scheduler.add_job(
+                    job_name=job_name,
+                    cron_expression=cron_expression,
+                    prompt=prompt,
+                    target_chat_ids=[update.effective_chat.id],
+                    created_by=user_id,
+                )
+            except Exception as e:
+                await update.message.reply_text(
+                    f"Failed to add job: {escape_html(str(e))}",
+                    parse_mode="HTML",
+                )
+                return
+            await update.message.reply_text(
+                f"Added job <code>{escape_html(str(job_id))}</code> "
+                f"(<code>{escape_html(cron_expression)}</code>).",
+                parse_mode="HTML",
+            )
+
+        elif sub == "remove":
+            if len(args) < 2:
+                await update.message.reply_text(usage, parse_mode="HTML")
+                return
+            job_id = args[1]
+            await scheduler.remove_job(job_id)
+            await update.message.reply_text(
+                f"Removed job <code>{escape_html(str(job_id))}</code>.",
+                parse_mode="HTML",
+            )
+
+        else:
+            await update.message.reply_text(usage, parse_mode="HTML")
+
+        # Audit log
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command="schedule",
+                args=[sub or "(none)"],
+                success=True,
+            )
+
+    @staticmethod
+    def _scheduler_next_run(scheduler: Any, job_id: str) -> Optional[str]:
+        """Return the next run time of a live APScheduler job, if available."""
+        try:
+            job = scheduler._scheduler.get_job(job_id)
+        except Exception:
+            return None
+        next_run_time = getattr(job, "next_run_time", None) if job else None
+        if next_run_time is None:
+            return None
+        return next_run_time.strftime("%Y-%m-%d %H:%M %Z").strip()
+
+    async def cmd_events(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Show recent failed / retrying / dead-letter webhook deliveries (admin)."""
+        user_id = update.effective_user.id
+
+        if not self.settings.is_admin(user_id):
+            await update.message.reply_text(
+                "🔒 <b>Admin only</b>\n\nThis command is restricted to "
+                "administrators.",
+                parse_mode="HTML",
+            )
+            audit_logger = context.bot_data.get("audit_logger")
+            if audit_logger:
+                await audit_logger.log_security_violation(
+                    user_id=user_id,
+                    violation_type="unauthorized_admin_command",
+                    details="/events denied (not an admin)",
+                    severity="medium",
+                )
+            logger.warning("Unauthorized /events attempt", user_id=user_id)
+            return
+
+        storage = context.bot_data.get("storage")
+        if storage is None:
+            await update.message.reply_text("Storage is unavailable.")
+            return
+
+        try:
+            async with storage.db_manager.get_connection() as conn:
+                cursor = await conn.execute(
+                    "SELECT provider, event_type, delivery_id, processed, "
+                    "attempts, last_error FROM webhook_events "
+                    "WHERE attempts > 0 OR processed = 2 "
+                    "ORDER BY COALESCE(last_attempt_at, received_at) DESC LIMIT 15"
+                )
+                rows = [dict(r) for r in await cursor.fetchall()]
+        except Exception:
+            logger.exception("Failed to load webhook events for /events")
+            await update.message.reply_text("Failed to load webhook events.")
+            return
+
+        if not rows:
+            await update.message.reply_text(
+                "No failed or retrying webhook events."
+            )
+            return
+
+        state_icon = {0: "⏳ retry", 1: "✅ recovered", 2: "💀 dead"}
+        lines: List[str] = []
+        for r in rows:
+            icon = state_icon.get(int(r.get("processed") or 0), "?")
+            delivery = str(r.get("delivery_id") or "?")[:16]
+            etype = str(r.get("event_type") or "?")
+            attempts = r.get("attempts") or 0
+            err = str(r.get("last_error") or "")
+            if len(err) > 120:
+                err = err[:120] + "…"
+            err_line = f"\n   {escape_html(err)}" if err else ""
+            lines.append(
+                f"{icon} · <b>{escape_html(etype)}</b> · "
+                f"<code>{escape_html(delivery)}</code> · {attempts} att.{err_line}"
+            )
+
+        await update.message.reply_text(
+            "<b>Webhook events</b> (failed / retrying / dead-letter)\n\n"
+            + "\n".join(lines),
+            parse_mode="HTML",
+        )
+
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id, command="events", args=[], success=True
+            )
+
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -2043,7 +2159,18 @@ class MessageOrchestrator:
         _, session_id = query.data.split(":", 1)
 
         # Find the session's working directory from local storage
-        from ..claude.local_sessions import _claude_projects_dir, _parse_session_head
+        from ..claude.local_sessions import (
+            _claude_projects_dir,
+            _encode_path,
+            _is_within,
+            _parse_session_head,
+        )
+
+        approved = self.settings.approved_directory
+        # Encoded prefix for the approved root — Claude encodes a cwd by
+        # replacing non-alphanumerics with "-", so any project dir inside the
+        # approved root has an encoded name starting with this prefix.
+        approved_prefix = _encode_path(approved.resolve())
 
         def _find_session_cwd() -> Optional[str]:
             projects_dir = _claude_projects_dir()
@@ -2052,11 +2179,18 @@ class MessageOrchestrator:
             for project_dir in projects_dir.iterdir():
                 if not project_dir.is_dir():
                     continue
+                # Scope to project dirs encoded under the approved root.
+                if not project_dir.name.startswith(approved_prefix):
+                    continue
                 jsonl = project_dir / f"{session_id}.jsonl"
                 if jsonl.is_file():
                     first = _parse_session_head(jsonl)
-                    if first:
-                        return first.get("cwd")
+                    if not first:
+                        return None
+                    cwd = first.get("cwd")
+                    # Confirm the recorded cwd really resolves inside approved.
+                    if cwd and _is_within(Path(cwd), approved):
+                        return cwd
                     return None
             return None
 
@@ -2064,24 +2198,23 @@ class MessageOrchestrator:
         # it does not block the event loop.
         cwd = await asyncio.to_thread(_find_session_cwd)
 
-        # Reject sessions whose working directory escapes the approved root —
-        # otherwise resuming would point subsequent prompts outside it.
-        approved = self.settings.approved_directory
-        if cwd and not self._is_within(Path(cwd).resolve(), approved.resolve()):
+        # Fail closed: if we cannot confirm a cwd within the approved root
+        # (missing/unscoped session, or first JSONL line had no cwd), refuse to
+        # resume rather than silently moving the bot outside the approved root.
+        if not cwd:
             await query.edit_message_text(
-                "❌ That session's working directory is outside the approved "
-                "directory and cannot be resumed.",
+                "❌ That session's working directory could not be confirmed "
+                "within the approved directory and cannot be resumed.",
             )
             return
 
-        if cwd:
-            context.user_data["current_directory"] = Path(cwd)
+        context.user_data["current_directory"] = Path(cwd)
 
         context.user_data["claude_session_id"] = session_id
         context.user_data.pop("force_new_session", None)
 
         short_id = session_id[:8]
-        dir_display = f" in <code>{escape_html(cwd)}</code>" if cwd else ""
+        dir_display = f" in <code>{escape_html(cwd)}</code>"
 
         await query.edit_message_text(
             f"Resumed session <code>{short_id}…</code>{dir_display}",

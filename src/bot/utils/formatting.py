@@ -212,12 +212,16 @@ class ResponseFormatter:
         def _truncate_code(m: re.Match) -> str:  # type: ignore[type-arg]
             full = m.group(0)
             if len(full) > self.max_code_block_length:
-                # Re-extract and truncate the inner content
+                # m.group(1) is the inner content of an ALREADY-escaped <pre><code>
+                # block (markdown_to_telegram_html ran first). Do not escape it a
+                # second time, and back the cut off so it never lands inside an
+                # `&...;` HTML entity.
                 inner = m.group(1)
                 truncated = inner[: self.max_code_block_length - 80]
-                return (
-                    f"<pre><code>{escape_html(truncated)}\n... (truncated)</code></pre>"
-                )
+                amp = truncated.rfind("&")
+                if amp != -1 and ";" not in truncated[amp:]:
+                    truncated = truncated[:amp]
+                return f"<pre><code>{truncated}\n... (truncated)</code></pre>"
             return full
 
         return re.sub(
@@ -244,8 +248,10 @@ class ResponseFormatter:
             # >= code-point length, so this stays within the budget).
             cut = step
             # Find the last whitespace before `cut` that is not inside a
-            # `<...>` tag or a `&...;` entity.
+            # `<...>` tag or a `&...;` entity. Also track the last offset that is
+            # outside a tag/entity, so the fallback cut never slices through one.
             safe = -1
+            outside = -1
             in_tag = False
             in_entity = False
             for i, ch in enumerate(rest[:cut]):
@@ -253,13 +259,29 @@ class ResponseFormatter:
                     in_tag = True
                 elif ch == ">":
                     in_tag = False
+                    outside = i + 1
                 elif ch == "&":
                     in_entity = True
                 elif ch == ";":
                     in_entity = False
-                elif ch.isspace() and not in_tag and not in_entity:
-                    safe = i
-            split_at = safe if safe > 0 else cut
+                    outside = i + 1
+                elif not in_tag and not in_entity:
+                    outside = i + 1
+                    if ch.isspace():
+                        safe = i
+            if safe > 0:
+                split_at = safe
+            elif outside > 0:
+                # No whitespace boundary: cut at the last position outside any
+                # tag/entity so we never split a `<...>`/`&...;` in two.
+                split_at = outside
+            else:
+                # A single tag/entity exceeds the budget; it cannot be sent as
+                # valid HTML at this size, so emit the chunk as escaped plain
+                # text rather than splitting the tag.
+                chunks.append(escape_html(rest[:cut]))
+                rest = rest[cut:]
+                continue
             chunks.append(rest[:split_at])
             rest = rest[split_at:]
 

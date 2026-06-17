@@ -1,5 +1,6 @@
 """Command handlers for bot operations."""
 
+import asyncio
 import os
 import signal
 import sys
@@ -519,32 +520,34 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
     try:
-        # List directory contents
-        items = []
-        directories = []
-        files = []
+        # List directory contents. The blocking iterdir/stat walk runs off the
+        # event loop so a slow/large directory doesn't stall other updates.
+        def _walk_directory() -> list[str]:
+            directories: list[str] = []
+            files: list[str] = []
+            for item in sorted(current_dir.iterdir()):
+                # Skip hidden files (starting with .)
+                if item.name.startswith("."):
+                    continue
 
-        for item in sorted(current_dir.iterdir()):
-            # Skip hidden files (starting with .)
-            if item.name.startswith("."):
-                continue
+                # Escape HTML special characters in filenames
+                safe_name = _escape_markdown(item.name)
 
-            # Escape HTML special characters in filenames
-            safe_name = _escape_markdown(item.name)
+                if item.is_dir():
+                    directories.append(f"📁 {safe_name}/")
+                else:
+                    # Get file size
+                    try:
+                        size = item.stat().st_size
+                        size_str = _format_file_size(size)
+                        files.append(f"📄 {safe_name} ({size_str})")
+                    except OSError:
+                        files.append(f"📄 {safe_name}")
 
-            if item.is_dir():
-                directories.append(f"📁 {safe_name}/")
-            else:
-                # Get file size
-                try:
-                    size = item.stat().st_size
-                    size_str = _format_file_size(size)
-                    files.append(f"📄 {safe_name} ({size_str})")
-                except OSError:
-                    files.append(f"📄 {safe_name}")
+            # Combine directories first, then files
+            return directories + files
 
-        # Combine directories first, then files
-        items = directories + files
+        items = await asyncio.to_thread(_walk_directory)
 
         # Format response
         relative_path = current_dir.relative_to(settings.approved_directory)
@@ -812,11 +815,16 @@ async def show_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
             return
 
-        # Get directories in approved directory (these are "projects")
-        projects = []
-        for item in sorted(settings.approved_directory.iterdir()):
-            if item.is_dir() and not item.name.startswith("."):
-                projects.append(item.name)
+        # Get directories in approved directory (these are "projects"). The
+        # blocking iterdir walk runs off the event loop.
+        def _list_projects() -> list[str]:
+            return [
+                item.name
+                for item in sorted(settings.approved_directory.iterdir())
+                if item.is_dir() and not item.name.startswith(".")
+            ]
+
+        projects = await asyncio.to_thread(_list_projects)
 
         if not projects:
             await update.message.reply_text(
@@ -826,19 +834,25 @@ async def show_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
             return
 
-        # Create inline keyboard with project buttons
+        # Create inline keyboard with project buttons. Telegram caps
+        # callback_data at 64 UTF-8 bytes; a multibyte name that overflows
+        # would break the whole reply, so omit its button (the name still
+        # shows in the text list and stays reachable via /cd).
         keyboard = []
         for i in range(0, len(projects), 2):
             row = []
             for j in range(2):
                 if i + j < len(projects):
                     project = projects[i + j]
+                    if len(f"cd:{project}".encode("utf-8")) > 64:
+                        continue
                     row.append(
                         InlineKeyboardButton(
                             f"📁 {project}", callback_data=f"cd:{project}"
                         )
                     )
-            keyboard.append(row)
+            if row:
+                keyboard.append(row)
 
         # Add navigation buttons
         keyboard.append(
@@ -1133,7 +1147,7 @@ async def quick_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
 
         # Create inline keyboard
-        keyboard = quick_action_manager.create_inline_keyboard(actions, max_columns=2)
+        keyboard = quick_action_manager.create_inline_keyboard(actions, columns=2)
 
         relative_path = current_dir.relative_to(settings.approved_directory)
         await update.message.reply_text(
@@ -1180,8 +1194,9 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
-        # Check if current directory is a git repository
-        if not (current_dir / ".git").exists():
+        # Check if current directory is a git repository (stat off-loop).
+        is_git_repo = await asyncio.to_thread((current_dir / ".git").exists)
+        if not is_git_repo:
             await update.message.reply_text(
                 f"📂 <b>Not a Git Repository</b>\n\n"
                 f"Current directory <code>{current_dir.relative_to(settings.approved_directory)}/</code> is not a git repository.\n\n"
@@ -1285,14 +1300,16 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     logger.info("Restart requested via /restart command", user_id=user_id)
 
-    # SIGTERM triggers the existing graceful-shutdown handler in main.py;
-    # systemd Restart=always will bring the process back up.
+    # SIGBREAK/SIGTERM triggers the graceful-shutdown handler in main.py, which
+    # records the restart intent and exits NON-ZERO so the process manager
+    # relaunches the bot: on the documented Windows deployment that is the
+    # Scheduled Task's restart-on-failure, on Linux any restart-on-exit manager.
     #
-    # On Windows, Python only honours SIGTERM as an alias for
-    # ``terminate()`` and does not invoke the Python-level signal handler
-    # installed via signal.signal(). To still get the same graceful path,
-    # we use SIGBREAK (CTRL_BREAK_EVENT) on Windows, which is handled by
-    # the same handler chain in main.py.
+    # On Windows, Python only honours SIGTERM as an alias for ``terminate()``
+    # and does not invoke the Python-level signal handler installed via
+    # signal.signal(). To still get the same graceful path, we use SIGBREAK
+    # (CTRL_BREAK_EVENT) on Windows, which is handled by main.py's handler chain
+    # and flagged there as a restart (non-zero exit).
     try:
         if sys.platform == "win32":
             sig = getattr(signal, "SIGBREAK", signal.SIGTERM)
@@ -1301,10 +1318,12 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         os.kill(os.getpid(), sig)
     except Exception as kill_err:  # pragma: no cover - best-effort fallback
         logger.warning(
-            "Graceful shutdown signal failed; exiting hard",
+            "Graceful shutdown signal failed; exiting hard for relaunch",
             error=str(kill_err),
         )
-        os._exit(0)
+        # Non-zero so restart-on-failure relaunches rather than treating the
+        # /restart as a clean stop.
+        os._exit(1)
 
 
 def _format_file_size(size: int) -> str:

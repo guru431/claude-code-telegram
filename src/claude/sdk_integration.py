@@ -75,7 +75,20 @@ def _make_can_use_tool_callback(
     The callback validates file path boundaries and bash directory boundaries
     *before* the SDK executes the tool, providing preventive security enforcement.
     """
-    _FILE_TOOLS = {"Write", "Edit", "Read", "create_file", "edit_file", "read_file"}
+    # File tools whose input carries a path. NotebookRead/NotebookEdit use
+    # "notebook_path", and MultiEdit (like Edit) uses "file_path"; without them
+    # those default-allowed tools would bypass the boundary + secret checks.
+    _FILE_TOOLS = {
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "Read",
+        "NotebookRead",
+        "NotebookEdit",
+        "create_file",
+        "edit_file",
+        "read_file",
+    }
     _BASH_TOOLS = {"Bash", "bash", "shell"}
 
     async def can_use_tool(
@@ -83,9 +96,15 @@ def _make_can_use_tool_callback(
         tool_input: Dict[str, Any],
         context: ToolPermissionContext,
     ) -> Any:
-        # File path validation
+        # File path validation. Read the path from whichever key the tool uses
+        # ("notebook_path" for the Notebook tools) so a future allowlisted
+        # path-bearing tool can't silently slip past the boundary/secret checks.
         if tool_name in _FILE_TOOLS:
-            file_path = tool_input.get("file_path") or tool_input.get("path")
+            file_path = (
+                tool_input.get("file_path")
+                or tool_input.get("path")
+                or tool_input.get("notebook_path")
+            )
             if file_path:
                 # Allow Claude Code internal paths (~/.claude/plans/, etc.)
                 if _is_claude_internal_path(file_path):

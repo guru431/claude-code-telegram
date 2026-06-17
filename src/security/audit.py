@@ -130,6 +130,103 @@ class InMemoryAuditStorage(AuditStorage):
         )
 
 
+class SQLiteAuditStorage(AuditStorage):
+    """Durable audit storage backed by the SQLite ``audit_log`` table.
+
+    Persists events through the existing ``AuditLogRepository`` so audit history
+    survives restarts (unlike :class:`InMemoryAuditStorage`). The table does not
+    carry ``session_id`` or ``risk_level``, so reconstructed events default those
+    fields; the high-risk warning behavior of the in-memory store is preserved.
+    """
+
+    def __init__(self, storage: Any) -> None:
+        self.storage = storage
+
+    async def store_event(self, event: AuditEvent) -> None:
+        """Persist an audit event to the audit_log table."""
+        from ..storage.models import AuditLogModel
+
+        model = AuditLogModel(
+            user_id=event.user_id,
+            event_type=event.event_type,
+            event_data=event.details,
+            success=event.success,
+            timestamp=event.timestamp,
+            ip_address=event.ip_address,
+        )
+        await self.storage.audit.log_event(model)
+
+        # Log high-risk events immediately (matches InMemoryAuditStorage).
+        if event.risk_level in ["high", "critical"]:
+            logger.warning(
+                "High-risk security event",
+                event_type=event.event_type,
+                user_id=event.user_id,
+                risk_level=event.risk_level,
+                details=event.details,
+            )
+
+    async def get_events(
+        self,
+        user_id: Optional[int] = None,
+        event_type: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        limit: int = 100,
+    ) -> List[AuditEvent]:
+        """Retrieve filtered audit events from the audit_log table."""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        if event_type is not None:
+            clauses.append("event_type = ?")
+            params.append(event_type)
+        if start_time is not None:
+            clauses.append("timestamp >= ?")
+            params.append(start_time)
+        if end_time is not None:
+            clauses.append("timestamp <= ?")
+            params.append(end_time)
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        query = (
+            f"SELECT * FROM audit_log {where} "
+            "ORDER BY timestamp DESC LIMIT ?"  # noqa: S608 — clauses are static
+        )
+        params.append(limit)
+
+        async with self.storage.db_manager.get_connection() as conn:
+            cursor = await conn.execute(query, tuple(params))
+            rows = await cursor.fetchall()
+
+        return [self._row_to_event(row) for row in rows]
+
+    async def get_security_violations(
+        self, user_id: Optional[int] = None, limit: int = 100
+    ) -> List[AuditEvent]:
+        """Get security violations from the audit_log table."""
+        return await self.get_events(
+            user_id=user_id, event_type="security_violation", limit=limit
+        )
+
+    @staticmethod
+    def _row_to_event(row: Any) -> AuditEvent:
+        """Reconstruct an AuditEvent from an audit_log row."""
+        from ..storage.models import AuditLogModel
+
+        model = AuditLogModel.from_row(row)
+        return AuditEvent(
+            timestamp=model.timestamp,
+            user_id=model.user_id,
+            event_type=model.event_type,
+            success=model.success,
+            details=model.event_data or {},
+            ip_address=model.ip_address,
+        )
+
+
 class AuditLogger:
     """Security audit logger."""
 

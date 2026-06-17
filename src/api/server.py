@@ -67,6 +67,20 @@ def create_api_app(
 
             event_type_name = x_github_event or "unknown"
             delivery_id = x_github_delivery or str(uuid.uuid4())
+
+            # Only act on configured GitHub event types. 'ping' (sent on
+            # webhook setup) and any non-allowlisted type are acknowledged
+            # without running an agent, before dedup-record/publish.
+            if (
+                event_type_name == "ping"
+                or event_type_name not in settings.github_webhook_events
+            ):
+                logger.info(
+                    "Ignoring GitHub webhook event type",
+                    event_type=event_type_name,
+                    delivery_id=delivery_id,
+                )
+                return {"status": "ignored", "event": event_type_name}
         else:
             # Generic provider — require auth (fail-closed)
             secret = settings.webhook_api_secret
@@ -148,6 +162,9 @@ async def _try_record_webhook(
     Uses INSERT OR IGNORE on the unique delivery_id column.
     If the row already exists the insert is a no-op and changes() == 0.
     Returns True if the event is new (inserted), False if duplicate.
+
+    The row is recorded with ``processed=0``; the agent handler flips it to 1
+    only after a successful run, so a failed/empty run stays durable as 0.
     """
     async with db_manager.get_connection() as conn:
         await conn.execute(
@@ -155,7 +172,7 @@ async def _try_record_webhook(
             INSERT OR IGNORE INTO webhook_events
             (event_id, provider, event_type, delivery_id, payload,
              processed)
-            VALUES (?, ?, ?, ?, ?, 1)
+            VALUES (?, ?, ?, ?, ?, 0)
             """,
             (
                 event_id,
@@ -172,6 +189,87 @@ async def _try_record_webhook(
         return inserted
 
 
+async def _replay_webhook_rows(rows: Any, event_bus: EventBus) -> int:
+    """Re-publish a set of webhook_events rows to the bus. Returns the count."""
+    replayed = 0
+    for row in rows:
+        row_dict = dict(row)
+        try:
+            raw = row_dict.get("payload")
+            payload: Dict[str, Any] = json.loads(raw) if raw else {}
+        except Exception:
+            payload = {}
+        event = WebhookEvent(
+            provider=row_dict["provider"],
+            event_type_name=row_dict["event_type"],
+            payload=payload,
+            delivery_id=row_dict.get("delivery_id") or "",
+        )
+        await event_bus.publish(event)
+        replayed += 1
+    return replayed
+
+
+async def recover_unprocessed_webhooks(
+    db_manager: DatabaseManager, event_bus: EventBus
+) -> int:
+    """Startup recovery: replay every still-pending (``processed=0``) delivery.
+
+    On a hard crash a delivery can be persisted yet never run, and the provider
+    blocks re-delivery as a duplicate. Dead-lettered rows (``processed=2``) and
+    completed rows (``processed=1``) are excluded. The agent handler flips the
+    row to 1 on success or bumps ``attempts``/dead-letters it on failure.
+    """
+    try:
+        async with db_manager.get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT provider, event_type, delivery_id, payload "
+                "FROM webhook_events WHERE processed = 0 ORDER BY received_at"
+            )
+            rows = list(await cursor.fetchall())
+    except Exception:
+        logger.exception("Failed to load unprocessed webhook events for recovery")
+        return 0
+
+    replayed = await _replay_webhook_rows(rows, event_bus)
+    if replayed:
+        logger.info("Replayed unprocessed webhook events on startup", count=replayed)
+    return replayed
+
+
+async def retry_pending_webhooks(
+    db_manager: DatabaseManager, event_bus: EventBus, base_delay_seconds: int = 60
+) -> int:
+    """Periodic retry sweep: replay pending deliveries whose backoff has elapsed.
+
+    Backoff is exponential per attempt (``base_delay_seconds * 2**attempts``).
+    Rows that exhausted their retry budget are already dead-lettered
+    (``processed=2``) and excluded; ``processed=0`` rows never attempted yet
+    (``last_attempt_at IS NULL``) are eligible immediately.
+    """
+    try:
+        async with db_manager.get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT provider, event_type, delivery_id, payload "
+                "FROM webhook_events "
+                "WHERE processed = 0 AND ("
+                "  last_attempt_at IS NULL OR "
+                "  datetime(last_attempt_at) <= "
+                "  datetime('now', '-' || (? * (1 << attempts)) || ' seconds')"
+                ") ORDER BY received_at",
+                (base_delay_seconds,),
+            )
+            rows = list(await cursor.fetchall())
+    except Exception:
+        logger.exception("Failed to load webhook events for retry")
+        return 0
+
+    replayed = await _replay_webhook_rows(rows, event_bus)
+    if replayed:
+        logger.info("Retried pending webhook events", count=replayed)
+    return replayed
+
+
 async def run_api_server(
     event_bus: EventBus,
     settings: Settings,
@@ -184,7 +282,7 @@ async def run_api_server(
 
     config = uvicorn.Config(
         app=app,
-        host="0.0.0.0",
+        host=settings.api_server_host,
         port=settings.api_server_port,
         log_level="info" if not settings.debug else "debug",
     )

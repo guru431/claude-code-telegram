@@ -7,9 +7,11 @@ Features:
 """
 
 import json
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Dict, List, Optional
+from typing import AsyncIterator, Dict, List, Optional
 
+import aiosqlite
 import structlog
 
 from .database import DatabaseManager
@@ -24,6 +26,25 @@ from .models import (
 )
 
 logger = structlog.get_logger()
+
+
+@asynccontextmanager
+async def _conn_ctx(
+    db_manager: DatabaseManager, conn: Optional[aiosqlite.Connection]
+) -> AsyncIterator[aiosqlite.Connection]:
+    """Yield a connection, committing only when we own the borrow.
+
+    When ``conn`` is provided the caller owns the transaction (shared
+    multi-write transaction in :meth:`Storage.save_claude_interaction`), so we
+    neither commit nor close. When ``conn`` is None we borrow from the pool and
+    commit on success, mirroring the standalone repository behaviour.
+    """
+    if conn is not None:
+        yield conn
+        return
+    async with db_manager.get_connection() as owned:
+        yield owned
+        await owned.commit()
 
 
 class UserRepository:
@@ -95,14 +116,17 @@ class UserRepository:
         cost: float,
         messages: int = 1,
         last_active: Optional[datetime] = None,
+        conn: Optional[aiosqlite.Connection] = None,
     ):
         """Atomically increment user cost/message counters.
 
         Avoids the lost-update race of read-modify-write under concurrent
-        interactions (mirrors CostTrackingRepository.update_daily_cost).
+        interactions (mirrors CostTrackingRepository.update_daily_cost). When
+        ``conn`` is supplied the write joins the caller's transaction and is
+        not committed here.
         """
-        async with self.db.get_connection() as conn:
-            await conn.execute(
+        async with _conn_ctx(self.db, conn) as c:
+            await c.execute(
                 """
                 UPDATE users
                 SET total_cost = total_cost + ?,
@@ -111,6 +135,28 @@ class UserRepository:
                 WHERE user_id = ?
             """,
                 (cost, messages, last_active or datetime.now(UTC), user_id),
+            )
+
+    async def increment_session_count(
+        self,
+        user_id: int,
+        last_active: Optional[datetime] = None,
+    ):
+        """Atomically increment a user's session counter.
+
+        Owns only the ``session_count``/``last_active`` columns so it can run
+        concurrently with :meth:`increment_stats` without the lost-update race
+        of a read-modify-write through :meth:`update_user`.
+        """
+        async with self.db.get_connection() as conn:
+            await conn.execute(
+                """
+                UPDATE users
+                SET session_count = session_count + 1,
+                    last_active = ?
+                WHERE user_id = ?
+            """,
+                (last_active or datetime.now(UTC), user_id),
             )
             await conn.commit()
 
@@ -415,10 +461,16 @@ class MessageRepository:
         """Initialize repository."""
         self.db = db_manager
 
-    async def save_message(self, message: MessageModel) -> int:
-        """Save message and return ID."""
-        async with self.db.get_connection() as conn:
-            cursor = await conn.execute(
+    async def save_message(
+        self, message: MessageModel, conn: Optional[aiosqlite.Connection] = None
+    ) -> int:
+        """Save message and return ID.
+
+        When ``conn`` is supplied the insert joins the caller's transaction and
+        is not committed here.
+        """
+        async with _conn_ctx(self.db, conn) as c:
+            cursor = await c.execute(
                 """
                 INSERT INTO messages
                 (session_id, user_id, timestamp, prompt,
@@ -436,8 +488,22 @@ class MessageRepository:
                     message.error,
                 ),
             )
-            await conn.commit()
             return cursor.lastrowid
+
+    async def purge_old_messages(self, days: int) -> int:
+        """Delete messages older than ``days`` and return the count removed."""
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                DELETE FROM messages
+                WHERE datetime(timestamp) < datetime('now', '-' || ? || ' days')
+            """,
+                (days,),
+            )
+            await conn.commit()
+            affected = cursor.rowcount
+            logger.info("Purged old messages", count=affected, days=days)
+            return affected
 
     async def get_session_messages(
         self, session_id: str, limit: int = 50
@@ -495,14 +561,19 @@ class ToolUsageRepository:
         """Initialize repository."""
         self.db = db_manager
 
-    async def save_tool_usage(self, tool_usage: ToolUsageModel) -> int:
-        """Save tool usage and return ID."""
-        async with self.db.get_connection() as conn:
-            tool_input_json = (
-                json.dumps(tool_usage.tool_input) if tool_usage.tool_input else None
-            )
+    async def save_tool_usage(
+        self, tool_usage: ToolUsageModel, conn: Optional[aiosqlite.Connection] = None
+    ) -> int:
+        """Save tool usage and return ID.
 
-            cursor = await conn.execute(
+        When ``conn`` is supplied the insert joins the caller's transaction and
+        is not committed here.
+        """
+        tool_input_json = (
+            json.dumps(tool_usage.tool_input) if tool_usage.tool_input else None
+        )
+        async with _conn_ctx(self.db, conn) as c:
+            cursor = await c.execute(
                 """
                 INSERT INTO tool_usage
                 (session_id, message_id, tool_name, tool_input,
@@ -519,8 +590,22 @@ class ToolUsageRepository:
                     tool_usage.error_message,
                 ),
             )
-            await conn.commit()
             return cursor.lastrowid
+
+    async def purge_old_tool_usage(self, days: int) -> int:
+        """Delete tool-usage rows older than ``days`` and return the count."""
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                DELETE FROM tool_usage
+                WHERE datetime(timestamp) < datetime('now', '-' || ? || ' days')
+            """,
+                (days,),
+            )
+            await conn.commit()
+            affected = cursor.rowcount
+            logger.info("Purged old tool usage", count=affected, days=days)
+            return affected
 
     async def get_session_tool_usage(self, session_id: str) -> List[ToolUsageModel]:
         """Get tool usage for session."""
@@ -576,14 +661,19 @@ class AuditLogRepository:
         """Initialize repository."""
         self.db = db_manager
 
-    async def log_event(self, audit_log: AuditLogModel) -> int:
-        """Log audit event and return ID."""
-        async with self.db.get_connection() as conn:
-            event_data_json = (
-                json.dumps(audit_log.event_data) if audit_log.event_data else None
-            )
+    async def log_event(
+        self, audit_log: AuditLogModel, conn: Optional[aiosqlite.Connection] = None
+    ) -> int:
+        """Log audit event and return ID.
 
-            cursor = await conn.execute(
+        When ``conn`` is supplied the insert joins the caller's transaction and
+        is not committed here.
+        """
+        event_data_json = (
+            json.dumps(audit_log.event_data) if audit_log.event_data else None
+        )
+        async with _conn_ctx(self.db, conn) as c:
+            cursor = await c.execute(
                 """
                 INSERT INTO audit_log
                 (user_id, event_type, event_data, success, timestamp, ip_address)
@@ -598,8 +688,22 @@ class AuditLogRepository:
                     audit_log.ip_address,
                 ),
             )
-            await conn.commit()
             return cursor.lastrowid
+
+    async def purge_old_audit_log(self, days: int) -> int:
+        """Delete audit-log rows older than ``days`` and return the count."""
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                DELETE FROM audit_log
+                WHERE datetime(timestamp) < datetime('now', '-' || ? || ' days')
+            """,
+                (days,),
+            )
+            await conn.commit()
+            affected = cursor.rowcount
+            logger.info("Purged old audit log", count=affected, days=days)
+            return affected
 
     async def get_user_audit_log(
         self, user_id: int, limit: int = 100
@@ -640,13 +744,23 @@ class CostTrackingRepository:
         """Initialize repository."""
         self.db = db_manager
 
-    async def update_daily_cost(self, user_id: int, cost: float, date: str = None):
-        """Update daily cost for user."""
+    async def update_daily_cost(
+        self,
+        user_id: int,
+        cost: float,
+        date: str = None,
+        conn: Optional[aiosqlite.Connection] = None,
+    ):
+        """Update daily cost for user.
+
+        When ``conn`` is supplied the write joins the caller's transaction and
+        is not committed here.
+        """
         if not date:
             date = datetime.now(UTC).strftime("%Y-%m-%d")
 
-        async with self.db.get_connection() as conn:
-            await conn.execute(
+        async with _conn_ctx(self.db, conn) as c:
+            await c.execute(
                 """
                 INSERT INTO cost_tracking (user_id, date, daily_cost, request_count)
                 VALUES (?, ?, ?, 1)
@@ -657,7 +771,6 @@ class CostTrackingRepository:
             """,
                 (user_id, date, cost, cost),
             )
-            await conn.commit()
 
     async def get_user_daily_costs(
         self, user_id: int, days: int = 30
@@ -733,7 +846,8 @@ class AnalyticsRepository:
                     SUM(cost) as cost,
                     COUNT(DISTINCT session_id) as sessions
                 FROM messages
-                WHERE user_id = ? AND timestamp >= datetime('now', '-30 days')
+                WHERE user_id = ?
+                  AND datetime(timestamp) >= datetime('now', '-30 days')
                 GROUP BY date(timestamp)
                 ORDER BY date DESC
             """,
@@ -786,7 +900,7 @@ class AnalyticsRepository:
             cursor = await conn.execute("""
                 SELECT COUNT(DISTINCT user_id) as active_users
                 FROM messages
-                WHERE timestamp > datetime('now', '-7 days')
+                WHERE datetime(timestamp) > datetime('now', '-7 days')
             """)
 
             active_users = (await cursor.fetchone())[0]
@@ -830,7 +944,7 @@ class AnalyticsRepository:
                     COUNT(*) as total_messages,
                     SUM(cost) as total_cost
                 FROM messages
-                WHERE timestamp >= datetime('now', '-30 days')
+                WHERE datetime(timestamp) >= datetime('now', '-30 days')
                 GROUP BY date(timestamp)
                 ORDER BY date DESC
             """)
@@ -843,3 +957,29 @@ class AnalyticsRepository:
                 "tool_stats": tool_stats,
                 "daily_activity": daily_activity,
             }
+
+
+class WebhookEventRepository:
+    """Webhook-event data access (dedup/audit rows)."""
+
+    def __init__(self, db_manager: DatabaseManager):
+        """Initialize repository."""
+        self.db = db_manager
+
+    async def purge_old_webhook_events(self, days: int) -> int:
+        """Delete webhook events older than ``days`` and return the count.
+
+        The webhook_events table records ingestion time in ``received_at``.
+        """
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                DELETE FROM webhook_events
+                WHERE datetime(received_at) < datetime('now', '-' || ? || ' days')
+            """,
+                (days,),
+            )
+            await conn.commit()
+            affected = cursor.rowcount
+            logger.info("Purged old webhook events", count=affected, days=days)
+            return affected

@@ -106,6 +106,13 @@ async def auth_middleware(handler: Callable, event: Any, data: Dict[str, Any]) -
         # Throttle the rejection reply to at most once per window per user. The
         # audit attempt above is still recorded for every message.
         now = time.monotonic()
+        # Evict entries older than the throttle window so the map stays bounded
+        # under a stream of distinct unauthorized senders (mirrors the GC in
+        # burst_protection_middleware). Entries past the window are no longer
+        # throttling anything, so dropping them is safe.
+        stale_cutoff = now - _REJECTION_REPLY_WINDOW
+        for uid in [u for u, t in _last_rejection_reply.items() if t < stale_cutoff]:
+            _last_rejection_reply.pop(uid, None)
         last_reply = _last_rejection_reply.get(user_id, 0.0)
         if event.effective_message and now - last_reply >= _REJECTION_REPLY_WINDOW:
             _last_rejection_reply[user_id] = now

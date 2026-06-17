@@ -10,11 +10,40 @@ from typing import Any, Callable, Dict, List, Optional
 import structlog
 
 from ..config.settings import Settings
+from .exceptions import ClaudeProcessError, ClaudeTimeoutError
 from .local_sessions import find_latest_local_session
 from .sdk_integration import ClaudeResponse, ClaudeSDKManager, StreamUpdate
 from .session import SessionManager
 
 logger = structlog.get_logger()
+
+# Substrings that indicate the resumed session no longer exists on Claude's
+# side (expired/deleted), which is the only situation where silently retrying
+# as a fresh session is safe — no tool side effects have run yet.
+_SESSION_GONE_MARKERS = (
+    "no conversation found",
+    "no such session",
+    "session not found",
+    "could not resume",
+    "session does not exist",
+    "unknown session",
+    "session expired",
+    "invalid session",
+)
+
+
+def _is_session_gone_error(error: Exception) -> bool:
+    """Return True if *error* means the resumed session is missing/expired.
+
+    Timeouts and process crashes are NOT session-gone — replaying the prompt
+    after a mutating tool already ran would duplicate side effects (or double
+    the wait on timeout), so those must propagate instead of triggering a
+    fresh-session restart.
+    """
+    if isinstance(error, (ClaudeTimeoutError, ClaudeProcessError)):
+        return False
+    text = str(error).lower()
+    return any(marker in text for marker in _SESSION_GONE_MARKERS)
 
 
 class ClaudeIntegration:
@@ -101,10 +130,12 @@ class ClaudeIntegration:
                     interrupt_event=interrupt_event,
                 )
             except Exception as resume_error:
-                # If resume failed (e.g., session expired/missing on Claude's side),
-                # retry as a fresh session.  The CLI returns a generic exit-code-1
-                # when the session is gone, so we catch *any* error during resume.
-                if should_continue:
+                # If resume failed *because the session is gone* (expired/missing
+                # on Claude's side), retry as a fresh session. Do NOT restart on
+                # timeouts or process crashes: a mutating tool may already have
+                # run, so replaying the whole prompt would duplicate side effects
+                # (and double the wait on timeout). Those propagate unchanged.
+                if should_continue and _is_session_gone_error(resume_error):
                     logger.warning(
                         "Session resume failed, starting fresh session",
                         failed_session_id=claude_session_id,
@@ -231,6 +262,28 @@ class ClaudeIntegration:
         # Fallback: discover sessions from ~/.claude/projects/ (VS Code / CLI)
         known_ids = {s.session_id for s in sessions if s.session_id}
         local = find_latest_local_session(working_directory, exclude_ids=known_ids)
+        # _encode_path() collapses distinct dirs to the same folder name, so the
+        # folder match alone can return a *sibling* directory's session. Verify
+        # the session's recorded cwd actually equals the requested directory
+        # before resuming, or we'd resume cross-project history into the wrong
+        # context. A blank/unresolvable cwd is rejected (fail closed).
+        if local and local.cwd:
+            try:
+                same_dir = (
+                    Path(local.cwd).resolve() == working_directory.resolve()
+                )
+            except (ValueError, OSError):
+                same_dir = False
+            if not same_dir:
+                logger.info(
+                    "Ignoring local session from a different directory",
+                    session_id=local.session_id,
+                    local_cwd=local.cwd,
+                    requested=str(working_directory),
+                )
+                local = None
+        elif local:
+            local = None
         if local:
             logger.info(
                 "Found local CLI/VS Code session to resume",

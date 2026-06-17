@@ -4,7 +4,6 @@ from .bus import Event, EventBus
 from .types import (
     AgentResponseEvent,
     ScheduledEvent,
-    UserMessageEvent,
     WebhookEvent,
 )
 
@@ -13,6 +12,5 @@ __all__ = [
     "EventBus",
     "AgentResponseEvent",
     "ScheduledEvent",
-    "UserMessageEvent",
     "WebhookEvent",
 ]

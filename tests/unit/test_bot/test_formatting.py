@@ -1,5 +1,6 @@
 """Tests for response formatting utilities."""
 
+import re
 from unittest.mock import Mock
 
 import pytest
@@ -205,6 +206,34 @@ class TestResponseFormatter:
         assert len(messages) >= 1
         full_text = "".join(m.text for m in messages)
         assert "truncated" not in full_text.lower()
+
+    def test_truncated_long_code_block_not_double_escaped(self, formatter):
+        """A >15000-char code block with <, >, & must not be double-escaped.
+
+        _clean_text escapes the code once; the truncation path in
+        _format_code_blocks must not escape it a second time (&lt; -> &amp;lt;)
+        nor leave a sliced HTML entity dangling at the cut.
+        """
+        # >15000 chars of code containing all three special characters
+        line = "if (a < b && c > d) { x = a & b; }\n"
+        text = "```c\n" + line * 600 + "```"
+
+        messages = formatter.format_claude_response(text)
+        full = "".join(m.text for m in messages)
+
+        # Truncation happened
+        assert "truncated" in full.lower()
+        # No double-escaping of the already-escaped entities
+        assert "&amp;lt;" not in full
+        assert "&amp;gt;" not in full
+        assert "&amp;amp;" not in full
+        # The original characters were escaped exactly once
+        assert "&lt;" in full
+        assert "&gt;" in full
+        assert "&amp;" in full
+        # No truncated/sliced entity left dangling (e.g. a trailing "&am")
+        for msg in messages:
+            assert not re.search(r"&[a-z]*$", msg.text)
 
     def test_quick_actions_keyboard(self, formatter):
         """Test quick actions keyboard generation."""

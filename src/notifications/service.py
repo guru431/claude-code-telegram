@@ -13,48 +13,15 @@ from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TelegramError
 
+from ..bot.utils.html_format import tg_len
 from ..events.bus import Event, EventBus
 from ..events.types import AgentResponseEvent
+from ..security.secret_patterns import redact_secrets
 
 logger = structlog.get_logger()
 
 # Telegram rate limit: ~30 msgs/sec globally, ~1 msg/sec per chat
 SEND_INTERVAL_SECONDS = 1.1
-
-# Defense-in-depth: notification/webhook responses are delivered verbatim, so
-# redact high-confidence secret patterns before sending. A minimal, conservative
-# local copy of the orchestrator's redactor (importing that module here would
-# pull in the whole bot stack), kept deliberately narrow to avoid mangling text.
-_SECRET_PATTERNS: List[re.Pattern[str]] = [
-    # OpenAI / Anthropic-style keys (sk-..., sk-ant-...)
-    re.compile(r"\b(sk-(?:ant-)?)[A-Za-z0-9_-]{16,}"),
-    # GitHub tokens (ghp_, gho_, ghu_, ghs_, ghr_)
-    re.compile(r"\b(gh[poprsu]_)[A-Za-z0-9]{16,}"),
-    # AWS access keys
-    re.compile(r"\b((?:AKIA|ASIA)[0-9A-Z]{4})[0-9A-Z]{12}"),
-    # Bearer auth tokens
-    re.compile(r"(Bearer )[A-Za-z0-9+/_.:-]{8,}"),
-    # Inline env assignments like SECRET=value
-    re.compile(
-        r"((?:TOKEN|SECRET|PASSWORD|PASSWD|PASS|API_KEY|APIKEY"
-        r"|AUTH_TOKEN|PRIVATE_KEY|ACCESS_KEY|ACCESS_TOKEN"
-        r"|CLIENT_SECRET|WEBHOOK_SECRET|BOT_TOKEN|GITHUB_TOKEN)"
-        r"=)['\"]?[^\s'\"]{8,}['\"]?"
-    ),
-]
-
-
-def _redact_match(match: "re.Match[str]") -> str:
-    groups = [g for g in match.groups() if g is not None]
-    return f"{groups[0]}***" if groups else "***"
-
-
-def _redact_secrets(text: str) -> str:
-    """Replace high-confidence secrets/credentials with redacted placeholders."""
-    result = text
-    for pattern in _SECRET_PATTERNS:
-        result = pattern.sub(_redact_match, result)
-    return result
 
 
 # Sentinel enqueued by stop() to wake an idle sender promptly without
@@ -86,15 +53,32 @@ def _open_tags_at(html: str) -> List[Tuple[str, str]]:
     return stack
 
 
+def _utf16_cut(text: str, max_length: int) -> int:
+    """Largest code-point index whose UTF-16 length is <= *max_length*.
+
+    Telegram counts message length in UTF-16 units (emoji = 2), so a code-point
+    slice can exceed the byte budget. This finds the index where the UTF-16
+    length first reaches the limit.
+    """
+    if tg_len(text) <= max_length:
+        return len(text)
+    units = 0
+    for i, ch in enumerate(text):
+        units += len(ch.encode("utf-16-le")) // 2
+        if units > max_length:
+            return i
+    return len(text)
+
+
 def _choose_split_point(text: str, max_length: int) -> int:
-    """Pick an index <= max_length to cut *text*, never inside an HTML tag.
+    """Pick an index <= max_length (UTF-16 units) to cut *text*.
 
     Prefers a paragraph break, then a newline, then a space; falls back to a
-    hard cut at ``max_length``. If the chosen point lands inside a ``<...>``
+    hard cut at the UTF-16 limit. If the chosen point lands inside a ``<...>``
     tag, it is moved back to just before that tag.
     """
-    window = text[:max_length]
-    pos = max_length
+    pos = _utf16_cut(text, max_length)
+    window = text[:pos]
     for sep in ("\n\n", "\n", " "):
         idx = window.rfind(sep)
         if idx != -1:
@@ -243,7 +227,7 @@ class NotificationService:
 
         # Redact high-confidence secrets before delivery (untrusted/verbatim
         # webhook + scheduled responses), then split (Telegram limit: 4096 chars).
-        text = _redact_secrets(event.text)
+        text = redact_secrets(event.text)
         chunks = self._split_message(text)
         chunk_index = 0
 
@@ -252,8 +236,8 @@ class NotificationService:
                 await self._send_chunk(chat_id, chunk, event)
                 self._last_send_per_chat[chat_id] = loop.time()
 
-                # Rate limit between chunks too
-                if len(chunks) > 1:
+                # Rate limit between chunks too — but not after the final one.
+                if chunk_index < len(chunks) - 1:
                     await asyncio.sleep(SEND_INTERVAL_SECONDS)
 
             logger.info(
@@ -313,7 +297,7 @@ class NotificationService:
         chunk's end and reopened (with their attributes) at the next chunk's
         start.
         """
-        if len(text) <= max_length:
+        if tg_len(text) <= max_length:
             return [text]
 
         chunks: List[str] = []
@@ -322,11 +306,11 @@ class NotificationService:
 
         while rest:
             prefix = "".join(carry_open)
-            if len(prefix) + len(rest) <= max_length:
+            if tg_len(prefix) + tg_len(rest) <= max_length:
                 chunks.append(prefix + rest)
                 break
 
-            budget = max_length - len(prefix)
+            budget = max_length - tg_len(prefix)
             split_len = _choose_split_point(rest, budget)
             segment = rest[:split_len]
             open_now = _open_tags_at(prefix + segment)
@@ -335,8 +319,11 @@ class NotificationService:
             # If the closing tags push the chunk past the limit, re-cut leaving
             # room for them. Plain text has no closing tags, so the exact cut is
             # preserved.
-            if closing and len(prefix) + split_len + len(closing) > max_length:
-                budget = max_length - len(prefix) - len(closing)
+            if (
+                closing
+                and tg_len(prefix) + tg_len(segment) + tg_len(closing) > max_length
+            ):
+                budget = max_length - tg_len(prefix) - tg_len(closing)
                 split_len = _choose_split_point(rest, budget)
                 segment = rest[:split_len]
                 open_now = _open_tags_at(prefix + segment)

@@ -60,13 +60,26 @@ def _parse_session_head(jsonl_path: Path) -> Optional[dict]:
     try:
         result: Optional[dict] = None
         first_message = ""
-        # Open in binary mode and read up to _MAX_LINE_BYTES per line so a
-        # single oversize line can't be used to DoS the bot.
+        # Open in binary mode and read at most _MAX_LINE_BYTES per line so a
+        # single oversize line can't be used to DoS the bot. ``readline(limit)``
+        # caps the allocation: iterating ``for raw in fh`` would instead pull
+        # the whole physical line (potentially multi-GB) into memory *before*
+        # we could check its length.
         with open(jsonl_path, "rb") as fh:
-            for raw in fh:
+            while True:
+                raw = fh.readline(_MAX_LINE_BYTES + 1)
+                if not raw:
+                    break  # EOF
                 if len(raw) > _MAX_LINE_BYTES:
-                    # Skip pathologically long lines rather than abort the
-                    # whole scan — other lines may still be useful.
+                    # Oversize line: readline stopped at the cap mid-line (no
+                    # trailing newline). Skip this line and drain the remainder
+                    # in bounded chunks so we don't realloc the whole line, then
+                    # continue scanning subsequent lines.
+                    if not raw.endswith(b"\n"):
+                        while True:
+                            chunk = fh.readline(_MAX_LINE_BYTES + 1)
+                            if not chunk or chunk.endswith(b"\n"):
+                                break
                     continue
                 try:
                     line = raw.decode("utf-8").strip()

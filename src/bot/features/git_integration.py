@@ -186,17 +186,34 @@ class GitIntegration:
             if not line:
                 continue
 
-            status = line[:2]
-            filename = line[3:]
+            # Porcelain v1: XY then a space then the path. X is the index
+            # (staged) column, Y the worktree column. For renames/copies the
+            # path field is "old -> new"; take the new path.
+            index_col = line[0]
+            worktree_col = line[1]
+            path = line[3:]
+            if " -> " in path:
+                path = path.split(" -> ", 1)[1]
 
-            if status == "??":
-                untracked.append(filename)
-            elif "M" in status:
-                modified.append(filename)
-            elif "A" in status:
-                added.append(filename)
-            elif "D" in status:
-                deleted.append(filename)
+            if index_col == "?" and worktree_col == "?":
+                untracked.append(path)
+            elif "R" in (index_col, worktree_col) or "C" in (
+                index_col,
+                worktree_col,
+            ):
+                # Rename or copy: tree changed — record the new path. Treated
+                # as a modification so is_clean reports dirty.
+                modified.append(path)
+            elif "D" in (index_col, worktree_col):
+                deleted.append(path)
+            elif "A" in (index_col, worktree_col):
+                added.append(path)
+            elif "M" in (index_col, worktree_col):
+                modified.append(path)
+            else:
+                # Catch-all for type-change (T), unmerged (U) and any other
+                # non-space status so the tree is never silently "clean".
+                modified.append(path)
 
         # Get ahead/behind counts
         ahead = behind = 0

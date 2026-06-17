@@ -81,42 +81,35 @@ class SQLiteSessionStorage(SessionStorage):
         )
 
         async with self.db_manager.get_connection() as conn:
-            # Try to update first
-            cursor = await conn.execute(
+            # Single race-safe upsert: avoids the UPDATE-then-INSERT PK race of
+            # two separate pooled connections, and restores is_active=TRUE so a
+            # session marked inactive by cleanup/eviction becomes visible to
+            # listings and the max_sessions count again when it is re-saved
+            # (it is still resumable).
+            await conn.execute(
                 """
-                UPDATE sessions
-                SET last_used = ?, total_cost = ?, total_turns = ?, message_count = ?
-                WHERE session_id = ?
+                INSERT INTO sessions
+                (session_id, user_id, project_path, created_at, last_used,
+                 total_cost, total_turns, message_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    last_used = excluded.last_used,
+                    total_cost = excluded.total_cost,
+                    total_turns = excluded.total_turns,
+                    message_count = excluded.message_count,
+                    is_active = TRUE
             """,
                 (
+                    session_model.session_id,
+                    session_model.user_id,
+                    session_model.project_path,
+                    session_model.created_at,
                     session_model.last_used,
                     session_model.total_cost,
                     session_model.total_turns,
                     session_model.message_count,
-                    session_model.session_id,
                 ),
             )
-
-            # If no rows were updated, insert new record
-            if cursor.rowcount == 0:
-                await conn.execute(
-                    """
-                    INSERT INTO sessions
-                    (session_id, user_id, project_path, created_at, last_used,
-                     total_cost, total_turns, message_count)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                    (
-                        session_model.session_id,
-                        session_model.user_id,
-                        session_model.project_path,
-                        session_model.created_at,
-                        session_model.last_used,
-                        session_model.total_cost,
-                        session_model.total_turns,
-                        session_model.message_count,
-                    ),
-                )
 
             await conn.commit()
 

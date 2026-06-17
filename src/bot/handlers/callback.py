@@ -46,10 +46,14 @@ async def handle_callback_query(
 ) -> None:
     """Route callback queries to appropriate handlers."""
     query = update.callback_query
-    await query.answer()  # Acknowledge the callback
-
     user_id = query.from_user.id
     data = query.data
+
+    # The contextual formatting buttons answer the query themselves (with a
+    # toast) in their routed branch below; pre-answering here would make a
+    # second ``query.answer()`` fail with BadRequest and wipe Claude's reply.
+    if data not in ("explain", "save_code", "show_files", "debug"):
+        await query.answer()  # Acknowledge the callback
 
     logger.info("Processing callback query", user_id=user_id, callback_data=data)
 
@@ -611,12 +615,20 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
             # Update session ID in context
             context.user_data["claude_session_id"] = claude_response.session_id
 
-            # Send Claude's response
-            await query.message.reply_text(
+            # Send Claude's response. ``query.message`` may be ``None``/
+            # ``InaccessibleMessage`` for buttons older than 48h, so fall back
+            # to sending directly to the user.
+            continued_text = (
                 f"✅ <b>Session Continued</b>\n\n"
-                f"{escape_html(claude_response.content[:500])}{'...' if len(claude_response.content) > 500 else ''}",
-                parse_mode="HTML",
+                f"{escape_html(claude_response.content[:500])}"
+                f"{'...' if len(claude_response.content) > 500 else ''}"
             )
+            if isinstance(query.message, Message):
+                await query.message.reply_text(continued_text, parse_mode="HTML")
+            else:
+                await context.bot.send_message(
+                    query.from_user.id, continued_text, parse_mode="HTML"
+                )
         else:
             # No session found to continue
             await query.edit_message_text(
@@ -837,31 +849,40 @@ async def _handle_quick_actions_action(
     query, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Handle quick actions menu."""
-    keyboard = [
-        [
-            InlineKeyboardButton("🧪 Run Tests", callback_data="quick:test"),
-            InlineKeyboardButton("📦 Install Deps", callback_data="quick:install"),
-        ],
-        [
-            InlineKeyboardButton("🎨 Format Code", callback_data="quick:format"),
-            InlineKeyboardButton("🔍 Find TODOs", callback_data="quick:find_todos"),
-        ],
-        [
-            InlineKeyboardButton("🔨 Build", callback_data="quick:build"),
-            InlineKeyboardButton("🚀 Start Server", callback_data="quick:start"),
-        ],
-        [
-            InlineKeyboardButton("📊 Git Status", callback_data="quick:git_status"),
-            InlineKeyboardButton("🔧 Lint Code", callback_data="quick:lint"),
-        ],
-        [InlineKeyboardButton("⬅️ Back", callback_data="action:new_session")],
-    ]
+    # Build the menu dynamically from the real registered actions so every
+    # button maps to an id that ``handle_quick_action_callback`` can run.
+    features = context.bot_data.get("features")
+    quick_actions = features.get_quick_actions() if features else None
+
+    if not quick_actions:
+        await query.edit_message_text(
+            "❌ <b>Quick Actions Not Available</b>\n\n"
+            "Quick actions feature is not available.",
+            parse_mode="HTML",
+        )
+        return
+
+    keyboard = []
+    row = []
+    for action in quick_actions.actions.values():
+        row.append(
+            InlineKeyboardButton(
+                f"{action.icon} {action.name}",
+                callback_data=f"quick:{action.id}",
+            )
+        )
+        if len(row) >= 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append(
+        [InlineKeyboardButton("⬅️ Back", callback_data="action:new_session")]
+    )
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await query.edit_message_text(
-        "🛠️ <b>Quick Actions</b>\n\n"
-        "Choose a common development task:\n\n"
-        "<i>Note: These will be fully functional once Claude Code integration is complete.</i>",
+        "🛠️ <b>Quick Actions</b>\n\n" "Choose a common development task:",
         parse_mode="HTML",
         reply_markup=reply_markup,
     )
@@ -880,17 +901,49 @@ async def _handle_refresh_ls_action(query, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def _handle_export_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle export action."""
+    """Handle export action — mirror the /export format-selection keyboard."""
+    features = context.bot_data.get("features")
+    session_exporter = features.get_session_export() if features else None
+
+    if not session_exporter:
+        await query.edit_message_text(
+            "❌ <b>Export Unavailable</b>\n\n"
+            "Session export service is not available.",
+            parse_mode="HTML",
+        )
+        return
+
+    claude_session_id = context.user_data.get("claude_session_id")
+    if not claude_session_id:
+        await query.edit_message_text(
+            "❌ <b>No Active Session</b>\n\n"
+            "There's no active Claude session to export.\n\n"
+            "<b>What you can do:</b>\n"
+            "• Start a new session with <code>/new</code>\n"
+            "• Continue an existing session with <code>/continue</code>\n"
+            "• Check your status with <code>/status</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton("📝 Markdown", callback_data="export:markdown"),
+            InlineKeyboardButton("🌐 HTML", callback_data="export:html"),
+        ],
+        [
+            InlineKeyboardButton("📋 JSON", callback_data="export:json"),
+            InlineKeyboardButton("❌ Cancel", callback_data="export:cancel"),
+        ],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     await query.edit_message_text(
         "📤 <b>Export Session</b>\n\n"
-        "Session export functionality will be available once the storage layer is implemented.\n\n"
-        "<b>Planned features:</b>\n"
-        "• Export conversation history\n"
-        "• Save session state\n"
-        "• Share conversations\n"
-        "• Create session backups\n\n"
-        "<i>Coming in the next development phase!</i>",
+        f"Ready to export session: <code>{escape_html(claude_session_id[:8])}...</code>\n\n"
+        "<b>Choose export format:</b>",
         parse_mode="HTML",
+        reply_markup=reply_markup,
     )
 
 
@@ -988,37 +1041,72 @@ async def handle_quick_action_callback(
 async def handle_followup_callback(
     query, suggestion_hash: str, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle follow-up suggestion callbacks."""
+    """Handle follow-up suggestion callbacks.
+
+    Resolves the 12-char hash carried in callback_data back to the original
+    suggestion text (stored in ``user_data`` when the keyboard was built) and
+    runs it through Claude as if the user had typed it.
+    """
     user_id = query.from_user.id
 
-    # Get conversation enhancer via the feature registry if available.
-    features = context.bot_data.get("features")
-    conversation_enhancer = features.get_conversation_enhancer() if features else None
+    # Resolve the hash back to the suggestion text.
+    followup_map = context.user_data.get("followup_suggestions", {})
+    suggestion = followup_map.get(suggestion_hash)
 
-    if not conversation_enhancer:
+    if not suggestion:
         await query.edit_message_text(
-            "❌ <b>Follow-up Not Available</b>\n\n"
-            "Conversation enhancement features are not available.",
+            "💡 <b>Suggestion Unavailable</b>\n\n"
+            "This follow-up suggestion has expired. "
+            "Send a message to continue the conversation.",
             parse_mode="HTML",
         )
         return
 
-    try:
-        # Get stored suggestions (this would need to be implemented in the enhancer)
-        # For now, we'll provide a generic response
+    claude_integration: ClaudeIntegration = context.bot_data.get("claude_integration")
+    if not claude_integration:
         await query.edit_message_text(
-            "💡 <b>Follow-up Suggestion Selected</b>\n\n"
-            "This follow-up suggestion will be implemented once the conversation "
-            "enhancement system is fully integrated with the message handler.\n\n"
-            "<b>Current Status:</b>\n"
-            "• Suggestion received ✅\n"
-            "• Integration pending 🔄\n\n"
-            "<i>You can continue the conversation by sending a new message.</i>",
+            "❌ <b>Claude Integration Not Available</b>\n\n"
+            "Claude integration is not properly configured.",
+            parse_mode="HTML",
+        )
+        return
+
+    settings: Settings = context.bot_data["settings"]
+    current_dir = context.user_data.get(
+        "current_directory", settings.approved_directory
+    )
+    session_id = context.user_data.get("claude_session_id")
+
+    try:
+        await query.edit_message_text(
+            f"💡 <b>{escape_html(suggestion)}</b>\n\nWorking on it...",
             parse_mode="HTML",
         )
 
+        claude_response = await claude_integration.run_command(
+            prompt=suggestion,
+            working_directory=current_dir,
+            user_id=user_id,
+            session_id=session_id,
+        )
+
+        if claude_response:
+            context.user_data["claude_session_id"] = claude_response.session_id
+
+            response_text = escape_html(claude_response.content)
+            if len(response_text) > 4000:
+                response_text = (
+                    response_text[:4000] + "...\n\n<i>(Response truncated)</i>"
+                )
+            if isinstance(query.message, Message):
+                await query.message.reply_text(response_text, parse_mode="HTML")
+            else:
+                await context.bot.send_message(
+                    query.from_user.id, response_text, parse_mode="HTML"
+                )
+
         logger.info(
-            "Follow-up suggestion selected",
+            "Follow-up suggestion executed",
             user_id=user_id,
             suggestion_hash=suggestion_hash,
         )

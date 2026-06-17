@@ -27,6 +27,15 @@ class QuickAction:
     context_required: List[str]  # Required context keys
     priority: int = 0  # Higher = more important
 
+    @property
+    def prompt(self) -> str:
+        """Natural-language prompt sent to Claude for this action.
+
+        Single source of truth for the prompt: derived from the action's
+        human-readable description so callers don't pass a bare command keyword.
+        """
+        return self.description
+
 
 class QuickActionManager:
     """Manages quick action suggestions based on context."""
@@ -122,40 +131,44 @@ class QuickActionManager:
         }
 
     async def get_suggestions(
-        self, session: SessionModel, limit: int = 6
+        self,
+        session: SessionModel,
+        limit: int = 6,
+        recent_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> List[QuickAction]:
         """Get quick action suggestions based on session context.
 
         Args:
             session: Current session
             limit: Maximum number of suggestions
+            recent_messages: Optional recent message dicts for context analysis
 
         Returns:
             List of suggested actions
         """
-        try:
-            # Analyze context
-            context = await self._analyze_context(session)
+        # Analyze context. ``SessionModel`` has no ``context`` attribute, so
+        # recent-message history (when available) is passed in explicitly by
+        # the caller rather than read off the session.
+        context = await self._analyze_context(session, recent_messages or [])
 
-            # Filter actions based on context
-            available_actions = []
-            for action in self.actions.values():
-                if self._is_action_available(action, context):
-                    available_actions.append(action)
+        # Filter actions based on context
+        available_actions = []
+        for action in self.actions.values():
+            if self._is_action_available(action, context):
+                available_actions.append(action)
 
-            # Sort by priority and return top N
-            available_actions.sort(key=lambda x: x.priority, reverse=True)
-            return available_actions[:limit]
+        # Sort by priority and return top N
+        available_actions.sort(key=lambda x: x.priority, reverse=True)
+        return available_actions[:limit]
 
-        except Exception as e:
-            self.logger.error(f"Error getting suggestions: {e}")
-            return []
-
-    async def _analyze_context(self, session: SessionModel) -> Dict[str, Any]:
+    async def _analyze_context(
+        self, session: SessionModel, recent_messages: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
         """Analyze session context to determine available actions.
 
         Args:
             session: Current session
+            recent_messages: Recent message dicts to scan for context clues
 
         Returns:
             Context dictionary
@@ -170,29 +183,25 @@ class QuickActionManager:
         }
 
         # Analyze recent messages for context clues
-        if session.context:
-            recent_messages = session.context.get("recent_messages", [])
-            for msg in recent_messages:
-                content = msg.get("content", "").lower()
+        for msg in recent_messages:
+            content = msg.get("content", "").lower()
 
-                # Check for test indicators
-                if any(word in content for word in ["test", "pytest", "unittest"]):
-                    context["has_tests"] = True
+            # Check for test indicators
+            if any(word in content for word in ["test", "pytest", "unittest"]):
+                context["has_tests"] = True
 
-                # Check for package manager indicators
-                if any(word in content for word in ["pip", "poetry", "npm", "yarn"]):
-                    context["has_package_manager"] = True
-                    context["has_dependencies"] = True
+            # Check for package manager indicators
+            if any(word in content for word in ["pip", "poetry", "npm", "yarn"]):
+                context["has_package_manager"] = True
+                context["has_dependencies"] = True
 
-                # Check for formatter indicators
-                if any(word in content for word in ["black", "prettier", "format"]):
-                    context["has_formatter"] = True
+            # Check for formatter indicators
+            if any(word in content for word in ["black", "prettier", "format"]):
+                context["has_formatter"] = True
 
-                # Check for linter indicators
-                if any(
-                    word in content for word in ["flake8", "pylint", "eslint", "mypy"]
-                ):
-                    context["has_linter"] = True
+            # Check for linter indicators
+            if any(word in content for word in ["flake8", "pylint", "eslint", "mypy"]):
+                context["has_linter"] = True
 
         # File-based context analysis could be added here
         # For now, we'll use heuristics based on session history
@@ -235,7 +244,9 @@ class QuickActionManager:
         for i, action in enumerate(actions):
             button = InlineKeyboardButton(
                 text=f"{action.icon} {action.name}",
-                callback_data=f"quick_action:{action.id}",
+                # ``quick:`` so handle_callback_query routes to the quick-action
+                # handler (the dispatcher splits on the first ":").
+                callback_data=f"quick:{action.id}",
             )
             row.append(button)
 
@@ -264,7 +275,7 @@ class QuickActionManager:
             raise ValueError(f"Unknown action: {action_id}")
 
         self.logger.info(
-            f"Executing quick action: {action.name} for session {session.id}"
+            f"Executing quick action: {action.name} for session {session.session_id}"
         )
 
         # Return the command - actual execution is handled by the bot

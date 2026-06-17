@@ -25,7 +25,11 @@ IMAGE_EXTENSIONS = {
 }
 
 # Raster formats that can be sent via reply_photo() (Telegram supports these natively)
-TELEGRAM_PHOTO_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+TELEGRAM_PHOTO_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+# Animated formats that must be sent via reply_animation() to preserve motion
+# (reply_photo would deliver only a single static frame).
+TELEGRAM_ANIMATION_EXTENSIONS = {".gif"}
 
 # Safety caps
 MAX_IMAGES_PER_RESPONSE = 10
@@ -97,10 +101,26 @@ def should_send_as_photo(path: Path) -> bool:
     """Return True if the image should be sent via reply_photo().
 
     Raster images ≤ 10 MB are sent as photos (inline preview).
-    SVGs and large files are sent as documents.
+    SVGs, animations (.gif) and large files are sent another way.
     """
     ext = path.suffix.lower()
     if ext not in TELEGRAM_PHOTO_EXTENSIONS:
+        return False
+
+    try:
+        return path.stat().st_size <= PHOTO_SIZE_LIMIT
+    except OSError:
+        return False
+
+
+def should_send_as_animation(path: Path) -> bool:
+    """Return True if the image should be sent via reply_animation().
+
+    Animated formats (.gif) ≤ 10 MB are sent as animations so motion is
+    preserved; reply_photo would deliver only a single static frame.
+    """
+    ext = path.suffix.lower()
+    if ext not in TELEGRAM_ANIMATION_EXTENSIONS:
         return False
 
     try:

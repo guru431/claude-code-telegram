@@ -65,13 +65,27 @@ async def rate_limit_middleware(
             message=message,
         )
 
-        # Log rate limit violation
+        # Log rate limit violation with the real measurement. check_rate_limit
+        # only returns (bool, message); infer which limit tripped from the
+        # message text and pull the matching numbers from get_user_status.
         if audit_logger:
+            status = rate_limiter.get_user_status(user_id)
+            if message and message.startswith("Cost limit exceeded"):
+                limit_type = "cost"
+                cost_usage = status["cost_usage"]
+                current_usage = float(cost_usage["current"])
+                limit_value = float(cost_usage["limit"])
+            else:
+                limit_type = "request"
+                bucket = status["request_bucket"]
+                # Request "usage" = tokens consumed out of capacity.
+                current_usage = float(bucket["capacity"]) - float(bucket["tokens"])
+                limit_value = float(bucket["capacity"])
             await audit_logger.log_rate_limit_exceeded(
                 user_id=user_id,
-                limit_type="combined",
-                current_usage=0,  # Would need to extract from rate_limiter
-                limit_value=0,  # Would need to extract from rate_limiter
+                limit_type=limit_type,
+                current_usage=current_usage,
+                limit_value=limit_value,
             )
 
         # Send user-friendly rate limit message

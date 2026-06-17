@@ -26,6 +26,7 @@ from .repositories import (
     SessionRepository,
     ToolUsageRepository,
     UserRepository,
+    WebhookEventRepository,
 )
 
 logger = structlog.get_logger()
@@ -45,6 +46,7 @@ class Storage:
         self.audit = AuditLogRepository(self.db_manager)
         self.costs = CostTrackingRepository(self.db_manager)
         self.analytics = AnalyticsRepository(self.db_manager)
+        self.webhooks = WebhookEventRepository(self.db_manager)
 
     async def initialize(self):
         """Initialize storage system."""
@@ -71,7 +73,19 @@ class Storage:
         response: ClaudeResponse,
         ip_address: Optional[str] = None,
     ):
-        """Save complete Claude interaction."""
+        """Save complete Claude interaction in a single transaction.
+
+        All writes (message, tool usage, daily cost, user stats, audit) are
+        committed atomically on one borrowed connection so a crash mid-sequence
+        cannot desync the counters.
+
+        When ``session_id`` is empty/missing (a new session was created but no
+        ``ResultMessage`` arrived) the ``messages``/``tool_usage`` rows have a
+        FOREIGN KEY to ``sessions`` that cannot be satisfied, so they are
+        skipped. The session-independent cost and audit writes (cost_tracking
+        and audit_log are not FK-bound to sessions) still run, and the dropped
+        message is logged at error level.
+        """
         logger.info(
             "Saving Claude interaction",
             user_id=user_id,
@@ -79,47 +93,15 @@ class Storage:
             cost=response.cost,
         )
 
-        # Save message
-        message = MessageModel(
-            message_id=None,
-            session_id=session_id,
-            user_id=user_id,
-            timestamp=datetime.now(UTC),
-            prompt=prompt,
-            response=response.content,
-            cost=response.cost,
-            duration_ms=response.duration_ms,
-            error=response.error_type if response.is_error else None,
-        )
+        now = datetime.now(UTC)
+        has_session = bool(session_id)
+        if not has_session:
+            logger.error(
+                "Empty session_id for Claude interaction; skipping FK-bound "
+                "message/tool rows, persisting cost and audit only",
+                user_id=user_id,
+            )
 
-        message_id = await self.messages.save_message(message)
-
-        # Save tool usage
-        if response.tools_used:
-            for tool in response.tools_used:
-                tool_usage = ToolUsageModel(
-                    id=None,
-                    session_id=session_id,
-                    message_id=message_id,
-                    tool_name=tool["name"],
-                    tool_input=tool.get("input", {}),
-                    timestamp=datetime.now(UTC),
-                    success=not response.is_error,
-                    error_message=response.error_type if response.is_error else None,
-                )
-                await self.tools.save_tool_usage(tool_usage)
-
-        # Update cost tracking
-        await self.costs.update_daily_cost(user_id, response.cost)
-
-        # Update user stats (atomic increment to avoid lost updates under
-        # concurrent interactions). Session counters are owned by
-        # SessionManager/SQLiteSessionStorage and must NOT be incremented here.
-        await self.users.increment_stats(
-            user_id, response.cost, messages=1, last_active=datetime.now(UTC)
-        )
-
-        # Log audit event
         audit_event = AuditLogModel(
             id=None,
             user_id=user_id,
@@ -133,10 +115,66 @@ class Storage:
                 "tools_used": [t["name"] for t in response.tools_used],
             },
             success=not response.is_error,
-            timestamp=datetime.now(UTC),
+            timestamp=now,
             ip_address=ip_address,
         )
-        await self.audit.log_event(audit_event)
+
+        async with self.db_manager.get_connection() as conn:
+            try:
+                if has_session:
+                    # Save message (FK-bound to sessions).
+                    message = MessageModel(
+                        message_id=None,
+                        session_id=session_id,
+                        user_id=user_id,
+                        timestamp=now,
+                        prompt=prompt,
+                        response=response.content,
+                        cost=response.cost,
+                        duration_ms=response.duration_ms,
+                        error=response.error_type if response.is_error else None,
+                    )
+                    message_id = await self.messages.save_message(message, conn=conn)
+
+                    # Save tool usage (FK-bound to sessions/messages).
+                    if response.tools_used:
+                        for tool in response.tools_used:
+                            tool_usage = ToolUsageModel(
+                                id=None,
+                                session_id=session_id,
+                                message_id=message_id,
+                                tool_name=tool["name"],
+                                tool_input=tool.get("input", {}),
+                                timestamp=now,
+                                success=not response.is_error,
+                                error_message=(
+                                    response.error_type
+                                    if response.is_error
+                                    else None
+                                ),
+                            )
+                            await self.tools.save_tool_usage(tool_usage, conn=conn)
+
+                # Update cost tracking (no session FK).
+                await self.costs.update_daily_cost(
+                    user_id, response.cost, conn=conn
+                )
+
+                # Update user stats (atomic increment to avoid lost updates
+                # under concurrent interactions). Session counters are owned by
+                # SessionManager/SQLiteSessionStorage and must NOT be
+                # incremented here.
+                await self.users.increment_stats(
+                    user_id, response.cost, messages=1, last_active=now, conn=conn
+                )
+
+                # Log audit event (no session FK).
+                await self.audit.log_event(audit_event, conn=conn)
+
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def get_or_create_user(
         self, user_id: int, username: Optional[str] = None
@@ -171,11 +209,11 @@ class Storage:
 
         await self.sessions.create_session(session)
 
-        # Update user session count
-        user = await self.users.get_user(user_id)
-        if user:
-            user.session_count += 1
-            await self.users.update_user(user)
+        # Atomically bump the session counter without a read-modify-write that
+        # could clobber a concurrent increment_stats (which owns total_cost /
+        # message_count). increment_session_count touches only the
+        # create_session-owned columns.
+        await self.users.increment_session_count(user_id, last_active=datetime.now(UTC))
 
         return session
 
@@ -254,16 +292,44 @@ class Storage:
             "tool_usage": [t.to_dict() for t in tools],
         }
 
-    async def cleanup_old_data(self, days: int = 30) -> Dict[str, int]:
-        """Cleanup old data."""
-        logger.info("Starting data cleanup", days=days)
+    async def cleanup_old_data(
+        self, days: int = 90, audit_days: int = 365
+    ) -> Dict[str, int]:
+        """Purge old data past the retention window.
 
-        # Cleanup old sessions
-        sessions_cleaned = await self.sessions.cleanup_old_sessions(days)
+        ``days`` governs sessions (marked inactive), and the hard DELETE purge
+        of messages, tool_usage and webhook_events. ``audit_days`` governs the
+        audit_log purge separately (audit rows are usually kept longer). A
+        ``0`` value for either arg disables that purge (keep forever).
+        Returns the count removed per table.
+        """
+        logger.info("Starting data cleanup", days=days, audit_days=audit_days)
 
-        logger.info("Data cleanup complete", sessions_cleaned=sessions_cleaned)
+        result: Dict[str, int] = {
+            "sessions_cleaned": 0,
+            "messages_purged": 0,
+            "tool_usage_purged": 0,
+            "webhook_events_purged": 0,
+            "audit_log_purged": 0,
+        }
 
-        return {"sessions_cleaned": sessions_cleaned}
+        if days > 0:
+            # Sessions are only flipped inactive (kept resumable), not deleted.
+            result["sessions_cleaned"] = await self.sessions.cleanup_old_sessions(days)
+            result["messages_purged"] = await self.messages.purge_old_messages(days)
+            result["tool_usage_purged"] = await self.tools.purge_old_tool_usage(days)
+            result["webhook_events_purged"] = (
+                await self.webhooks.purge_old_webhook_events(days)
+            )
+
+        if audit_days > 0:
+            result["audit_log_purged"] = await self.audit.purge_old_audit_log(
+                audit_days
+            )
+
+        logger.info("Data cleanup complete", **result)
+
+        return result
 
     async def get_user_dashboard(self, user_id: int) -> Dict[str, Any]:
         """Get comprehensive user dashboard data."""

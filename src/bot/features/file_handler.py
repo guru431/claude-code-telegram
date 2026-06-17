@@ -145,8 +145,9 @@ class FileHandler:
     ) -> ProcessedFile:
         """Process uploaded document"""
 
-        # Download file
+        # Download file into a per-request subdir
         file_path = await self._download_file(document)
+        download_dir = file_path.parent
 
         try:
             # Detect file type
@@ -163,17 +164,29 @@ class FileHandler:
                 raise ValueError(f"Unsupported file type: {file_type}")
 
         finally:
-            # Cleanup
-            file_path.unlink(missing_ok=True)
+            # Cleanup the whole per-request subdir so concurrent uploads of a
+            # same-named file never delete each other's bytes mid-flight.
+            shutil.rmtree(download_dir, ignore_errors=True)
 
     async def _download_file(self, document: Document) -> Path:
-        """Download file from Telegram"""
+        """Download file from Telegram into a unique per-request subdir.
+
+        Each download gets its own ``self.temp_dir / <uuid4>`` directory so two
+        concurrent uploads of an identically named file (PTB dispatches updates
+        concurrently) cannot collide on the same path or unlink each other's
+        bytes mid-flight. The sanitized filename is joined inside that subdir.
+        """
         # Get file
         file = await document.get_file()
 
-        # Create temp file path
+        # Per-request directory isolates this download from every other
+        download_dir = self.temp_dir / str(uuid.uuid4())
+        download_dir.mkdir()
+
+        # Sanitize the user-controlled filename to a bare name within the subdir
         file_name = document.file_name or f"file_{uuid.uuid4()}"
-        file_path = self.temp_dir / file_name
+        file_name = Path(file_name).name or f"file_{uuid.uuid4()}"
+        file_path = download_dir / file_name
 
         # Download to path
         await file.download_to_drive(str(file_path))

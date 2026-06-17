@@ -12,7 +12,7 @@ import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterator, List, Optional, Tuple
+from typing import AsyncIterator, List, Optional, Tuple, Union
 
 import aiosqlite
 import structlog
@@ -148,21 +148,33 @@ class DatabaseManager:
         # a burst. Initialised lazily in initialize() once _pool_size is fixed.
         self._pool_semaphore: Optional[asyncio.Semaphore] = None
 
-    def _parse_database_url(self, database_url: str) -> Path:
-        """Parse database URL to path."""
+    def _parse_database_url(self, database_url: str) -> Union[str, Path]:
+        """Parse database URL to a path or the literal in-memory marker.
+
+        In-memory forms (``sqlite:///:memory:`` / ``:memory:`` / empty path)
+        are passed to aiosqlite as the literal string ``":memory:"`` rather
+        than a filesystem Path so SQLite opens a transient in-memory database
+        and no parent directory is created.
+        """
         if database_url.startswith("sqlite:///"):
-            return Path(database_url[10:])
+            path = database_url[10:]
         elif database_url.startswith("sqlite://"):
-            return Path(database_url[9:])
+            path = database_url[9:]
         else:
-            return Path(database_url)
+            path = database_url
+
+        if path in (":memory:", ""):
+            return ":memory:"
+        return Path(path)
 
     async def initialize(self):
         """Initialize database and run migrations."""
         logger.info("Initializing database", path=str(self.database_path))
 
-        # Ensure directory exists
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure directory exists (skip for the in-memory marker, which has no
+        # backing file and therefore no parent directory to create).
+        if isinstance(self.database_path, Path):
+            self.database_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Run migrations
         await self._run_migrations()
@@ -186,15 +198,20 @@ class DatabaseManager:
             current_version = await self._get_schema_version(conn)
             logger.info("Current schema version", version=current_version)
 
-            # Run migrations
+            # Run migrations. Commit the version bump immediately after each
+            # migration's DDL: executescript() implicitly COMMITs the DDL, so a
+            # crash before a trailing commit would persist the schema change
+            # but not the version row. On the next start migration 1
+            # (INITIAL_SCHEMA, bare CREATE TABLE) would rerun and fail with
+            # "table users already exists". One commit per migration keeps the
+            # DDL and its version row atomic relative to later migrations.
             migrations = self._get_migrations()
             for version, migration in migrations:
                 if version > current_version:
                     logger.info("Running migration", version=version)
                     await conn.executescript(migration)
                     await self._set_schema_version(conn, version)
-
-            await conn.commit()
+                    await conn.commit()
 
     async def _get_schema_version(self, conn: aiosqlite.Connection) -> int:
         """Get current schema version."""
@@ -322,6 +339,20 @@ class DatabaseManager:
                     ON tool_usage(session_id);
                 CREATE INDEX IF NOT EXISTS idx_messages_user_id
                     ON messages(user_id, timestamp);
+                """,
+            ),
+            (
+                6,
+                """
+                -- Durable webhook retry: attempt counter, last error, last
+                -- attempt time. ``processed`` becomes tri-state: 0=pending,
+                -- 1=done, 2=dead-letter (retries exhausted).
+                ALTER TABLE webhook_events ADD COLUMN attempts INTEGER NOT NULL
+                    DEFAULT 0;
+                ALTER TABLE webhook_events ADD COLUMN last_error TEXT;
+                ALTER TABLE webhook_events ADD COLUMN last_attempt_at TIMESTAMP;
+                CREATE INDEX IF NOT EXISTS idx_webhook_events_pending
+                    ON webhook_events(processed, attempts);
                 """,
             ),
         ]

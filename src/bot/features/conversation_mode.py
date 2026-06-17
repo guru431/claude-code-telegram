@@ -260,6 +260,16 @@ class ConversationEnhancer:
         # Return top 3-4 most relevant suggestions
         return prioritized[:4]
 
+    @staticmethod
+    def suggestion_hash(suggestion: str) -> str:
+        """Stable 12-char hash for a suggestion's callback_data.
+
+        Stable across bot restarts (builtin ``hash()`` is randomized via
+        PYTHONHASHSEED). Callers persist the hash->text mapping so
+        ``handle_followup_callback`` can recover the original suggestion.
+        """
+        return hashlib.sha256(suggestion.encode("utf-8")).hexdigest()[:12]
+
     def create_follow_up_keyboard(self, suggestions: List[str]) -> InlineKeyboardMarkup:
         """Create keyboard with follow-up suggestions."""
         if not suggestions:
@@ -269,12 +279,7 @@ class ConversationEnhancer:
 
         # Add suggestion buttons (max 4, in rows of 1 for better mobile experience)
         for suggestion in suggestions[:4]:
-            # Stable hash so callback_data stays valid across bot restarts;
-            # builtin ``hash()`` is randomized via PYTHONHASHSEED and would
-            # produce a different value each run.
-            suggestion_hash = hashlib.sha256(suggestion.encode("utf-8")).hexdigest()[
-                :12
-            ]
+            suggestion_hash = self.suggestion_hash(suggestion)
             keyboard.append(
                 [
                     InlineKeyboardButton(

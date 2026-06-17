@@ -204,6 +204,18 @@ class Settings(BaseSettings):
     max_sessions_per_user: int = Field(
         DEFAULT_MAX_SESSIONS_PER_USER, description="Max concurrent sessions"
     )
+    data_retention_days: int = Field(
+        90,
+        ge=0,
+        description=(
+            "Days to retain messages/tool_usage/webhook_events (0 = keep forever)"
+        ),
+    )
+    audit_log_retention_days: int = Field(
+        365,
+        ge=0,
+        description="Days to retain audit_log rows (0 = keep forever)",
+    )
 
     # Features
     enable_mcp: bool = Field(False, description="Enable Model Context Protocol")
@@ -310,10 +322,20 @@ class Settings(BaseSettings):
 
     # Agentic platform settings
     enable_api_server: bool = Field(False, description="Enable FastAPI webhook server")
+    api_server_host: str = Field(
+        "127.0.0.1",
+        description="Bind address for the webhook API server (use 0.0.0.0 to expose)",
+    )
     api_server_port: int = Field(8080, description="Webhook API server port")
     enable_scheduler: bool = Field(False, description="Enable job scheduler")
     github_webhook_secret: Optional[str] = Field(
         None, description="GitHub webhook HMAC secret"
+    )
+    github_webhook_events: Optional[List[str]] = Field(
+        default=["issues", "pull_request", "release"],
+        description=(
+            "GitHub event types that trigger an agent run; others are ignored"
+        ),
     )
     webhook_api_secret: Optional[str] = Field(
         None, description="Shared secret for generic webhook providers"
@@ -344,7 +366,15 @@ class Settings(BaseSettings):
     )
 
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+        # Re-run field + model validators on attribute assignment so that
+        # environment overrides applied via setattr in
+        # ``loader._apply_environment_overrides`` are validated/parsed instead
+        # of bypassing validation.
+        validate_assignment=True,
     )
 
     @field_validator(
@@ -373,6 +403,18 @@ class Settings(BaseSettings):
             return [tool.strip() for tool in v.split(",") if tool.strip()]
         if isinstance(v, list):
             return [str(tool) for tool in v]
+        return v  # type: ignore[no-any-return]
+
+    @field_validator("github_webhook_events", mode="before")
+    @classmethod
+    def parse_github_webhook_events(cls, v: Any) -> Optional[List[str]]:
+        """Parse comma-separated GitHub event types."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return [event.strip() for event in v.split(",") if event.strip()]
+        if isinstance(v, list):
+            return [str(event) for event in v]
         return v  # type: ignore[no-any-return]
 
     @field_validator("approved_directory")
@@ -540,9 +582,16 @@ class Settings(BaseSettings):
 
     @property
     def database_path(self) -> Optional[Path]:
-        """Extract path from SQLite database URL."""
+        """Extract path from SQLite database URL.
+
+        Returns ``None`` for non-SQLite URLs and for the in-memory form
+        (``sqlite:///:memory:`` or an empty path after the prefix), so callers
+        skip parent-directory creation and on-disk file handling.
+        """
         if self.database_url.startswith("sqlite:///"):
             db_path = self.database_url.replace("sqlite:///", "")
+            if db_path in ("", ":memory:"):
+                return None
             return Path(db_path).resolve()
         return None
 

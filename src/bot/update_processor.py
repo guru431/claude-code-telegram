@@ -49,6 +49,11 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
     # Sized far above any realistic backlog so a stop: callback is never starved
     # of a semaphore slot by regular updates queued on _sequential_lock.
     _MAX_CONCURRENT = 100_000
+    # Above this many tracked per-user locks, opportunistically drop the ones
+    # that are provably idle (not currently held) so the map stays bounded under
+    # traffic from many distinct ids — including rejected senders, since this
+    # processor runs before auth.
+    _MAX_USER_LOCKS = 10_000
 
     def __init__(self, max_concurrent: Optional[int] = None) -> None:
         # max_concurrent is overridable mainly so tests can exercise the
@@ -94,10 +99,23 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
             user_id = update.effective_user.id
             lock = self._user_locks.get(user_id)
             if lock is None:
+                if len(self._user_locks) >= self._MAX_USER_LOCKS:
+                    self._evict_idle_locks()
                 lock = asyncio.Lock()
                 self._user_locks[user_id] = lock
             return lock
         return self._fallback_lock
+
+    def _evict_idle_locks(self) -> None:
+        """Drop per-user locks that are provably not held.
+
+        Only removes locks where ``locked()`` is False, so an in-flight update
+        never loses the lock serializing it. Runs synchronously (no await) so the
+        map is not mutated concurrently mid-iteration.
+        """
+        idle = [uid for uid, lock in self._user_locks.items() if not lock.locked()]
+        for uid in idle:
+            self._user_locks.pop(uid, None)
 
     async def initialize(self) -> None:
         """Initialize the processor (no-op)."""

@@ -180,6 +180,67 @@ _INLINE_CODE_FLAGS: Set[str] = {
 # which matches nothing and bypasses path validation entirely.
 _ENV_ASSIGN_RE: re.Pattern[str] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
+# Launcher wrappers that take *another command* as their operand (e.g.
+# ``nohup rm -rf /etc``, ``timeout 5 cat /etc/passwd``, ``sudo cat
+# /etc/shadow``). Classifying only the wrapper as the base command would leave
+# the wrapped command (the one that actually touches the filesystem)
+# unchecked, so we strip the wrapper and re-classify the next real command.
+_LAUNCHER_WRAPPERS: Set[str] = {
+    "nohup",
+    "timeout",
+    "nice",
+    "command",
+    "sudo",
+    "doas",
+    "stdbuf",
+    "setsid",
+    "ionice",
+    "chrt",
+}
+
+# Wrappers that take a numeric/value operand of their own *before* the wrapped
+# command (e.g. ``timeout 5 cmd``, ``nice -n 10 cmd``, ``ionice -c2 cmd``,
+# ``chrt -f 99 cmd``). After consuming the wrapper's flags we also skip a
+# single bare numeric operand so the real command lands as the base command.
+_WRAPPERS_WITH_NUMERIC_OPERAND: Set[str] = {"timeout", "nice", "ionice", "chrt"}
+
+
+def _strip_launcher_wrappers(cmd_tokens: list[str]) -> list[str]:
+    """Strip leading launcher wrappers (and their own flags/operands).
+
+    Handles chained wrappers (``nohup timeout 5 nice -n 5 rm -rf /etc``) by
+    looping until the leading token is no longer a recognized wrapper, so the
+    returned list begins with the command that actually runs.
+    """
+    while cmd_tokens and Path(cmd_tokens[0]).name in _LAUNCHER_WRAPPERS:
+        wrapper = Path(cmd_tokens[0]).name
+        cmd_tokens = cmd_tokens[1:]
+        # Skip the wrapper's own option flags (``-n``, ``-c2``, ``-f``, …) and
+        # any standalone value that follows a separated flag (``-n 10``).
+        while cmd_tokens and cmd_tokens[0].startswith("-"):
+            flag = cmd_tokens[0]
+            cmd_tokens = cmd_tokens[1:]
+            # A separated numeric/value operand (``-n 10``, ``-c 2``) is the
+            # flag's argument, not the command — drop it too. Bundled forms
+            # (``-c2``) carry the value in the same token and need no extra skip.
+            if (
+                wrapper in _WRAPPERS_WITH_NUMERIC_OPERAND
+                and flag in {"-n", "-c", "-p", "-i", "-r", "-b", "-k", "-s"}
+                and cmd_tokens
+                and not cmd_tokens[0].startswith("-")
+            ):
+                cmd_tokens = cmd_tokens[1:]
+        # ``timeout``/``chrt`` take a bare positional operand (``timeout 5``,
+        # ``chrt 99`` rare) before the command; drop a single leading numeric.
+        if (
+            wrapper in _WRAPPERS_WITH_NUMERIC_OPERAND
+            and cmd_tokens
+            and re.match(r"^\d+(\.\d+)?[a-zA-Z]?$", cmd_tokens[0])
+        ):
+            cmd_tokens = cmd_tokens[1:]
+    return cmd_tokens
+
+
 # Bash command separators
 _COMMAND_SEPARATORS: Set[str] = {"&&", "||", ";", "|", "&"}
 
@@ -277,6 +338,19 @@ def check_bash_directory_boundary(
 
         # Strip leading ``VAR=value`` env-assignment tokens so the real command
         # (e.g. the ``rm`` in ``FOO=bar rm -rf /etc``) is the one we classify.
+        while cmd_tokens and _ENV_ASSIGN_RE.match(cmd_tokens[0]):
+            cmd_tokens = cmd_tokens[1:]
+        if not cmd_tokens:
+            continue
+
+        # Strip launcher wrappers (``nohup``, ``timeout 5``, ``sudo``, …) so the
+        # wrapped command (``rm``/``cat`` in ``nohup rm -rf /etc``) is the one we
+        # classify and path-check, rather than the always-unknown wrapper.
+        cmd_tokens = _strip_launcher_wrappers(cmd_tokens)
+        if not cmd_tokens:
+            continue
+        # A wrapper may be immediately followed by another ``VAR=value`` (e.g.
+        # ``sudo FOO=bar rm -rf /etc``); strip those too before classifying.
         while cmd_tokens and _ENV_ASSIGN_RE.match(cmd_tokens[0]):
             cmd_tokens = cmd_tokens[1:]
         if not cmd_tokens:

@@ -8,8 +8,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.bot.orchestrator import MessageOrchestrator, _redact_secrets
+from src.bot.orchestrator import MessageOrchestrator
 from src.config import create_test_config
+from src.security.secret_patterns import redact_secrets as _redact_secrets
 
 
 @pytest.fixture
@@ -82,8 +83,9 @@ def deps():
     }
 
 
-def test_agentic_registers_7_commands(agentic_settings, deps):
-    """Agentic mode registers start, new, status, verbose, repo, sessions, restart."""
+def test_agentic_registers_9_commands(agentic_settings, deps):
+    """Agentic mode registers start, new, status, verbose, repo, sessions,
+    schedule, events, restart."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     app = MagicMock()
     app.add_handler = MagicMock()
@@ -100,13 +102,15 @@ def test_agentic_registers_7_commands(agentic_settings, deps):
     ]
     commands = [h[0][0].commands for h in cmd_handlers]
 
-    assert len(cmd_handlers) == 7
+    assert len(cmd_handlers) == 9
     assert frozenset({"start"}) in commands
     assert frozenset({"new"}) in commands
     assert frozenset({"status"}) in commands
     assert frozenset({"verbose"}) in commands
     assert frozenset({"repo"}) in commands
     assert frozenset({"sessions"}) in commands
+    assert frozenset({"schedule"}) in commands
+    assert frozenset({"events"}) in commands
     assert frozenset({"restart"}) in commands
 
 
@@ -157,11 +161,11 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
 
 
 async def test_agentic_bot_commands(agentic_settings, deps):
-    """Agentic mode returns 7 bot commands."""
+    """Agentic mode returns 9 bot commands."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     commands = await orchestrator.get_bot_commands()
 
-    assert len(commands) == 7
+    assert len(commands) == 9
     cmd_names = [c.command for c in commands]
     assert cmd_names == [
         "start",
@@ -170,6 +174,8 @@ async def test_agentic_bot_commands(agentic_settings, deps):
         "verbose",
         "repo",
         "sessions",
+        "schedule",
+        "events",
         "restart",
     ]
 
@@ -477,6 +483,7 @@ async def test_agentic_voice_calls_claude(agentic_settings, deps):
     mock_response.session_id = "voice-session-123"
     mock_response.content = "Voice response from Claude"
     mock_response.tools_used = []
+    mock_response.is_error = False
 
     claude_integration = AsyncMock()
     claude_integration.run_command = AsyncMock(return_value=mock_response)

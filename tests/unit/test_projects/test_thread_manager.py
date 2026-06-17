@@ -212,7 +212,7 @@ async def test_sync_renames_existing_topic_and_updates_mapping(
     result = await manager.sync_topics(bot, chat_id=42)
     mapping = await repo.get_by_chat_project(42, "app1")
 
-    assert result.reused == 1
+    assert result.reused == 0
     assert result.renamed == 1
     assert result.failed == 0
     assert mapping is not None
@@ -252,7 +252,7 @@ async def test_sync_rename_failure_keeps_old_mapping_for_retry(
     result = await manager.sync_topics(bot, chat_id=42)
     mapping = await repo.get_by_chat_project(42, "app1")
 
-    assert result.reused == 1
+    assert result.reused == 0
     assert result.renamed == 0
     assert result.failed == 1
     assert mapping is not None
@@ -433,7 +433,7 @@ async def test_sync_reopen_inactive_mapping(tmp_path: Path, db_manager) -> None:
     mapping = await repo.get_by_chat_project(42, "app1")
 
     assert result.reopened == 1
-    assert result.reused == 1
+    assert result.reused == 0
     assert mapping is not None
     assert mapping.is_active is True
 

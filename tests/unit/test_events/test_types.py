@@ -5,21 +5,12 @@ from pathlib import Path
 from src.events.types import (
     AgentResponseEvent,
     ScheduledEvent,
-    UserMessageEvent,
     WebhookEvent,
 )
 
 
 class TestEventTypes:
     """Tests for concrete event dataclasses."""
-
-    def test_user_message_event_defaults(self) -> None:
-        event = UserMessageEvent(user_id=123, chat_id=456, text="hello")
-        assert event.source == "telegram"
-        assert event.user_id == 123
-        assert event.chat_id == 456
-        assert event.text == "hello"
-        assert event.event_type == "UserMessageEvent"
 
     def test_webhook_event_defaults(self) -> None:
         event = WebhookEvent(

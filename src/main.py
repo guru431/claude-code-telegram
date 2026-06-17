@@ -30,7 +30,7 @@ from src.projects import (
     load_project_registry,
 )
 from src.scheduler.scheduler import JobScheduler
-from src.security.audit import AuditLogger, InMemoryAuditStorage
+from src.security.audit import AuditLogger, SQLiteAuditStorage
 from src.security.auth import (
     AuthenticationManager,
     AuthProvider,
@@ -181,8 +181,10 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     )
     rate_limiter = RateLimiter(config)
 
-    # Create audit storage and logger
-    audit_storage = InMemoryAuditStorage()  # TODO: Use database storage in production
+    # Create audit storage and logger — persist the security forensic trail
+    # (auth attempts, violations, /restart, file access, rate-limit breaches)
+    # to SQLite so it survives restarts.
+    audit_storage = SQLiteAuditStorage(storage)
     audit_logger = AuditLogger(audit_storage)
 
     # Create Claude integration components with persistent storage
@@ -216,6 +218,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         claude_integration=claude_integration,
         default_working_directory=config.approved_directory,
         default_user_id=config.allowed_users[0] if config.allowed_users else 0,
+        db_manager=storage.db_manager,
     )
     agent_handler.register()
 
@@ -253,8 +256,14 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     }
 
 
-async def run_application(app: Dict[str, Any]) -> None:
-    """Run the application with graceful shutdown handling."""
+async def run_application(app: Dict[str, Any]) -> int:
+    """Run the application with graceful shutdown handling.
+
+    Returns the desired process exit code: non-zero when the bot must be
+    relaunched (a core task crashed, or /restart was requested), 0 on a clean
+    stop. The bot runs as a Windows Scheduled Task with restart-on-failure,
+    which only relaunches on a non-zero exit.
+    """
     logger = structlog.get_logger()
     bot: ClaudeCodeBot = app["bot"]
     claude_integration: ClaudeIntegration = app["claude_integration"]
@@ -262,17 +271,21 @@ async def run_application(app: Dict[str, Any]) -> None:
     config: Settings = app["config"]
     features: FeatureFlags = app["features"]
     event_bus: EventBus = app["event_bus"]
+    agent_handler: AgentHandler = app["agent_handler"]
 
     notification_service: Optional[NotificationService] = None
     scheduler: Optional[JobScheduler] = None
     discovery_scheduler: Optional[Any] = None
+    maintenance_scheduler: Optional[Any] = None
     project_threads_manager: Optional[ProjectThreadManager] = None
 
     # Set up signal handlers for graceful shutdown
     shutdown_event = asyncio.Event()
+    shutdown_signal: Dict[str, Any] = {}
 
     def signal_handler(signum: int, frame: Any) -> None:
         logger.info("Shutdown signal received", signal=signum)
+        shutdown_signal["signum"] = signum
         shutdown_event.set()
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -356,6 +369,15 @@ async def run_application(app: Dict[str, Any]) -> None:
         # Start event bus
         await event_bus.start()
 
+        # Replay webhook deliveries that were recorded but never processed
+        # (e.g. a hard crash between accepting the delivery and finishing the
+        # agent run). The provider blocks re-delivery as a duplicate, so this
+        # is the only at-least-once path for those events.
+        if features.api_server_enabled:
+            from src.api.server import recover_unprocessed_webhooks
+
+            await recover_unprocessed_webhooks(storage.db_manager, event_bus)
+
         # Notification service
         notification_service = NotificationService(
             event_bus=event_bus,
@@ -390,7 +412,69 @@ async def run_application(app: Dict[str, Any]) -> None:
                 default_working_directory=config.approved_directory,
             )
             await scheduler.start()
+            # Expose the scheduler to the /schedule command via bot_data (the
+            # middleware re-injects bot.deps into context.bot_data per update).
+            bot.deps["scheduler"] = scheduler
             logger.info("Job scheduler enabled")
+
+        # Maintenance cron: purge expired rows (retention) and evict idle
+        # per-user state. Runs regardless of the optional feature flags so a
+        # long-lived deployment does not accumulate unbounded DB/memory growth.
+        from apscheduler.schedulers.asyncio import (
+            AsyncIOScheduler as _MaintenanceScheduler,
+        )
+        from apscheduler.triggers.cron import CronTrigger as _MaintenanceCronTrigger
+
+        rate_limiter_ref = bot.deps.get("rate_limiter")
+
+        async def _daily_maintenance() -> None:
+            _log = structlog.get_logger()
+            try:
+                purged = await storage.cleanup_old_data(
+                    days=config.data_retention_days,
+                    audit_days=config.audit_log_retention_days,
+                )
+                _log.info("Retention purge complete", **purged)
+            except Exception:
+                _log.exception("Retention purge failed")
+            if rate_limiter_ref is not None:
+                try:
+                    await rate_limiter_ref.cleanup_inactive_users()
+                except Exception:
+                    _log.exception("Rate-limiter eviction failed")
+
+        maintenance_scheduler = _MaintenanceScheduler()
+        maintenance_scheduler.add_job(
+            _daily_maintenance,
+            trigger=_MaintenanceCronTrigger(hour=4, minute=30),
+            name="daily_maintenance",
+        )
+
+        # Webhook retry sweep: replay pending deliveries whose exponential
+        # backoff has elapsed (dead-lettered rows are excluded). Only meaningful
+        # when the webhook server is enabled.
+        if features.api_server_enabled:
+            from apscheduler.triggers.interval import (
+                IntervalTrigger as _IntervalTrigger,
+            )
+
+            from src.api.server import retry_pending_webhooks
+
+            async def _webhook_retry_sweep() -> None:
+                try:
+                    await retry_pending_webhooks(storage.db_manager, event_bus)
+                except Exception:
+                    structlog.get_logger().exception("Webhook retry sweep failed")
+
+            maintenance_scheduler.add_job(
+                _webhook_retry_sweep,
+                trigger=_IntervalTrigger(minutes=5),
+                name="webhook_retry_sweep",
+            )
+            logger.info("Webhook retry sweep enabled (every 5 min)")
+
+        maintenance_scheduler.start()
+        logger.info("Daily maintenance cron enabled (04:30 daily)")
 
         # Nightly project discovery cron (if project threads enabled)
         if config.enable_project_threads and config.projects_config_path:
@@ -493,6 +577,24 @@ async def run_application(app: Dict[str, Any]) -> None:
             except asyncio.CancelledError:
                 pass
 
+        # Decide the process exit code. A clean stop (SIGINT/SIGTERM) exits 0
+        # and the Scheduled Task stays down; a crashed core task or an explicit
+        # /restart (SIGBREAK) exits non-zero so restart-on-failure relaunches
+        # the bot instead of leaving it dead until the next reboot.
+        core_task_exited = any(task is not shutdown_task for task in done)
+        restart_requested = shutdown_signal.get("signum") == getattr(
+            signal, "SIGBREAK", None
+        )
+        if core_task_exited:
+            logger.error("Core task exited unexpectedly; requesting relaunch")
+            exit_code = 1
+        elif restart_requested:
+            logger.info("Restart requested; exiting non-zero to relaunch the task")
+            exit_code = 1
+        else:
+            exit_code = 0
+        return exit_code
+
     except Exception as e:
         logger.error("Application error", error=str(e))
         raise
@@ -507,8 +609,13 @@ async def run_application(app: Dict[str, Any]) -> None:
         try:
             if discovery_scheduler:
                 discovery_scheduler.shutdown(wait=False)
+            if maintenance_scheduler:
+                maintenance_scheduler.shutdown(wait=False)
             if scheduler:
                 await scheduler.stop()
+            # Drain in-flight background agent runs while the bus is still live
+            # so their responses get published before the bus/notifications stop.
+            await agent_handler.aclose()
             await event_bus.stop()
             if notification_service:
                 await notification_service.stop()
@@ -545,7 +652,9 @@ async def main() -> None:
 
         # Initialize bot and Claude integration
         app = await create_application(config)
-        await run_application(app)
+        exit_code = await run_application(app)
+        if exit_code:
+            sys.exit(exit_code)
 
     except ConfigurationError as e:
         logger.error("Configuration error", error=str(e))

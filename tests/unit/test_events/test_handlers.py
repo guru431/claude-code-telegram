@@ -62,6 +62,8 @@ class TestAgentHandler:
         )
 
         await agent_handler.handle_webhook(event)
+        # Agent runs are spawned as background tasks; drain them before asserting.
+        await agent_handler.aclose()
 
         mock_claude.run_command.assert_called_once()
         call_kwargs = mock_claude.run_command.call_args
@@ -96,6 +98,7 @@ class TestAgentHandler:
         )
 
         await agent_handler.handle_scheduled(event)
+        await agent_handler.aclose()
 
         mock_claude.run_command.assert_called_once()
         assert "standup" in mock_claude.run_command.call_args.kwargs["prompt"].lower()
@@ -120,6 +123,7 @@ class TestAgentHandler:
         )
 
         await agent_handler.handle_scheduled(event)
+        await agent_handler.aclose()
 
         prompt = mock_claude.run_command.call_args.kwargs["prompt"]
         assert prompt.startswith("/daily-standup")
@@ -139,6 +143,7 @@ class TestAgentHandler:
 
         # Should not raise
         await agent_handler.handle_webhook(event)
+        await agent_handler.aclose()
 
     def test_build_webhook_prompt(self, agent_handler: AgentHandler) -> None:
         """Webhook prompt includes provider and event info."""

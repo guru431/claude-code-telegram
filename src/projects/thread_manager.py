@@ -204,6 +204,12 @@ class ProjectThreadManager:
         """Sync an existing mapping. Returns True if handled without recreate."""
         chat_id = mapping.chat_id
 
+        # Track which single bucket this project lands in. Every processed
+        # existing mapping must be counted in exactly one of
+        # failed/reused/renamed/reopened — never several — so /sync_threads
+        # totals stay accurate.
+        reopened = False
+
         if not mapping.is_active:
             # Closed topic: reopening is real work, and it also surfaces a
             # deleted/unusable topic — no separate usability probe needed.
@@ -213,7 +219,7 @@ class ProjectThreadManager:
             if reopen_status == "failed":
                 result.failed += 1
                 return True
-            result.reopened += 1
+            reopened = True
         elif probe_usable:
             # Active topic: optionally confirm it still exists. This is a write
             # call per topic, skipped on startup to avoid a 429 storm across
@@ -226,6 +232,7 @@ class ProjectThreadManager:
                 return True
 
         topic_name = mapping.topic_name
+        renamed = False
         if mapping.topic_name != project.name:
             rename_status = await self._rename_topic(
                 bot=bot,
@@ -243,10 +250,9 @@ class ProjectThreadManager:
                     is_active=True,
                 )
                 result.failed += 1
-                result.reused += 1
                 return True
             topic_name = project.name
-            result.renamed += 1
+            renamed = True
 
         await self.repository.upsert_mapping(
             project_slug=project.slug,
@@ -255,7 +261,13 @@ class ProjectThreadManager:
             topic_name=topic_name,
             is_active=True,
         )
-        result.reused += 1
+        # Exactly one bucket: rename wins over reopen wins over plain reuse.
+        if renamed:
+            result.renamed += 1
+        elif reopened:
+            result.reopened += 1
+        else:
+            result.reused += 1
         return True
 
     async def _create_and_map_topic(

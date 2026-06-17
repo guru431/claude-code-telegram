@@ -600,6 +600,15 @@ def test_computed_properties(tmp_path):
     )
     assert sqlite_settings.database_path == Path("data/bot.db").resolve()
 
+    # In-memory SQLite has no on-disk path.
+    memory_settings = Settings(
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(test_dir),
+        database_url="sqlite:///:memory:",
+    )
+    assert memory_settings.database_path is None
+
 
 def test_feature_flags():
     """Test feature flag system."""

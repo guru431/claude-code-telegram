@@ -9,7 +9,7 @@ import structlog
 from ..security.auth import AuthenticationManager
 from ..security.validators import SecurityValidator
 from .bus import Event, EventBus
-from .types import UserMessageEvent, WebhookEvent
+from .types import WebhookEvent
 
 logger = structlog.get_logger()
 
@@ -33,24 +33,7 @@ class EventSecurityMiddleware:
 
     def register(self) -> None:
         """Subscribe as a global handler to validate all events."""
-        self.event_bus.subscribe(UserMessageEvent, self.validate_user_message)
         self.event_bus.subscribe(WebhookEvent, self.validate_webhook)
-
-    async def validate_user_message(self, event: Event) -> None:
-        """Validate user message events."""
-        if not isinstance(event, UserMessageEvent):
-            return
-
-        # Validate the working directory
-        is_valid, _, error = self.security.validate_path(str(event.working_directory))
-        if not is_valid:
-            logger.warning(
-                "Event rejected: invalid working directory",
-                event_id=event.id,
-                user_id=event.user_id,
-                error=error,
-            )
-            raise ValueError(f"Event security validation failed: {error}")
 
     async def validate_webhook(self, event: Event) -> None:
         """Validate webhook events (signature verified upstream in API layer)."""

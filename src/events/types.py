@@ -8,17 +8,6 @@ from .bus import Event
 
 
 @dataclass
-class UserMessageEvent(Event):
-    """A message from a Telegram user."""
-
-    user_id: int = 0
-    chat_id: int = 0
-    text: str = ""
-    working_directory: Path = field(default_factory=lambda: Path("."))
-    source: str = "telegram"
-
-
-@dataclass
 class WebhookEvent(Event):
     """An external webhook delivery (GitHub, Notion, etc.)."""
 
@@ -48,7 +37,9 @@ class AgentResponseEvent(Event):
 
     chat_id: int = 0
     text: str = ""
-    parse_mode: Optional[str] = "HTML"
+    # Always HTML: AgentHandler converts Claude's markdown to Telegram HTML
+    # before publishing, so the split logic can always rebalance HTML tags.
+    parse_mode: str = "HTML"
     reply_to_message_id: Optional[int] = None
     source: str = "agent"
     originating_event_id: Optional[str] = None

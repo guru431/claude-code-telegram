@@ -489,38 +489,34 @@ async def handle_text_message(
                 if photos and not documents:
                     try:
                         if len(photos) == 1:
-                            with open(photos[0].path, "rb") as f:
-                                await update.message.reply_photo(
-                                    photo=f,
-                                    caption=msg.text,
-                                    parse_mode=msg.parse_mode,
-                                    reply_to_message_id=update.message.message_id,
-                                )
+                            # Read the image off the event loop; PTB would
+                            # otherwise read the whole body synchronously.
+                            data = await asyncio.to_thread(photos[0].path.read_bytes)
+                            await update.message.reply_photo(
+                                photo=data,
+                                caption=msg.text,
+                                parse_mode=msg.parse_mode,
+                                reply_to_message_id=update.message.message_id,
+                            )
                             caption_sent = True
                         else:
                             media = []
-                            file_handles = []
                             for idx, img in enumerate(photos[:10]):
-                                fh = open(img.path, "rb")  # noqa: SIM115
-                                file_handles.append(fh)
+                                data = await asyncio.to_thread(img.path.read_bytes)
                                 media.append(
                                     InputMediaPhoto(
-                                        media=fh,
+                                        media=data,
                                         caption=msg.text if idx == 0 else None,
                                         parse_mode=(
                                             msg.parse_mode if idx == 0 else None
                                         ),
                                     )
                                 )
-                            try:
-                                await update.message.chat.send_media_group(
-                                    media=media,
-                                    reply_to_message_id=update.message.message_id,
-                                )
-                                caption_sent = True
-                            finally:
-                                for fh in file_handles:
-                                    fh.close()
+                            await update.message.chat.send_media_group(
+                                media=media,
+                                reply_to_message_id=update.message.message_id,
+                            )
+                            caption_sent = True
                     except Exception as album_err:
                         logger.warning(
                             "Failed to send photo+caption", error=str(album_err)
@@ -575,38 +571,36 @@ async def handle_text_message(
                 if photos:
                     try:
                         if len(photos) == 1:
-                            with open(photos[0].path, "rb") as f:
-                                await update.message.reply_photo(
-                                    photo=f,
-                                    reply_to_message_id=update.message.message_id,
-                                )
+                            # Read the image off the event loop; PTB would
+                            # otherwise read the whole body synchronously.
+                            data = await asyncio.to_thread(photos[0].path.read_bytes)
+                            await update.message.reply_photo(
+                                photo=data,
+                                reply_to_message_id=update.message.message_id,
+                            )
                         else:
                             media = []
-                            file_handles = []
                             for img in photos[:10]:
-                                fh = open(img.path, "rb")  # noqa: SIM115
-                                file_handles.append(fh)
-                                media.append(InputMediaPhoto(media=fh))
-                            try:
-                                await update.message.chat.send_media_group(
-                                    media=media,
-                                    reply_to_message_id=update.message.message_id,
-                                )
-                            finally:
-                                for fh in file_handles:
-                                    fh.close()
+                                data = await asyncio.to_thread(img.path.read_bytes)
+                                media.append(InputMediaPhoto(media=data))
+                            await update.message.chat.send_media_group(
+                                media=media,
+                                reply_to_message_id=update.message.message_id,
+                            )
                     except Exception as album_err:
                         logger.warning(
                             "Failed to send photo album", error=str(album_err)
                         )
                 for img in documents:
                     try:
-                        with open(img.path, "rb") as f:
-                            await update.message.reply_document(
-                                document=f,
-                                filename=img.path.name,
-                                reply_to_message_id=update.message.message_id,
-                            )
+                        # Read the file off the event loop before handing the
+                        # bytes to PTB.
+                        data = await asyncio.to_thread(img.path.read_bytes)
+                        await update.message.reply_document(
+                            document=data,
+                            filename=img.path.name,
+                            reply_to_message_id=update.message.message_id,
+                        )
                         await asyncio.sleep(0.5)
                     except Exception as doc_err:
                         logger.warning(
@@ -647,6 +641,17 @@ async def handle_text_message(
                         suggestion_keyboard = (
                             conversation_enhancer.create_follow_up_keyboard(suggestions)
                         )
+
+                        # Persist the hash->text mapping so the followup
+                        # callback can recover the suggestion the user tapped
+                        # (callback_data only carries the 12-char hash).
+                        followup_map = context.user_data.setdefault(
+                            "followup_suggestions", {}
+                        )
+                        for suggestion in suggestions[:4]:
+                            followup_map[
+                                conversation_enhancer.suggestion_hash(suggestion)
+                            ] = suggestion
 
                         # Send follow-up suggestions
                         await update.message.reply_text(
@@ -1004,6 +1009,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 # Update session ID
                 context.user_data["claude_session_id"] = claude_response.session_id
 
+                # Charge the real cost so claude_max_cost_per_user is enforced.
+                rate_limiter: Optional[RateLimiter] = context.bot_data.get(
+                    "rate_limiter"
+                )
+                if rate_limiter:
+                    await rate_limiter.record_actual_cost(user_id, claude_response.cost)
+
+                # Check if Claude changed the working directory and update tracking
+                _update_working_directory_from_claude_response(
+                    claude_response, context, settings, user_id
+                )
+
                 # Format and send response
                 from ..utils.formatting import ResponseFormatter
 
@@ -1120,6 +1137,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
             context.user_data["claude_session_id"] = claude_response.session_id
 
+            # Charge the real cost so claude_max_cost_per_user is enforced.
+            rate_limiter: Optional[RateLimiter] = context.bot_data.get("rate_limiter")
+            if rate_limiter:
+                await rate_limiter.record_actual_cost(user_id, claude_response.cost)
+
             _update_working_directory_from_claude_response(
                 claude_response, context, settings, user_id
             )
@@ -1157,38 +1179,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
 
-def _estimate_text_processing_cost(text: str) -> float:
-    """Estimate cost for processing text message."""
-    # Base cost
-    base_cost = 0.001
-
-    # Additional cost based on length
-    length_cost = len(text) * 0.00001
-
-    # Additional cost for complex requests
-    complex_keywords = [
-        "analyze",
-        "generate",
-        "create",
-        "build",
-        "implement",
-        "refactor",
-        "optimize",
-        "debug",
-        "explain",
-        "document",
-    ]
-
-    text_lower = text.lower()
-    complexity_multiplier = 1.0
-
-    for keyword in complex_keywords:
-        if keyword in text_lower:
-            complexity_multiplier += 0.5
-
-    return (base_cost + length_cost) * min(complexity_multiplier, 3.0)
-
-
 def _estimate_file_processing_cost(file_size: int) -> float:
     """Estimate cost for processing uploaded file."""
     # Base cost for file handling
@@ -1198,77 +1188,6 @@ def _estimate_file_processing_cost(file_size: int) -> float:
     size_cost = (file_size / 1024) * 0.0001
 
     return base_cost + size_cost
-
-
-async def _generate_placeholder_response(
-    message_text: str, context: ContextTypes.DEFAULT_TYPE
-) -> dict:
-    """Generate placeholder response until Claude integration is implemented."""
-    settings: Settings = context.bot_data["settings"]
-    current_dir = getattr(
-        context.user_data, "current_directory", settings.approved_directory
-    )
-    relative_path = current_dir.relative_to(settings.approved_directory)
-
-    # Analyze the message for intent
-    message_lower = message_text.lower()
-
-    if any(
-        word in message_lower for word in ["list", "show", "see", "directory", "files"]
-    ):
-        response_text = (
-            f"🤖 <b>Claude Code Response</b> <i>(Placeholder)</i>\n\n"
-            f"I understand you want to see files. Try using the /ls command to list files "
-            f"in your current directory (<code>{relative_path}/</code>).\n\n"
-            f"<b>Available commands:</b>\n"
-            f"• /ls - List files\n"
-            f"• /cd &lt;dir&gt; - Change directory\n"
-            f"• /projects - Show projects\n\n"
-            f"<i>Note: Full Claude Code integration will be available in the next phase.</i>"
-        )
-
-    elif any(word in message_lower for word in ["create", "generate", "make", "build"]):
-        response_text = (
-            f"🤖 <b>Claude Code Response</b> <i>(Placeholder)</i>\n\n"
-            f"I understand you want to create something! Once the Claude Code integration "
-            f"is complete, I'll be able to:\n\n"
-            f"• Generate code files\n"
-            f"• Create project structures\n"
-            f"• Write documentation\n"
-            f"• Build complete applications\n\n"
-            f"<b>Current directory:</b> <code>{relative_path}/</code>\n\n"
-            f"<i>Full functionality coming soon!</i>"
-        )
-
-    elif any(word in message_lower for word in ["help", "how", "what", "explain"]):
-        response_text = (
-            "🤖 <b>Claude Code Response</b> <i>(Placeholder)</i>\n\n"
-            "I'm here to help! Try using /help for available commands.\n\n"
-            "<b>What I can do now:</b>\n"
-            "• Navigate directories (/cd, /ls, /pwd)\n"
-            "• Show projects (/projects)\n"
-            "• Manage sessions (/new, /status)\n\n"
-            "<b>Coming soon:</b>\n"
-            "• Full Claude Code integration\n"
-            "• Code generation and editing\n"
-            "• File operations\n"
-            "• Advanced programming assistance"
-        )
-
-    else:
-        response_text = (
-            f"🤖 <b>Claude Code Response</b> <i>(Placeholder)</i>\n\n"
-            f"I received your message: \"{message_text[:100]}{'...' if len(message_text) > 100 else ''}\"\n\n"
-            f"<b>Current Status:</b>\n"
-            f"• Directory: <code>{relative_path}/</code>\n"
-            f"• Bot core: ✅ Active\n"
-            f"• Claude integration: 🔄 Coming soon\n\n"
-            f"Once Claude Code integration is complete, I'll be able to process your "
-            f"requests fully and help with coding tasks!\n\n"
-            f"For now, try the available commands like /ls, /cd, and /help."
-        )
-
-    return {"text": response_text, "parse_mode": "HTML"}
 
 
 def _update_working_directory_from_claude_response(
