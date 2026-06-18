@@ -45,6 +45,17 @@ class RateLimitBucket:
     def _refill(self) -> None:
         """Refill tokens based on time passed."""
         now = datetime.now(UTC)
+        self.tokens = self._tokens_at(now)
+        self.last_update = now
+
+    def _tokens_at(self, now: datetime) -> float:
+        """Compute available tokens at *now* without mutating state.
+
+        Pure read helper shared by the mutating ``_refill`` and the
+        non-mutating ``get_status``; it never writes ``self.tokens`` or
+        ``self.last_update`` so it is safe to call outside the rate
+        limiter's per-user lock.
+        """
         elapsed = (now - self.last_update).total_seconds()
         # Cap elapsed at the time needed to refill to full capacity. This
         # avoids float-precision loss when a bucket sat idle for a very
@@ -54,8 +65,7 @@ class RateLimitBucket:
             max_useful_elapsed = (self.capacity * 2) / self.refill_rate
             if elapsed > max_useful_elapsed:
                 elapsed = max_useful_elapsed
-        self.tokens = min(self.capacity, self.tokens + (elapsed * self.refill_rate))
-        self.last_update = now
+        return min(self.capacity, self.tokens + (elapsed * self.refill_rate))
 
     def get_wait_time(self, tokens: int = 1) -> float:
         """Get time to wait before tokens are available."""
@@ -67,12 +77,16 @@ class RateLimitBucket:
         return tokens_needed / self.refill_rate
 
     def get_status(self) -> Dict[str, float]:
-        """Get current bucket status."""
-        self._refill()
+        """Get current bucket status without mutating bucket state.
+
+        Tokens are computed on the fly via ``_tokens_at`` so this read
+        path is safe to call outside the rate limiter's lock.
+        """
+        tokens = self._tokens_at(datetime.now(UTC))
         return {
             "capacity": self.capacity,
-            "tokens": self.tokens,
-            "utilization": (self.capacity - self.tokens) / self.capacity,
+            "tokens": tokens,
+            "utilization": (self.capacity - tokens) / self.capacity,
             "refill_rate": self.refill_rate,
         }
 
@@ -228,6 +242,21 @@ class RateLimiter:
                     reset_time=now.isoformat(),
                 )
 
+    def _effective_cost(self, user_id: int) -> Tuple[float, datetime]:
+        """Compute current cost and reset time as if a due reset had run.
+
+        Non-mutating counterpart of ``_maybe_reset_cost_tracker`` for the
+        read path: it reports the cost the user *would* have after any due
+        daily reset, plus the effective reset timestamp, without touching
+        ``self.cost_tracker`` or ``self.cost_reset_time``.
+        """
+        now = datetime.now(UTC)
+        last_reset = self.cost_reset_time.get(user_id, now - timedelta(days=1))
+        reset_interval = timedelta(hours=24)
+        if now - last_reset >= reset_interval:
+            return 0.0, now
+        return self.cost_tracker[user_id], self.cost_reset_time.get(user_id, now)
+
     async def record_actual_cost(self, user_id: int, cost: float) -> None:
         """Add the *actual* cost of a completed request to the user's budget.
 
@@ -260,14 +289,18 @@ class RateLimiter:
             logger.info("User limits reset", user_id=user_id, old_cost=old_cost)
 
     def get_user_status(self, user_id: int) -> Dict[str, Any]:
-        """Get current rate limit status for user."""
+        """Get current rate limit status for user.
+
+        Pure read path: neither the bucket nor the cost tracker is
+        mutated here (``get_status``/``_effective_cost`` compute values on
+        the fly), so it is safe to call without holding ``self.locks``.
+        """
         # Get request bucket status
         bucket = self._get_or_create_bucket(user_id)
         bucket_status = bucket.get_status()
 
-        # Get cost status
-        self._maybe_reset_cost_tracker(user_id)
-        current_cost = self.cost_tracker[user_id]
+        # Get cost status (computed without mutating the tracker)
+        current_cost, effective_reset = self._effective_cost(user_id)
         cost_remaining = max(0, self.config.claude_max_cost_per_user - current_cost)
 
         return {
@@ -278,9 +311,7 @@ class RateLimiter:
                 "remaining": cost_remaining,
                 "utilization": current_cost / self.config.claude_max_cost_per_user,
             },
-            "last_reset": self.cost_reset_time.get(
-                user_id, datetime.now(UTC)
-            ).isoformat(),
+            "last_reset": effective_reset.isoformat(),
         }
 
     def get_global_status(self) -> Dict[str, Any]:

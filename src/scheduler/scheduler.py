@@ -171,13 +171,23 @@ class JobScheduler:
                 try:
                     trigger = CronTrigger.from_crontab(row_dict["cron_expression"])
 
-                    # Parse target_chat_ids from stored string
+                    # Parse target_chat_ids from stored string. Tolerate junk
+                    # in the DB: strip each token and skip non-numeric ones
+                    # (with a warning) instead of failing the whole job.
                     chat_ids_str = row_dict.get("target_chat_ids", "")
-                    chat_ids = (
-                        [int(x) for x in chat_ids_str.split(",") if x.strip()]
-                        if chat_ids_str
-                        else []
-                    )
+                    chat_ids: List[int] = []
+                    for token in (chat_ids_str or "").split(","):
+                        token = token.strip()
+                        if not token:
+                            continue
+                        try:
+                            chat_ids.append(int(token))
+                        except ValueError:
+                            logger.warning(
+                                "Skipping non-numeric target_chat_id token",
+                                job_id=row_dict.get("job_id"),
+                                token=token,
+                            )
 
                     self._scheduler.add_job(
                         self._fire_event,

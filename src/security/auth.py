@@ -157,6 +157,11 @@ class TokenAuthProvider(AuthProvider):
         storage: TokenStorage,
         token_lifetime: timedelta = timedelta(days=30),
     ):
+        if len(secret) < 32:
+            raise SecurityError(
+                "Token auth secret must be at least 32 characters "
+                f"(got {len(secret)})"
+            )
         self.secret = secret
         self.storage = storage
         self.token_lifetime = token_lifetime

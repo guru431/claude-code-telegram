@@ -421,22 +421,28 @@ class DatabaseManager:
 
             yield conn
         finally:
-            released = False
-            if conn is not None:
-                # Roll back any open write transaction before the connection
-                # goes back to the pool. If a task was cancelled or raised
-                # between execute() and commit(), an open transaction would
-                # otherwise be inherited by the next borrower and either
-                # implicitly committed or cause "database is locked".
-                if conn.in_transaction:
-                    await conn.rollback()
-                async with self._pool_lock:
-                    if len(self._connection_pool) < self._pool_size:
-                        self._connection_pool.append(conn)
-                        released = True
-                if not released:
-                    await conn.close()
-            self._pool_semaphore.release()
+            # Always release the semaphore permit, even if rolling back or
+            # closing the connection raises. Otherwise a failed await below
+            # would leak a permit and, after _pool_size leaks, acquire() would
+            # block forever.
+            try:
+                released = False
+                if conn is not None:
+                    # Roll back any open write transaction before the connection
+                    # goes back to the pool. If a task was cancelled or raised
+                    # between execute() and commit(), an open transaction would
+                    # otherwise be inherited by the next borrower and either
+                    # implicitly committed or cause "database is locked".
+                    if conn.in_transaction:
+                        await conn.rollback()
+                    async with self._pool_lock:
+                        if len(self._connection_pool) < self._pool_size:
+                            self._connection_pool.append(conn)
+                            released = True
+                    if not released:
+                        await conn.close()
+            finally:
+                self._pool_semaphore.release()
 
     async def close(self):
         """Close all connections in pool."""

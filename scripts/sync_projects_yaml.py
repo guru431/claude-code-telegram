@@ -8,7 +8,7 @@ Preserves manually set slug/name/enabled for existing entries.
 import os
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -63,11 +63,11 @@ def sync(config_path: Path, approved_dir: Path) -> bool:
     # Collect existing nested paths (like site/lingva) that still exist on disk
     existing_nested = set()
     for p in by_path:
-        if "/" in p and (approved_dir / p).is_dir():
+        if len(PurePosixPath(p).parts) > 1 and (approved_dir / p).is_dir():
             existing_nested.add(p)
 
     # Exclude top-level dirs that serve as parents for existing nested paths
-    parent_dirs = {p.split("/")[0] for p in existing_nested}
+    parent_dirs = {PurePosixPath(p).parts[0] for p in existing_nested}
     actual_paths -= parent_dirs
 
     all_paths = actual_paths | existing_nested
@@ -87,33 +87,44 @@ def sync(config_path: Path, approved_dir: Path) -> bool:
                 }
             )
 
-    # Check for changes
-    old_paths = {str(e.get("path", "")) for e in existing}
-    new_paths = {str(e.get("path", "")) for e in new_projects}
+    # Check for changes: compare full normalized content (fields + order + duplicates),
+    # not just the set of paths.
+    def _normalize(entry: dict) -> dict:
+        return {
+            "slug": str(entry.get("slug", "")),
+            "name": str(entry.get("name", "")),
+            "path": str(entry.get("path", "")),
+            "enabled": bool(entry.get("enabled", True)),
+        }
 
-    added = new_paths - old_paths
-    removed = old_paths - new_paths
+    old_norm = [_normalize(e) for e in existing]
+    new_norm = [_normalize(e) for e in new_projects]
 
-    if not added and not removed:
+    if old_norm == new_norm:
         print("projects.yaml is up to date, no changes needed.")
         return False
+
+    old_paths = {e["path"] for e in old_norm}
+    new_paths = {e["path"] for e in new_norm}
+    added = new_paths - old_paths
+    removed = old_paths - new_paths
 
     if added:
         print(f"Added: {', '.join(sorted(added))}")
     if removed:
         print(f"Removed: {', '.join(sorted(removed))}")
 
-    # Write updated config with readable formatting
+    # Write updated config, preserving field schema and project order.
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = ["projects:"]
-    for proj in new_projects:
-        lines.append(f"  - slug: {proj['slug']}")
-        lines.append(f"    name: {proj['name']}")
-        lines.append(f"    path: {proj['path']}")
-        lines.append(f"    enabled: {'true' if proj.get('enabled', True) else 'false'}")
-        lines.append("")
+    payload = {"projects": new_norm}
     with open(config_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+        yaml.dump(
+            payload,
+            f,
+            default_flow_style=False,
+            sort_keys=False,
+            allow_unicode=True,
+        )
 
     print(f"Updated {config_path} ({len(new_projects)} projects)")
     return True

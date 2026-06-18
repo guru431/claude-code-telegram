@@ -14,9 +14,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 
-# from src.exceptions import SecurityError  # Future use
+from src.exceptions import ConfigurationError
 
 logger = structlog.get_logger()
+
+# Single source of truth for hidden files (names starting with ".") that are
+# allowed despite the catch-all hidden-file ban in validate_filename. Keep this
+# minimal — fail-closed: anything not listed here is rejected.
+ALLOWED_HIDDEN_FILES: frozenset[str] = frozenset({".gitignore", ".gitkeep"})
 
 
 class SecurityValidator:
@@ -149,6 +154,16 @@ class SecurityValidator:
         # replaced with a symlink, or moved/recreated at runtime.
         self._approved_directory_raw = approved_directory
         self.approved_directory = approved_directory.resolve()
+        # Refuse the filesystem root as the approved directory. If it resolves
+        # to "/" (POSIX) or a drive root ("C:\\"), it has no parent, so every
+        # absolute path would satisfy the _is_within_directory boundary check
+        # and directory isolation would be effectively disabled.
+        if self.approved_directory.parent == self.approved_directory:
+            raise ConfigurationError(
+                "Approved directory must not be the filesystem root "
+                f"({self.approved_directory}); choose a specific subdirectory "
+                "so path isolation can be enforced."
+            )
         self.disable_security_patterns = disable_security_patterns
         logger.info(
             "Security validator initialized",
@@ -320,7 +335,7 @@ class SecurityValidator:
             return False, f"File type not allowed: {ext}"
 
         # Check for hidden files (starting with .)
-        if filename.startswith(".") and filename not in {".gitignore", ".gitkeep"}:
+        if filename.startswith(".") and filename not in ALLOWED_HIDDEN_FILES:
             logger.warning("Hidden file upload attempt", filename=filename)
             return False, "Hidden files not allowed"
 

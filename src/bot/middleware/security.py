@@ -1,5 +1,6 @@
 """Security middleware for input validation and threat detection."""
 
+import re
 from typing import Any, Callable, Dict
 
 import structlog
@@ -7,6 +8,59 @@ import structlog
 from ..utils.html_format import escape_html
 
 logger = structlog.get_logger()
+
+# Command injection patterns. The backtick pattern is scoped to *dangerous*
+# commands inside backticks (rm/curl/wget/etc.) so users can still discuss
+# code snippets using inline code formatting. Compiled once at import time.
+_DANGEROUS_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r";\s*rm\s+",
+        r";\s*del\s+",
+        r";\s*format\s+",
+        r"`[^`]*\b(?:rm|curl|wget|chmod|chown|nc|bash|sh)\s+[^`]*`",
+        r"\$\([^)]*\)",
+        r"&&\s*rm\s+",
+        r"\|\s*mail\s+",
+        r">\s*/dev/",
+        r"curl\s+.*\|\s*sh",
+        r"wget\s+.*\|\s*sh",
+        r"exec\s*\(",
+        r"eval\s*\(",
+    )
+]
+
+# Path traversal patterns. These intentionally require a command-like context
+# (start of message, separator, or a cd/rm/cat-style command prefix) so
+# legitimate references such as "see ../README.md" or "/etc/hosts is documented
+# in ..." are not blocked. The authoritative path check still happens in
+# ``SecurityValidator.validate_path`` for actual file operations. Matched
+# case-sensitively (no re.IGNORECASE). Compiled once at import time.
+_PATH_TRAVERSAL_PATTERNS = [
+    re.compile(p)
+    for p in (
+        r"(?:^|[;&|]|\b(?:cd|cat|rm|mv|cp|ls|less|head|tail)\s+)\.\./",
+        r"(?:^|[;&|]\s*)~/",
+        r"(?:^|[;&|]|\b(?:cd|cat|rm|mv|cp|ls|less|head|tail)\s+)/(?:etc|var|usr|sys|proc)/",
+    )
+]
+
+# Suspicious URLs or domains.
+# Note: blanket TLD blocks (.ru/.tk/.ml) produce too many false positives for a
+# Russian-speaking userbase and any project hosted on legitimate ccTLDs.
+# Restrict to URL-shortener-style obfuscation and inline-script schemes that
+# have no business use case here. Compiled once at import time.
+_SUSPICIOUS_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"https?://bit\.ly/",
+        r"https?://tinyurl\.com/",
+        r"https?://t\.co/",
+        r"https?://goo\.gl/",
+        r"javascript:",
+        r"data:text/html",
+    )
+]
 
 
 async def security_middleware(
@@ -35,15 +89,30 @@ async def security_middleware(
     security_validator = data.get("security_validator")
     audit_logger = data.get("audit_logger")
 
-    if not security_validator:
-        logger.error("Security validator not available in middleware context")
-        # Continue without validation (log error but don't block)
-        return await handler(event, data)
-
     # In agentic mode, user text is a prompt to Claude — not a command.
     # Skip input validation so natural conversation (backticks, paths, etc.) works.
     settings = data.get("settings")
     agentic_mode = getattr(settings, "agentic_mode", False) if settings else False
+    development_mode = (
+        getattr(settings, "development_mode", False) if settings else False
+    )
+
+    if not security_validator:
+        # In agentic mode input validation is intentionally skipped, so a
+        # missing validator is harmless — preserve pass-through. In classic
+        # mode, fail closed in production: without a validator we cannot
+        # enforce the input checks, so refuse rather than silently allowing
+        # unvalidated input through. Development keeps the lenient behavior.
+        if not agentic_mode and not development_mode:
+            logger.error(
+                "Security validator not available in middleware context; "
+                "blocking request (fail-closed, production)",
+                user_id=user_id,
+            )
+            return  # Block processing (wrapper raises ApplicationHandlerStop)
+        logger.error("Security validator not available in middleware context")
+        # Agentic mode or development: continue without validation.
+        return await handler(event, data)
 
     # For callback queries, ``effective_message`` is the bot's own message that
     # carries the inline keyboard, not user-supplied input — validating its text
@@ -99,33 +168,14 @@ async def validate_message_content(
 ) -> tuple[bool, str]:
     """Validate message text content for security threats."""
 
-    # Check for command injection patterns. The backtick pattern is scoped
-    # to *dangerous* commands inside backticks (rm/curl/wget/etc.) so users
-    # can still discuss code snippets using inline code formatting.
-    dangerous_patterns = [
-        r";\s*rm\s+",
-        r";\s*del\s+",
-        r";\s*format\s+",
-        r"`[^`]*\b(?:rm|curl|wget|chmod|chown|nc|bash|sh)\s+[^`]*`",
-        r"\$\([^)]*\)",
-        r"&&\s*rm\s+",
-        r"\|\s*mail\s+",
-        r">\s*/dev/",
-        r"curl\s+.*\|\s*sh",
-        r"wget\s+.*\|\s*sh",
-        r"exec\s*\(",
-        r"eval\s*\(",
-    ]
-
-    import re
-
-    for pattern in dangerous_patterns:
-        if re.search(pattern, text, re.IGNORECASE):
+    # Check for command injection patterns (compiled at module level).
+    for pattern in _DANGEROUS_PATTERNS:
+        if pattern.search(text):
             if audit_logger:
                 await audit_logger.log_security_violation(
                     user_id=user_id,
                     violation_type="command_injection_attempt",
-                    details=f"Dangerous pattern detected: {pattern}",
+                    details=f"Dangerous pattern detected: {pattern.pattern}",
                     severity="high",
                     attempted_action="message_send",
                 )
@@ -133,30 +183,20 @@ async def validate_message_content(
             logger.warning(
                 "Command injection attempt detected",
                 user_id=user_id,
-                pattern=pattern,
+                pattern=pattern.pattern,
                 text_preview=text[:100],
             )
             return False, "Command injection attempt"
 
-    # Check for path traversal attempts. These patterns intentionally
-    # require a command-like context (start of message, separator, or a
-    # cd/rm/cat-style command prefix) so legitimate references such as
-    # "see ../README.md" or "/etc/hosts is documented in ..." are not
-    # blocked. The authoritative path check still happens in
-    # ``SecurityValidator.validate_path`` for actual file operations.
-    path_traversal_patterns = [
-        r"(?:^|[;&|]|\b(?:cd|cat|rm|mv|cp|ls|less|head|tail)\s+)\.\./",
-        r"(?:^|[;&|]\s*)~/",
-        r"(?:^|[;&|]|\b(?:cd|cat|rm|mv|cp|ls|less|head|tail)\s+)/(?:etc|var|usr|sys|proc)/",
-    ]
-
-    for pattern in path_traversal_patterns:
-        if re.search(pattern, text):
+    # Check for path traversal attempts (compiled at module level,
+    # case-sensitive).
+    for pattern in _PATH_TRAVERSAL_PATTERNS:
+        if pattern.search(text):
             if audit_logger:
                 await audit_logger.log_security_violation(
                     user_id=user_id,
                     violation_type="path_traversal_attempt",
-                    details=f"Path traversal pattern detected: {pattern}",
+                    details=f"Path traversal pattern detected: {pattern.pattern}",
                     severity="high",
                     attempted_action="message_send",
                 )
@@ -164,37 +204,26 @@ async def validate_message_content(
             logger.warning(
                 "Path traversal attempt detected",
                 user_id=user_id,
-                pattern=pattern,
+                pattern=pattern.pattern,
                 text_preview=text[:100],
             )
             return False, "Path traversal attempt"
 
-    # Check for suspicious URLs or domains.
-    # Note: blanket TLD blocks (.ru/.tk/.ml) produce too many false positives
-    # for a Russian-speaking userbase and any project hosted on legitimate
-    # ccTLDs. Restrict to URL-shortener-style obfuscation and inline-script
-    # schemes that have no business use case here.
-    suspicious_patterns = [
-        r"https?://bit\.ly/",
-        r"https?://tinyurl\.com/",
-        r"https?://t\.co/",
-        r"https?://goo\.gl/",
-        r"javascript:",
-        r"data:text/html",
-    ]
-
-    for pattern in suspicious_patterns:
-        if re.search(pattern, text, re.IGNORECASE):
+    # Check for suspicious URLs or domains (compiled at module level).
+    for pattern in _SUSPICIOUS_PATTERNS:
+        if pattern.search(text):
             if audit_logger:
                 await audit_logger.log_security_violation(
                     user_id=user_id,
                     violation_type="suspicious_url",
-                    details=f"Suspicious URL pattern detected: {pattern}",
+                    details=f"Suspicious URL pattern detected: {pattern.pattern}",
                     severity="medium",
                     attempted_action="message_send",
                 )
 
-            logger.warning("Suspicious URL detected", user_id=user_id, pattern=pattern)
+            logger.warning(
+                "Suspicious URL detected", user_id=user_id, pattern=pattern.pattern
+            )
             return False, "Suspicious URL detected"
 
     # Sanitize content using security validator

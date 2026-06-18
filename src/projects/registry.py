@@ -59,7 +59,7 @@ def load_project_registry(
     approved_root = approved_directory.resolve()
     seen_slugs = set()
     seen_names = set()
-    seen_rel_paths = set()
+    seen_abs_paths: set[str] = set()
     projects: List[ProjectDefinition] = []
 
     for idx, raw in enumerate(raw_projects):
@@ -97,17 +97,17 @@ def load_project_registry(
                 f"is not a directory: {absolute_path}"
             )
 
-        rel_path_norm = str(rel_path)
+        abs_path_key = str(absolute_path)
         if slug in seen_slugs:
             raise ValueError(f"Duplicate project slug: {slug}")
         if name in seen_names:
             raise ValueError(f"Duplicate project name: {name}")
-        if rel_path_norm in seen_rel_paths:
-            raise ValueError(f"Duplicate project path: {rel_path_norm}")
+        if abs_path_key in seen_abs_paths:
+            raise ValueError(f"Duplicate project path: {rel_path_raw}")
 
         seen_slugs.add(slug)
         seen_names.add(name)
-        seen_rel_paths.add(rel_path_norm)
+        seen_abs_paths.add(abs_path_key)
 
         projects.append(
             ProjectDefinition(

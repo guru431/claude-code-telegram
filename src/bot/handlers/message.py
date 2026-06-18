@@ -706,6 +706,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Initialize prompt to avoid UnboundLocalError
     prompt: str = ""
 
+    # Initialize so the outer except can safely clean it up even when the
+    # failure happens before the progress message is created (~767 below).
+    progress_msg = None
+
     # Get services
     security_validator: Optional[SecurityValidator] = context.bot_data.get(
         "security_validator"
@@ -927,10 +931,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 )
 
     except Exception as e:
-        try:
-            await progress_msg.delete()
-        except Exception as delete_error:
-            logger.debug("Failed to delete progress message", error=str(delete_error))
+        if progress_msg:
+            try:
+                await progress_msg.delete()
+            except Exception as delete_error:
+                logger.debug(
+                    "Failed to delete progress message", error=str(delete_error)
+                )
 
         error_msg = f"❌ <b>Error processing file</b>\n\n{escape_html(str(e))}"
         await update.message.reply_text(error_msg, parse_mode="HTML")

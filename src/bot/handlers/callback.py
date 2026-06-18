@@ -122,11 +122,19 @@ async def handle_callback_query(
                 "❌ <b>Error Processing Action</b>\n\n"
                 "An error occurred while processing your request."
             )
-            if isinstance(query.message, Message):
-                await query.message.reply_text(text, parse_mode="HTML")
-            else:
-                await context.bot.send_message(
-                    query.from_user.id, text, parse_mode="HTML"
+            try:
+                if isinstance(query.message, Message):
+                    await query.message.reply_text(text, parse_mode="HTML")
+                else:
+                    await context.bot.send_message(
+                        query.from_user.id, text, parse_mode="HTML"
+                    )
+            except Exception as send_error:
+                logger.error(
+                    "Failed to deliver callback error fallback message",
+                    error=str(send_error),
+                    user_id=user_id,
+                    callback_data=data,
                 )
 
 

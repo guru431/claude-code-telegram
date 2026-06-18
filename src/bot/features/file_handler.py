@@ -370,7 +370,7 @@ class FileHandler:
                 type="archive",
                 prompt=prompt,
                 metadata={
-                    "file_count": len(list(extract_dir.rglob("*"))),
+                    "file_count": sum(1 for _ in extract_dir.rglob("*")),
                     "code_files": len(code_files),
                 },
             )

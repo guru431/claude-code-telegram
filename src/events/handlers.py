@@ -130,6 +130,10 @@ class AgentHandler:
                         originating_event_id=event.id,
                     )
                 )
+            # Empty content: intentionally publish nothing. Unlike a scheduled
+            # job, a webhook has no known target chat (chat_id=0 broadcasts to
+            # all configured notification chats), so an empty-result notice would
+            # be noise. Suppress it; the run is still recorded as processed below.
             # The run completed (even with empty output): mark done so the retry
             # sweep does not replay a successful delivery.
             await self._mark_webhook_processed(event.delivery_id)
@@ -180,6 +184,20 @@ class AgentHandler:
             )
 
         working_dir = event.working_directory or self.default_working_directory
+        # Defense-in-depth: a scheduled job's working_directory comes from
+        # persisted job config and is otherwise passed straight to run_command.
+        # Confine it to the default (approved) working directory; fall back to
+        # the default on any violation so a misconfigured/tampered job cannot
+        # run the agent outside the approved tree.
+        if not self._is_within_default(working_dir):
+            logger.warning(
+                "Scheduled job working_directory outside approved tree; "
+                "using default",
+                job_id=event.job_id,
+                requested=str(working_dir),
+                default=str(self.default_working_directory),
+            )
+            working_dir = self.default_working_directory
 
         try:
             async with self._semaphore:
@@ -231,6 +249,21 @@ class AgentHandler:
                     )
                 )
 
+    def _is_within_default(self, candidate: Path) -> bool:
+        """Return True when ``candidate`` is inside the default working dir.
+
+        The default working directory is the approved root for bus-driven runs.
+        Resolves both paths so traversal (``..``) and symlinks can't escape it.
+        Returns False on any resolution error so the caller falls back safely.
+        """
+        try:
+            resolved = candidate.resolve()
+            root = self.default_working_directory.resolve()
+            resolved.relative_to(root)
+            return True
+        except (ValueError, OSError):
+            return False
+
     async def _mark_webhook_processed(self, delivery_id: str) -> None:
         """Mark a webhook delivery as processed after a successful agent run.
 
@@ -267,23 +300,25 @@ class AgentHandler:
         now = datetime.now(UTC).isoformat()
         try:
             async with self.db_manager.get_connection() as conn:
-                await conn.execute(
-                    "UPDATE webhook_events SET attempts = attempts + 1, "
-                    "last_error = ?, last_attempt_at = ? WHERE delivery_id = ?",
-                    (error[:1000], now, delivery_id),
-                )
+                # Increment and read the new attempts count atomically via
+                # RETURNING (SQLite 3.35+) so a concurrent retry sweep can't read
+                # a stale count between a separate UPDATE and SELECT.
                 cursor = await conn.execute(
-                    "SELECT attempts FROM webhook_events WHERE delivery_id = ?",
-                    (delivery_id,),
+                    "UPDATE webhook_events SET attempts = attempts + 1, "
+                    "last_error = ?, last_attempt_at = ? WHERE delivery_id = ? "
+                    "RETURNING attempts",
+                    (error[:1000], now, delivery_id),
                 )
                 row = await cursor.fetchone()
                 attempts = int(row[0]) if row else 0
                 dead = attempts >= _MAX_WEBHOOK_ATTEMPTS
                 if dead:
+                    # Re-check the cap in the WHERE clause so the dead-letter
+                    # flip only ever applies once the threshold is durably met.
                     await conn.execute(
                         "UPDATE webhook_events SET processed = 2 "
-                        "WHERE delivery_id = ?",
-                        (delivery_id,),
+                        "WHERE delivery_id = ? AND attempts >= ?",
+                        (delivery_id, _MAX_WEBHOOK_ATTEMPTS),
                     )
                 await conn.commit()
                 return attempts, dead

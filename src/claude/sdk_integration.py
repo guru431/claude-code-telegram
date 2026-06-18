@@ -448,6 +448,12 @@ class ClaudeSDKManager:
                 # _run_client() closes over `messages` by reference, so clearing
                 # it here is seen by every new call.
                 messages.clear()
+                # Likewise reset captured stderr so a ProcessError's diagnostic
+                # log only reflects the failing attempt, not lines emitted by a
+                # previous (already-retried) attempt. `_stderr_callback` closes
+                # over `stderr_lines` by reference, so this clear is seen by the
+                # next client run.
+                stderr_lines.clear()
 
                 if attempt > 0:
                     delay = min(

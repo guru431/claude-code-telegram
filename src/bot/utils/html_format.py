@@ -96,7 +96,14 @@ def markdown_to_telegram_html(text: str) -> str:
     # --- 6. Links: [text](url) ---
     def _replace_link(m: re.Match) -> str:  # type: ignore[type-arg]
         label = m.group(1)
-        url = m.group(2).replace('"', "&quot;")
+        url = m.group(2)
+        # Allowlist URL schemes: only http(s) and tg are clickable.
+        # Reject javascript:, data:, etc. to prevent unsafe href injection.
+        scheme = url.split(":", 1)[0].strip().lower() if ":" in url else ""
+        if scheme not in ("http", "https", "tg"):
+            # Disallowed/relative scheme: emit label as plain (already-escaped) text.
+            return str(label)
+        url = url.replace('"', "&quot;")
         return f'<a href="{url}">{label}</a>'
 
     text = re.sub(

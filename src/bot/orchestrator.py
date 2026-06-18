@@ -6,6 +6,7 @@ classic mode, delegates to existing full-featured handlers.
 """
 
 import asyncio
+import contextlib
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -917,31 +918,31 @@ class MessageOrchestrator:
                         )
                     caption_sent = use_caption and not per_image_caption
                 else:
-                    media = []
-                    file_handles = []
-                    for idx, img in enumerate(photos[:10]):
-                        fh = open(img.path, "rb")  # noqa: SIM115
-                        file_handles.append(fh)
-                        media.append(
-                            InputMediaPhoto(
-                                media=fh,
-                                caption=caption if use_caption and idx == 0 else None,
-                                parse_mode=(
-                                    caption_parse_mode
-                                    if use_caption and idx == 0
-                                    else None
-                                ),
+                    # ExitStack closes every handle on exit — including the
+                    # case where open() fails partway through the loop, which a
+                    # plain try/finally around send_media_group would leak.
+                    with contextlib.ExitStack() as stack:
+                        media = []
+                        for idx, img in enumerate(photos[:10]):
+                            fh = stack.enter_context(open(img.path, "rb"))
+                            media.append(
+                                InputMediaPhoto(
+                                    media=fh,
+                                    caption=(
+                                        caption if use_caption and idx == 0 else None
+                                    ),
+                                    parse_mode=(
+                                        caption_parse_mode
+                                        if use_caption and idx == 0
+                                        else None
+                                    ),
+                                )
                             )
-                        )
-                    try:
                         await update.message.chat.send_media_group(
                             media=media,
                             reply_to_message_id=reply_to_message_id,
                         )
                         caption_sent = use_caption
-                    finally:
-                        for fh in file_handles:
-                            fh.close()
             except Exception as e:
                 logger.warning("Failed to send photo album", error=str(e))
 
@@ -1089,9 +1090,7 @@ class MessageOrchestrator:
             else:
                 # Charge the real cost so claude_max_cost_per_user is enforced.
                 if rate_limiter:
-                    await rate_limiter.record_actual_cost(
-                        user_id, claude_response.cost
-                    )
+                    await rate_limiter.record_actual_cost(user_id, claude_response.cost)
 
                 # Track directory changes
                 from .handlers.message import (
@@ -1979,9 +1978,7 @@ class MessageOrchestrator:
             return
 
         if not rows:
-            await update.message.reply_text(
-                "No failed or retrying webhook events."
-            )
+            await update.message.reply_text("No failed or retrying webhook events.")
             return
 
         state_icon = {0: "⏳ retry", 1: "✅ recovered", 2: "💀 dead"}
@@ -2102,7 +2099,7 @@ class MessageOrchestrator:
                 display_path = Path(sess.cwd).name or sess.cwd
 
             short_id = sess.session_id[:8]
-            mtime = datetime.fromtimestamp(sess.jsonl_path.stat().st_mtime, tz=UTC)
+            mtime = datetime.fromtimestamp(sess.mtime, tz=UTC)
             age = datetime.now(UTC) - mtime
             if age.days > 0:
                 age_str = f"{age.days}d ago"

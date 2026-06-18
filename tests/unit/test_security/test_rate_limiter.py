@@ -45,12 +45,15 @@ class TestRateLimitBucket:
             refill_rate=1.0,  # 1 token per second
         )
 
-        # Trigger refill by checking status
+        # get_status() reports the refilled count without mutating the bucket
         status = bucket.get_status()
 
         # Should have refilled ~5 tokens (5 seconds * 1 token/second)
-        assert bucket.tokens == 10  # Capped at capacity
-        assert status["tokens"] == 10
+        assert status["tokens"] == 10  # Capped at capacity
+
+        # _refill() is the mutating path that persists the refilled count
+        bucket._refill()
+        assert bucket.tokens == 10
 
     def test_wait_time_calculation(self):
         """Test wait time calculation when tokens not available."""

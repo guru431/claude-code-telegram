@@ -592,6 +592,41 @@ class ToolUsageRepository:
             )
             return cursor.lastrowid
 
+    async def save_tool_usages(
+        self,
+        tool_usages: List[ToolUsageModel],
+        conn: Optional[aiosqlite.Connection] = None,
+    ) -> None:
+        """Batch-insert tool usage rows in a single executemany.
+
+        When ``conn`` is supplied the inserts join the caller's transaction and
+        are not committed here.
+        """
+        if not tool_usages:
+            return
+        params = [
+            (
+                tool_usage.session_id,
+                tool_usage.message_id,
+                tool_usage.tool_name,
+                json.dumps(tool_usage.tool_input) if tool_usage.tool_input else None,
+                tool_usage.timestamp,
+                tool_usage.success,
+                tool_usage.error_message,
+            )
+            for tool_usage in tool_usages
+        ]
+        async with _conn_ctx(self.db, conn) as c:
+            await c.executemany(
+                """
+                INSERT INTO tool_usage
+                (session_id, message_id, tool_name, tool_input,
+                 timestamp, success, error_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+                params,
+            )
+
     async def purge_old_tool_usage(self, days: int) -> int:
         """Delete tool-usage rows older than ``days`` and return the count."""
         async with self.db.get_connection() as conn:
@@ -825,8 +860,8 @@ class AnalyticsRepository:
                 SELECT
                     COUNT(DISTINCT session_id) as total_sessions,
                     COUNT(*) as total_messages,
-                    SUM(cost) as total_cost,
-                    AVG(cost) as avg_cost,
+                    COALESCE(SUM(cost), 0) as total_cost,
+                    COALESCE(AVG(cost), 0) as avg_cost,
                     MAX(timestamp) as last_activity,
                     AVG(duration_ms) as avg_duration
                 FROM messages
@@ -889,7 +924,7 @@ class AnalyticsRepository:
                     COUNT(DISTINCT user_id) as total_users,
                     COUNT(DISTINCT session_id) as total_sessions,
                     COUNT(*) as total_messages,
-                    SUM(cost) as total_cost,
+                    COALESCE(SUM(cost), 0) as total_cost,
                     AVG(duration_ms) as avg_duration
                 FROM messages
             """)

@@ -138,8 +138,8 @@ class Storage:
 
                     # Save tool usage (FK-bound to sessions/messages).
                     if response.tools_used:
-                        for tool in response.tools_used:
-                            tool_usage = ToolUsageModel(
+                        tool_usages = [
+                            ToolUsageModel(
                                 id=None,
                                 session_id=session_id,
                                 message_id=message_id,
@@ -148,17 +148,15 @@ class Storage:
                                 timestamp=now,
                                 success=not response.is_error,
                                 error_message=(
-                                    response.error_type
-                                    if response.is_error
-                                    else None
+                                    response.error_type if response.is_error else None
                                 ),
                             )
-                            await self.tools.save_tool_usage(tool_usage, conn=conn)
+                            for tool in response.tools_used
+                        ]
+                        await self.tools.save_tool_usages(tool_usages, conn=conn)
 
                 # Update cost tracking (no session FK).
-                await self.costs.update_daily_cost(
-                    user_id, response.cost, conn=conn
-                )
+                await self.costs.update_daily_cost(user_id, response.cost, conn=conn)
 
                 # Update user stats (atomic increment to avoid lost updates
                 # under concurrent interactions). Session counters are owned by
@@ -192,6 +190,10 @@ class Storage:
                 is_allowed=False,  # Default to not allowed
             )
             await self.users.create_user(user)
+            # create_user is INSERT ON CONFLICT DO NOTHING and returns the
+            # passed-in (stale) object; re-read to reflect actual DB state
+            # (e.g. an existing row when a concurrent insert won the race).
+            user = await self.users.get_user(user_id) or user
 
         return user
 

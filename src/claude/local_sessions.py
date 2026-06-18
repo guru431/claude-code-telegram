@@ -36,6 +36,7 @@ class LocalSession:
     timestamp: datetime
     jsonl_path: Path
     first_message: str = ""
+    mtime: float = 0.0
 
 
 def _claude_projects_dir() -> Path:
@@ -238,40 +239,48 @@ def list_all_local_sessions(
     if not projects_dir.is_dir():
         return []
 
-    all_sessions: List[LocalSession] = []
-
+    # Collect (path, mtime) for every JSONL across all projects using only the
+    # cheap stat() call, then sort by mtime (newest first). This lets us parse
+    # the head of just the top entries instead of every file up front.
+    candidates: List[tuple[Path, float]] = []
     for project_dir in projects_dir.iterdir():
         if not project_dir.is_dir():
             continue
         for entry in project_dir.iterdir():
             if entry.suffix != ".jsonl" or not entry.is_file():
                 continue
+            candidates.append((entry, entry.stat().st_mtime))
 
-            session_id = entry.stem
-            first = _parse_session_head(entry)
-            if not first:
-                continue
+    candidates.sort(key=lambda c: c[1], reverse=True)
 
-            cwd = first.get("cwd", "")
-            # Skip sessions outside the approved directory when scoping.
-            if within is not None and (not cwd or not _is_within(Path(cwd), within)):
-                continue
-            ts_str = first.get("timestamp", "")
-            try:
-                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-            except (ValueError, AttributeError):
-                ts = datetime.fromtimestamp(entry.stat().st_mtime, tz=UTC)
+    sessions: List[LocalSession] = []
+    for entry, mtime in candidates:
+        if len(sessions) >= limit:
+            break
 
-            all_sessions.append(
-                LocalSession(
-                    session_id=session_id,
-                    cwd=cwd,
-                    timestamp=ts,
-                    jsonl_path=entry,
-                    first_message=first.get("first_message", ""),
-                )
+        first = _parse_session_head(entry)
+        if not first:
+            continue
+
+        cwd = first.get("cwd", "")
+        # Skip sessions outside the approved directory when scoping.
+        if within is not None and (not cwd or not _is_within(Path(cwd), within)):
+            continue
+        ts_str = first.get("timestamp", "")
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            ts = datetime.fromtimestamp(mtime, tz=UTC)
+
+        sessions.append(
+            LocalSession(
+                session_id=entry.stem,
+                cwd=cwd,
+                timestamp=ts,
+                jsonl_path=entry,
+                first_message=first.get("first_message", ""),
+                mtime=mtime,
             )
+        )
 
-    # Sort by file modification time, newest first
-    all_sessions.sort(key=lambda s: s.jsonl_path.stat().st_mtime, reverse=True)
-    return all_sessions[:limit]
+    return sessions

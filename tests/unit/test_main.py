@@ -26,7 +26,7 @@ def test_token_provider_secret_is_hashable(tmp_path):
         allowed_users="123",
         enable_token_auth=True,
         development_mode=True,
-        auth_token_secret="super-secret",
+        auth_token_secret="test-token-auth-secret-0123456789-abcdef",
     )
 
     providers = _build_auth_providers(config)
@@ -55,7 +55,7 @@ def test_token_auth_is_fail_closed_in_production(tmp_path):
         allowed_users="123",
         enable_token_auth=True,
         development_mode=False,
-        auth_token_secret="super-secret",
+        auth_token_secret="test-token-auth-secret-0123456789-abcdef",
     )
 
     with pytest.raises(ConfigurationError):

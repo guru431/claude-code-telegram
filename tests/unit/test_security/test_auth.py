@@ -137,7 +137,7 @@ class TestTokenAuthProvider:
     @pytest.fixture
     def provider(self):
         storage = InMemoryTokenStorage()
-        return TokenAuthProvider("secret123", storage)
+        return TokenAuthProvider("test-token-auth-secret-0123456789-abcdef",storage)
 
     async def test_generate_and_verify_token(self, provider):
         """Test token generation and verification."""
@@ -203,7 +203,7 @@ class TestAuthenticationManager:
     def auth_manager(self):
         whitelist_provider = WhitelistAuthProvider([123, 456])
         token_storage = InMemoryTokenStorage()
-        token_provider = TokenAuthProvider("secret123", token_storage)
+        token_provider = TokenAuthProvider("test-token-auth-secret-0123456789-abcdef",token_storage)
 
         return AuthenticationManager([whitelist_provider, token_provider])
 

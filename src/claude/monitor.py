@@ -127,6 +127,10 @@ _NETWORK_OR_INTERP_COMMANDS: Set[str] = {
     "bash",
     "sh",
     "zsh",
+    # ``source``/``.`` read and execute a script file in the current shell. Its
+    # path operand must stay inside the boundary (e.g. ``source /etc/passwd``).
+    "source",
+    ".",
     # Command launchers / evaluators: they run another command whose path we
     # cannot statically see, so force a boundary check rather than waving them
     # through as "unknown".
@@ -152,6 +156,8 @@ _INTERP_COMMANDS: Set[str] = {
     "bash",
     "sh",
     "zsh",
+    "source",
+    ".",
 }
 
 # Matches a ``scheme://`` prefix (http, https, ftp, file, …). Used to spot URL
@@ -196,6 +202,10 @@ _LAUNCHER_WRAPPERS: Set[str] = {
     "setsid",
     "ionice",
     "chrt",
+    # ``exec <cmd>`` replaces the shell with the wrapped command; it has no
+    # numeric/value operands, so strip it and re-classify the real command
+    # (``exec cat /etc/passwd`` must check ``cat``'s path).
+    "exec",
 }
 
 # Wrappers that take a numeric/value operand of their own *before* the wrapped
@@ -356,7 +366,10 @@ def check_bash_directory_boundary(
         if not cmd_tokens:
             continue
 
-        base_command = Path(cmd_tokens[0]).name
+        # ``Path(".").name`` is the empty string, which would never match the
+        # interpreter sets — preserve the bare ``.`` (the POSIX "dot"/source
+        # builtin) so ``. /etc/passwd`` is classified and path-checked.
+        base_command = "." if cmd_tokens[0] == "." else Path(cmd_tokens[0]).name
 
         # Redirection targets are filesystem paths the command writes to / reads
         # from regardless of the lead command. Validate the token after each
