@@ -101,6 +101,12 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
             if lock is None:
                 if len(self._user_locks) >= self._MAX_USER_LOCKS:
                     self._evict_idle_locks()
+                    # If every tracked lock is currently held, eviction freed
+                    # nothing; fall back to the shared lock rather than grow the
+                    # map past the cap. This hard-bounds _user_locks at
+                    # _MAX_USER_LOCKS even under flood.
+                    if len(self._user_locks) >= self._MAX_USER_LOCKS:
+                        return self._fallback_lock
                 lock = asyncio.Lock()
                 self._user_locks[user_id] = lock
             return lock

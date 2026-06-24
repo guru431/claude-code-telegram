@@ -60,6 +60,7 @@ class DraftStreamer:
         self.throttle_interval = throttle_interval
 
         self._tool_lines: List[str] = []
+        self._tool_overflow = 0
         self._accumulated_text = ""
         self._last_send_time = 0.0
         self._enabled = True
@@ -69,6 +70,10 @@ class DraftStreamer:
         if not self._enabled or not line:
             return
         self._tool_lines.append(line)
+        if len(self._tool_lines) > _MAX_TOOL_LINES:
+            trimmed = len(self._tool_lines) - _MAX_TOOL_LINES
+            self._tool_lines = self._tool_lines[-_MAX_TOOL_LINES:]
+            self._tool_overflow += trimmed
         now = time.time()
         if (now - self._last_send_time) >= self.throttle_interval:
             await self._send_draft()
@@ -96,7 +101,7 @@ class DraftStreamer:
 
         if self._tool_lines:
             visible = self._tool_lines[-_MAX_TOOL_LINES:]
-            overflow = len(self._tool_lines) - _MAX_TOOL_LINES
+            overflow = self._tool_overflow + (len(self._tool_lines) - _MAX_TOOL_LINES)
             if overflow >= 3:
                 parts.append(f"... +{overflow} more")
             parts.extend(visible)

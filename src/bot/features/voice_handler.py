@@ -98,7 +98,9 @@ class VoiceHandler:
         prompt = f"{label}\n\n{transcription}"
 
         dur = voice.duration
-        duration_secs = int(dur.total_seconds()) if isinstance(dur, timedelta) else dur
+        duration_secs = (
+            int(dur.total_seconds()) if isinstance(dur, timedelta) else dur or 0
+        )
 
         return ProcessedVoice(
             prompt=prompt,

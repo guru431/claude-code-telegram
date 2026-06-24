@@ -1,5 +1,6 @@
 """Bash directory boundary enforcement for Claude tool calls."""
 
+import os
 import re
 import shlex
 from pathlib import Path
@@ -214,6 +215,15 @@ _LAUNCHER_WRAPPERS: Set[str] = {
 # single bare numeric operand so the real command lands as the base command.
 _WRAPPERS_WITH_NUMERIC_OPERAND: Set[str] = {"timeout", "nice", "ionice", "chrt"}
 
+# Separated flags that take an argument of their own (the next token) for
+# wrappers *outside* _WRAPPERS_WITH_NUMERIC_OPERAND. Without dropping the
+# operand too, ``sudo -u user cat /etc/passwd`` leaves ``user`` as the base
+# command and the real ``cat /etc/passwd`` is never checked.
+_WRAPPER_OPERAND_FLAGS: dict[str, Set[str]] = {
+    "sudo": {"-u", "-g", "-C", "-h", "-p", "-r", "-t", "-U", "-c"},
+    "doas": {"-u", "-C"},
+}
+
 
 def _strip_launcher_wrappers(cmd_tokens: list[str]) -> list[str]:
     """Strip leading launcher wrappers (and their own flags/operands).
@@ -240,6 +250,15 @@ def _strip_launcher_wrappers(cmd_tokens: list[str]) -> list[str]:
                 and not cmd_tokens[0].startswith("-")
             ):
                 cmd_tokens = cmd_tokens[1:]
+            # For non-numeric wrappers (``sudo -u user cmd``), drop the operand
+            # that follows an argument-taking flag so the *wrapped* command — not
+            # the flag's value — becomes the base command.
+            elif (
+                flag in _WRAPPER_OPERAND_FLAGS.get(wrapper, set())
+                and cmd_tokens
+                and not cmd_tokens[0].startswith("-")
+            ):
+                cmd_tokens = cmd_tokens[1:]
         # ``timeout``/``chrt`` take a bare positional operand (``timeout 5``,
         # ``chrt 99`` rare) before the command; drop a single leading numeric.
         if (
@@ -259,6 +278,22 @@ _COMMAND_SEPARATORS: Set[str] = {"&&", "||", ";", "|", "&"}
 # and must be boundary-checked even when the lead command takes no path of its
 # own (``echo``). shlex.split keeps these as standalone tokens.
 _REDIRECTION_OPERATORS: Set[str] = {">", ">>", "<", "<>", ">|", "&>", "&>>"}
+
+# Path-bearing option flags per command. Their value is a filesystem path the
+# utility writes to / reads from, but it hides behind a ``-`` so the generic
+# "skip anything starting with ``-``" rule would wave it through. We check the
+# value in every form: separated (``-t DIR``), bundled (``-tDIR``), and long
+# (``--target-directory=DIR`` / ``--target-directory DIR``).
+_PATH_BEARING_FLAGS: dict[str, dict[str, str]] = {
+    "cp": {"-t": "--target-directory"},
+    "mv": {"-t": "--target-directory"},
+    "ln": {"-t": "--target-directory"},
+    "install": {"-t": "--target-directory"},
+    "wget": {"-O": "--output-document", "-P": "--directory-prefix"},
+    "curl": {"-o": "--output"},
+    "tar": {"-C": "--directory", "-f": "--file"},
+    "sort": {"-o": "--output"},
+}
 
 # Bash subshell / command-substitution patterns. shlex.split silently absorbs
 # these into a token (e.g. "$(rm -rf /)" becomes a single token), bypassing
@@ -301,9 +336,14 @@ def check_bash_directory_boundary(
         try:
             line_tokens = shlex.split(line)
         except ValueError:
-            # If we can't parse the line, let it through —
-            # the sandbox will catch it at the OS level
-            return True, None
+            # A command we cannot tokenize (e.g. an unclosed quote) cannot be
+            # boundary-checked at all. Deny by default rather than fail open —
+            # otherwise any malformed command bypasses the check whenever the OS
+            # sandbox is disabled.
+            return False, (
+                "Directory boundary violation: command could not be parsed for "
+                "path validation and is not allowed"
+            )
         if tokens and line_tokens:
             # Treat the line break as a separator between chains.
             tokens.append(";")
@@ -332,10 +372,14 @@ def check_bash_directory_boundary(
     def _path_escapes(path_token: str) -> bool:
         """Return True if *path_token* resolves outside the approved directory."""
         try:
-            if path_token.startswith("/"):
-                resolved = Path(path_token).resolve()
+            # Expand ``~`` / ``~user`` the way bash does before resolving — shlex
+            # leaves the tilde literal, so without this ``> ~/.ssh/authorized_keys``
+            # would resolve to a literal ``~`` subdir inside the boundary.
+            expanded = os.path.expanduser(path_token)
+            if expanded.startswith("/"):
+                resolved = Path(expanded).resolve()
             else:
-                resolved = (working_directory / path_token).resolve()
+                resolved = (working_directory / expanded).resolve()
             return not _is_within_directory(resolved, resolved_approved)
         except (ValueError, OSError):
             # Unresolvable: rely on the OS-level sandbox rather than guessing.
@@ -432,8 +476,14 @@ def check_bash_directory_boundary(
                     )
 
         # Check each argument for paths outside the boundary
+        path_flags = _PATH_BEARING_FLAGS.get(base_command, {})
         seen_double_dash = False
-        for token in cmd_tokens[1:]:
+        rest_tokens = cmd_tokens[1:]
+        idx = 0
+        path_value: Optional[str]
+        while idx < len(rest_tokens):
+            token = rest_tokens[idx]
+            idx += 1
             # ``--`` marks the end of options; everything after is a positional
             # argument and must be path-checked even if it starts with ``-``.
             if token == "--" and not seen_double_dash:
@@ -453,6 +503,32 @@ def check_bash_directory_boundary(
                             f"validated against approved directory "
                             f"'{resolved_approved}'"
                         )
+                # Path-bearing flags hide a target path inside/after the option.
+                # Pull out the value in whichever form it appears and fall through
+                # to the boundary check; otherwise the flag is skipped as usual.
+                path_value = None
+                if path_flags:
+                    short_set = set(path_flags)
+                    long_set = set(path_flags.values())
+                    name = token.split("=", 1)[0]
+                    if "=" in token and name in long_set:
+                        # ``--target-directory=DIR``
+                        path_value = token.split("=", 1)[1]
+                    elif token in long_set or token in short_set:
+                        # Separated form ``--target-directory DIR`` / ``-t DIR``:
+                        # the value is the next token.
+                        if idx < len(rest_tokens):
+                            path_value = rest_tokens[idx]
+                            idx += 1
+                    elif len(token) > 2 and token[1] != "-" and token[:2] in short_set:
+                        # Bundled form ``-tDIR``.
+                        path_value = token[2:]
+                if path_value and _path_escapes(path_value):
+                    return False, (
+                        f"Directory boundary violation: '{base_command}' "
+                        f"targets '{path_value}' which is outside approved "
+                        f"directory '{resolved_approved}'"
+                    )
                 continue
 
             # A ``scheme://`` argument to a network command (curl/wget/fetch …)
@@ -493,12 +569,15 @@ def check_bash_directory_boundary(
 
             # Resolve both absolute and relative paths against the working
             # directory so that traversal sequences like ``../../evil`` are
-            # caught instead of being silently allowed.
+            # caught instead of being silently allowed. Expand ``~``/``~user``
+            # first (bash does, shlex doesn't) so ``cat ~/.ssh/id_rsa`` is not
+            # treated as a literal ``~`` subdir inside the boundary.
             try:
-                if token.startswith("/"):
-                    resolved = Path(token).resolve()
+                expanded_token = os.path.expanduser(token)
+                if expanded_token.startswith("/"):
+                    resolved = Path(expanded_token).resolve()
                 else:
-                    resolved = (working_directory / token).resolve()
+                    resolved = (working_directory / expanded_token).resolve()
 
                 if not _is_within_directory(resolved, resolved_approved):
                     return False, (
@@ -518,7 +597,9 @@ def check_bash_directory_boundary(
 def _is_claude_internal_path(file_path: str) -> bool:
     """Check whether *file_path* points inside ``~/.claude/`` (allowed subdirs only)."""
     try:
-        resolved = Path(file_path).resolve()
+        # Expand ``~``/``~user`` first so ``~/.claude/plans/...`` is recognized
+        # as an internal path (Path.resolve leaves the tilde literal).
+        resolved = Path(os.path.expanduser(file_path)).resolve()
         home = Path.home().resolve()
         claude_dir = home / ".claude"
 

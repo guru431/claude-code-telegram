@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import List, Optional
 
+import aiosqlite
 import structlog
 
 from ..claude.session import ClaudeSession, SessionStorage
@@ -24,40 +25,49 @@ class SQLiteSessionStorage(SessionStorage):
         self.db_manager = db_manager
 
     async def _ensure_user_exists(
-        self, user_id: int, username: Optional[str] = None
+        self,
+        conn: aiosqlite.Connection,
+        user_id: int,
+        username: Optional[str] = None,
     ) -> None:
-        """Ensure user exists in database before creating session."""
-        async with self.db_manager.get_connection() as conn:
-            # Check if user exists
+        """Ensure user exists in database before creating session.
+
+        Runs on the caller-supplied ``conn`` so the user-insert and the
+        session-upsert share a single transaction; the caller owns the commit.
+        This prevents a committed orphan user row when the session upsert fails.
+        """
+        # Check if user exists
+        cursor = await conn.execute(
+            "SELECT user_id FROM users WHERE user_id = ?", (user_id,)
+        )
+        user_exists = await cursor.fetchone()
+
+        if not user_exists:
+            # Create user record. ``is_allowed`` defaults to FALSE in
+            # the schema — authorization is granted by the
+            # ``AuthenticationManager`` (whitelist/token providers),
+            # not by the act of creating a session record. Leaving it
+            # FALSE here prevents this code path from acting as an
+            # implicit allowlist bypass.
+            now = datetime.now(UTC)
             cursor = await conn.execute(
-                "SELECT user_id FROM users WHERE user_id = ?", (user_id,)
+                """
+                INSERT INTO users
+                (user_id, telegram_username, first_seen, last_active)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO NOTHING
+                """,
+                (
+                    user_id,
+                    username,
+                    now,
+                    now,
+                ),
             )
-            user_exists = await cursor.fetchone()
 
-            if not user_exists:
-                # Create user record. ``is_allowed`` defaults to FALSE in
-                # the schema — authorization is granted by the
-                # ``AuthenticationManager`` (whitelist/token providers),
-                # not by the act of creating a session record. Leaving it
-                # FALSE here prevents this code path from acting as an
-                # implicit allowlist bypass.
-                now = datetime.now(UTC)
-                await conn.execute(
-                    """
-                    INSERT INTO users
-                    (user_id, telegram_username, first_seen, last_active)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(user_id) DO NOTHING
-                    """,
-                    (
-                        user_id,
-                        username,
-                        now,
-                        now,
-                    ),
-                )
-                await conn.commit()
-
+            # Only log a genuine insert: ON CONFLICT DO NOTHING reports
+            # rowcount 0 when a concurrent insert already created the row.
+            if cursor.rowcount:
                 logger.info(
                     "Created user record for session",
                     user_id=user_id,
@@ -66,9 +76,6 @@ class SQLiteSessionStorage(SessionStorage):
 
     async def save_session(self, session: ClaudeSession) -> None:
         """Save session to database."""
-        # Ensure user exists before creating session
-        await self._ensure_user_exists(session.user_id)
-
         session_model = SessionModel(
             session_id=session.session_id,
             user_id=session.user_id,
@@ -81,6 +88,10 @@ class SQLiteSessionStorage(SessionStorage):
         )
 
         async with self.db_manager.get_connection() as conn:
+            # Ensure the user row exists in the SAME transaction as the session
+            # upsert so a failed upsert cannot leave a committed orphan user.
+            await self._ensure_user_exists(conn, session.user_id)
+
             # Single race-safe upsert: avoids the UPDATE-then-INSERT PK race of
             # two separate pooled connections, and restores is_active=TRUE so a
             # session marked inactive by cleanup/eviction becomes visible to

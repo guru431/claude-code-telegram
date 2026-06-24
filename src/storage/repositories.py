@@ -9,7 +9,7 @@ Features:
 import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 import aiosqlite
 import structlog
@@ -66,7 +66,7 @@ class UserRepository:
     async def create_user(self, user: UserModel) -> UserModel:
         """Create new user."""
         async with self.db.get_connection() as conn:
-            await conn.execute(
+            cursor = await conn.execute(
                 """
                 INSERT INTO users
                 (user_id, telegram_username, first_seen,
@@ -84,9 +84,12 @@ class UserRepository:
             )
             await conn.commit()
 
-            logger.info(
-                "Created user", user_id=user.user_id, username=user.telegram_username
-            )
+            if cursor.rowcount:
+                logger.info(
+                    "Created user",
+                    user_id=user.user_id,
+                    username=user.telegram_username,
+                )
             return user
 
     async def update_user(self, user: UserModel):
@@ -539,7 +542,9 @@ class MessageRepository:
             rows = await cursor.fetchall()
             return [MessageModel.from_row(row) for row in rows]
 
-    async def get_recent_messages(self, hours: int = 24) -> List[MessageModel]:
+    async def get_recent_messages(
+        self, hours: int = 24, limit: int = 1000
+    ) -> List[MessageModel]:
         """Get recent messages."""
         async with self.db.get_connection() as conn:
             cursor = await conn.execute(
@@ -547,8 +552,9 @@ class MessageRepository:
                 SELECT * FROM messages
                 WHERE datetime(timestamp) > datetime('now', '-' || ? || ' hours')
                 ORDER BY timestamp DESC
+                LIMIT ?
             """,
-                (hours,),
+                (hours, limit),
             )
             rows = await cursor.fetchall()
             return [MessageModel.from_row(row) for row in rows]
@@ -642,7 +648,9 @@ class ToolUsageRepository:
             logger.info("Purged old tool usage", count=affected, days=days)
             return affected
 
-    async def get_session_tool_usage(self, session_id: str) -> List[ToolUsageModel]:
+    async def get_session_tool_usage(
+        self, session_id: str, limit: int = 1000
+    ) -> List[ToolUsageModel]:
         """Get tool usage for session."""
         async with self.db.get_connection() as conn:
             cursor = await conn.execute(
@@ -650,13 +658,16 @@ class ToolUsageRepository:
                 SELECT * FROM tool_usage
                 WHERE session_id = ?
                 ORDER BY timestamp DESC
+                LIMIT ?
             """,
-                (session_id,),
+                (session_id, limit),
             )
             rows = await cursor.fetchall()
             return [ToolUsageModel.from_row(row) for row in rows]
 
-    async def get_user_tool_usage(self, user_id: int) -> List[ToolUsageModel]:
+    async def get_user_tool_usage(
+        self, user_id: int, limit: int = 1000
+    ) -> List[ToolUsageModel]:
         """Get tool usage for user."""
         async with self.db.get_connection() as conn:
             cursor = await conn.execute(
@@ -665,13 +676,14 @@ class ToolUsageRepository:
                 JOIN sessions s ON tu.session_id = s.session_id
                 WHERE s.user_id = ?
                 ORDER BY tu.timestamp DESC
+                LIMIT ?
             """,
-                (user_id,),
+                (user_id, limit),
             )
             rows = await cursor.fetchall()
             return [ToolUsageModel.from_row(row) for row in rows]
 
-    async def get_tool_stats(self) -> List[Dict[str, any]]:
+    async def get_tool_stats(self) -> List[Dict[str, Any]]:
         """Get tool usage statistics."""
         async with self.db.get_connection() as conn:
             cursor = await conn.execute("""
@@ -783,7 +795,7 @@ class CostTrackingRepository:
         self,
         user_id: int,
         cost: float,
-        date: str = None,
+        date: Optional[str] = None,
         conn: Optional[aiosqlite.Connection] = None,
     ):
         """Update daily cost for user.
@@ -823,7 +835,7 @@ class CostTrackingRepository:
             rows = await cursor.fetchall()
             return [CostTrackingModel.from_row(row) for row in rows]
 
-    async def get_total_costs(self, days: int = 30) -> List[Dict[str, any]]:
+    async def get_total_costs(self, days: int = 30) -> List[Dict[str, Any]]:
         """Get total costs by day."""
         async with self.db.get_connection() as conn:
             cursor = await conn.execute(
@@ -851,7 +863,7 @@ class AnalyticsRepository:
         """Initialize repository."""
         self.db = db_manager
 
-    async def get_user_stats(self, user_id: int) -> Dict[str, any]:
+    async def get_user_stats(self, user_id: int) -> Dict[str, Any]:
         """Get user statistics."""
         async with self.db.get_connection() as conn:
             # User summary
@@ -915,7 +927,7 @@ class AnalyticsRepository:
                 "top_tools": top_tools,
             }
 
-    async def get_system_stats(self) -> Dict[str, any]:
+    async def get_system_stats(self) -> Dict[str, Any]:
         """Get system-wide statistics."""
         async with self.db.get_connection() as conn:
             # Overall stats

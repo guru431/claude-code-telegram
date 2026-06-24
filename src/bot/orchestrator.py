@@ -7,6 +7,7 @@ classic mode, delegates to existing full-featured handlers.
 
 import asyncio
 import contextlib
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -99,6 +100,18 @@ class MessageOrchestrator:
         self.deps = deps
         self._known_commands: frozenset[str] = frozenset()
         self._active_requests: Dict[int, ActiveRequest] = {}
+        # Per-user lock serializing in-flight requests so a second concurrent
+        # request can't clobber the first's ActiveRequest (orphaning its
+        # heartbeat/progress message and stealing its Stop button).
+        self._request_locks: Dict[int, asyncio.Lock] = {}
+
+    def _get_request_lock(self, user_id: int) -> asyncio.Lock:
+        """Return (creating if needed) the per-user request serialization lock."""
+        lock = self._request_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._request_locks[user_id] = lock
+        return lock
 
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
         """Wrap handler to inject dependencies into context.bot_data."""
@@ -188,7 +201,7 @@ class MessageOrchestrator:
         thread_states = context.user_data.setdefault("thread_state", {})
         state = thread_states.get(state_key, {})
 
-        project_root = project.absolute_path
+        project_root = project.absolute_path.resolve()
         current_dir_raw = state.get("current_directory")
         current_dir = (
             Path(current_dir_raw).resolve() if current_dir_raw else project_root
@@ -639,7 +652,7 @@ class MessageOrchestrator:
         if not activity_log:
             return "Working..."
 
-        elapsed = time.time() - start_time
+        elapsed = time.monotonic() - start_time
         lines: List[str] = [f"Working... ({elapsed:.0f}s)\n"]
 
         for entry in activity_log[-15:]:  # Show last 15 entries max
@@ -684,15 +697,21 @@ class MessageOrchestrator:
             if cmd:
                 return redact_secrets(cmd[:100])[:80]
         if tool_name in ("WebFetch", "WebSearch"):
-            return (tool_input.get("url", "") or tool_input.get("query", ""))[:60]
+            url = tool_input.get("url", "")
+            if url:
+                # URL query params often carry tokens that don't match the
+                # generic secret patterns — mask every query-string value.
+                url = re.sub(r"([?&][^=&\s]+=)[^&\s]+", r"\1***", url)
+                return redact_secrets(url[:200])[:60]
+            return redact_secrets(tool_input.get("query", "")[:200])[:60]
         if tool_name == "Task":
             desc = tool_input.get("description", "")
             if desc:
-                return desc[:60]
+                return redact_secrets(desc[:200])[:60]
         # Generic: show first key's value
         for v in tool_input.values():
             if isinstance(v, str) and v:
-                return v[:60]
+                return redact_secrets(v[:200])[:60]
         return ""
 
     @staticmethod
@@ -943,6 +962,11 @@ class MessageOrchestrator:
                             reply_to_message_id=reply_to_message_id,
                         )
                         caption_sent = use_caption
+                    if len(photos) > 10:
+                        await update.message.reply_text(
+                            f"Note: only the first 10 of {len(photos)} images "
+                            "were sent (Telegram album limit)."
+                        )
             except Exception as e:
                 logger.warning("Failed to send photo album", error=str(e))
 
@@ -997,6 +1021,11 @@ class MessageOrchestrator:
             "Working...", reply_markup=stop_kb
         )
 
+        # Serialize per-user requests so a second concurrent message can't
+        # clobber this one's ActiveRequest while it is still in flight.
+        request_lock = self._get_request_lock(user_id)
+        await request_lock.acquire()
+
         # Register active request so the stop callback can find it
         self._active_requests[user_id] = ActiveRequest(
             user_id=user_id,
@@ -1007,6 +1036,7 @@ class MessageOrchestrator:
         claude_integration = context.bot_data.get("claude_integration")
         if not claude_integration:
             self._active_requests.pop(user_id, None)
+            request_lock.release()
             await progress_msg.edit_text(
                 "Claude integration not available. Check configuration.",
                 reply_markup=None,
@@ -1024,7 +1054,7 @@ class MessageOrchestrator:
 
         # --- Verbose progress tracking via stream callback ---
         tool_log: List[Dict[str, Any]] = []
-        start_time = time.time()
+        start_time = time.monotonic()
         mcp_images: List[ImageAttachment] = []
 
         # Stream drafts (private chats only)
@@ -1140,6 +1170,7 @@ class MessageOrchestrator:
         finally:
             heartbeat.cancel()
             self._active_requests.pop(user_id, None)
+            request_lock.release()
             if draft_streamer:
                 try:
                     await draft_streamer.flush()
@@ -1278,7 +1309,12 @@ class MessageOrchestrator:
                     update.message.caption or "Please review this file:",
                 )
                 prompt = processed_file.prompt
-            except Exception:
+            except Exception as e:
+                logger.warning(
+                    "Enhanced file handler failed, falling back to basic",
+                    error=str(e),
+                    user_id=user_id,
+                )
                 file_handler = None
 
         if not file_handler:
@@ -1289,9 +1325,16 @@ class MessageOrchestrator:
                 if len(content) > 50000:
                     content = content[:50000] + "\n... (truncated)"
                 caption = update.message.caption or "Please review this file:"
+                # Pick a fence longer than any backtick run in the content so
+                # embedded triple-backticks can't close the block early and
+                # corrupt the prompt.
+                longest_run = max(
+                    (len(m) for m in re.findall(r"`+", content)), default=0
+                )
+                fence = "`" * max(3, longest_run + 1)
                 prompt = (
                     f"{caption}\n\n**File:** `{document.file_name}`\n\n"
-                    f"```\n{content}\n```"
+                    f"{fence}\n{content}\n{fence}"
                 )
             except UnicodeDecodeError:
                 await progress_msg.edit_text(
@@ -1463,6 +1506,10 @@ class MessageOrchestrator:
             await progress_msg.edit_reply_markup(reply_markup=stop_kb)
         except Exception:
             pass
+        # Serialize per-user requests so a second concurrent message can't
+        # clobber this one's ActiveRequest while it is still in flight.
+        request_lock = self._get_request_lock(user_id)
+        await request_lock.acquire()
         self._active_requests[user_id] = ActiveRequest(
             user_id=user_id,
             interrupt_event=interrupt_event,
@@ -1475,7 +1522,7 @@ class MessageOrchestrator:
             verbose_level,
             progress_msg,
             tool_log,
-            time.time(),
+            time.monotonic(),
             mcp_images=mcp_images_media,
             approved_directory=self.settings.approved_directory,
             reply_markup=stop_kb,
@@ -1506,6 +1553,7 @@ class MessageOrchestrator:
         finally:
             heartbeat.cancel()
             self._active_requests.pop(user_id, None)
+            request_lock.release()
 
         if force_new:
             context.user_data["force_new_session"] = False
@@ -1533,26 +1581,30 @@ class MessageOrchestrator:
             )
             return
 
-        rate_limiter = context.bot_data.get("rate_limiter")
-        if rate_limiter:
-            await rate_limiter.record_actual_cost(user_id, claude_response.cost)
-
-        _update_working_directory_from_claude_response(
-            claude_response, context, self.settings, user_id
-        )
-
-        formatter = ResponseFormatter(self.settings)
-        # Redact secrets from the response body before it leaves the bot —
-        # tool OUTPUT (e.g. a printenv dump) can land here.
-        response_content = redact_secrets(claude_response.content or "")
-        if claude_response.interrupted:
-            response_content = response_content + "\n\n_(Interrupted by user)_"
-        formatted_messages = formatter.format_claude_response(response_content)
-
+        # The run succeeded; from here on always clear the "Working..." message
+        # (with its Stop button) even if post-processing raises — otherwise the
+        # caller reports an error AND a stale progress message lingers.
         try:
-            await progress_msg.delete()
-        except Exception:
-            logger.debug("Failed to delete progress message, ignoring")
+            rate_limiter = context.bot_data.get("rate_limiter")
+            if rate_limiter:
+                await rate_limiter.record_actual_cost(user_id, claude_response.cost)
+
+            _update_working_directory_from_claude_response(
+                claude_response, context, self.settings, user_id
+            )
+
+            formatter = ResponseFormatter(self.settings)
+            # Redact secrets from the response body before it leaves the bot —
+            # tool OUTPUT (e.g. a printenv dump) can land here.
+            response_content = redact_secrets(claude_response.content or "")
+            if claude_response.interrupted:
+                response_content = response_content + "\n\n_(Interrupted by user)_"
+            formatted_messages = formatter.format_claude_response(response_content)
+        finally:
+            try:
+                await progress_msg.delete()
+            except Exception:
+                logger.debug("Failed to delete progress message, ignoring")
 
         # Use MCP-collected images (from send_image_to_user tool calls).
         images: List[ImageAttachment] = mcp_images_media
@@ -1591,13 +1643,23 @@ class MessageOrchestrator:
                         error=str(send_err),
                         message_index=i,
                     )
-                    await update.message.reply_text(
-                        message.text,
-                        reply_markup=None,
-                        reply_to_message_id=(
-                            update.message.message_id if i == 0 else None
-                        ),
-                    )
+                    try:
+                        await update.message.reply_text(
+                            message.text,
+                            reply_markup=None,
+                            reply_to_message_id=(
+                                update.message.message_id if i == 0 else None
+                            ),
+                        )
+                    except Exception as plain_err:
+                        await update.message.reply_text(
+                            f"Failed to deliver response "
+                            f"(Telegram error: {str(plain_err)[:150]}). "
+                            f"Please try again.",
+                            reply_to_message_id=(
+                                update.message.message_id if i == 0 else None
+                            ),
+                        )
                 if i < len(formatted_messages) - 1:
                     await asyncio.sleep(0.5)
 
@@ -1782,14 +1844,19 @@ class MessageOrchestrator:
             marker = " \u25c0" if d.name == current_name else ""
             lines.append(f"{icon} <code>{escape_html(d.name)}/</code>{marker}")
 
-        # Build inline keyboard (2 per row)
+        # Build inline keyboard (2 per row). Telegram caps callback_data at
+        # 64 UTF-8 bytes; a name that overflows would break the whole reply,
+        # so omit its button (the name still shows in the text list above).
         for i in range(0, len(entries), 2):
             row = []
             for j in range(2):
                 if i + j < len(entries):
                     name = entries[i + j].name
+                    if len(f"cd:{name}".encode("utf-8")) > 64:
+                        continue
                     row.append(InlineKeyboardButton(name, callback_data=f"cd:{name}"))
-            keyboard_rows.append(row)
+            if row:
+                keyboard_rows.append(row)
 
         reply_markup = InlineKeyboardMarkup(keyboard_rows)
 

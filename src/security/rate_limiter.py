@@ -8,10 +8,10 @@ Features:
 """
 
 import asyncio
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, Optional, Tuple
 
 import structlog
 
@@ -99,6 +99,11 @@ class RateLimiter:
         self.request_buckets: Dict[int, RateLimitBucket] = {}
         self.cost_tracker: Dict[int, float] = defaultdict(float)
         self.cost_reset_time: Dict[int, datetime] = {}
+        # Per-user FIFO of heuristic estimates charged by check_rate_limit but
+        # not yet reconciled against a real cost. record_actual_cost pops the
+        # matching estimate before adding actual spend so cost_tracker holds
+        # estimate-or-actual, never estimate+actual (no double-counting).
+        self.pending_estimates: Dict[int, Deque[float]] = defaultdict(deque)
         self.locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
         # Calculate refill rate from config
@@ -144,6 +149,10 @@ class RateLimiter:
             # If both checks pass, consume resources
             self._consume_request_tokens(user_id, tokens)
             self._track_cost(user_id, cost)
+            # Remember this estimate so record_actual_cost can swap it out for
+            # the real cost instead of stacking on top of it.
+            if cost > 0:
+                self.pending_estimates[user_id].append(cost)
 
             logger.debug(
                 "Rate limit check passed", user_id=user_id, cost=cost, tokens=tokens
@@ -233,6 +242,10 @@ class RateLimiter:
             old_cost = self.cost_tracker[user_id]
             self.cost_tracker[user_id] = 0
             self.cost_reset_time[user_id] = now
+            # Estimates charged before the reset are no longer in the (now
+            # zeroed) tracker; drop them so a late record_actual_cost can't
+            # back out a stale estimate against a fresh window.
+            self.pending_estimates.pop(user_id, None)
 
             if old_cost > 0:
                 logger.info(
@@ -258,17 +271,29 @@ class RateLimiter:
         return self.cost_tracker[user_id], self.cost_reset_time.get(user_id, now)
 
     async def record_actual_cost(self, user_id: int, cost: float) -> None:
-        """Add the *actual* cost of a completed request to the user's budget.
+        """Reconcile a completed request's *actual* cost against the estimate.
 
-        The pre-flight ``check_rate_limit`` only tracks a small heuristic
-        estimate; without this, ``claude_max_cost_per_user`` never reflects real
-        spend and the cap is cosmetic. Call this once the real
-        ``ClaudeResponse.cost`` is known. Costs of 0 or less are ignored.
+        The pre-flight ``check_rate_limit`` charges a small heuristic estimate
+        so the request rate is gated even before the real cost is known. Once
+        the real ``ClaudeResponse.cost`` is available, this swaps that estimate
+        out for the actual figure: it backs out the matching pending estimate
+        and then adds the actual cost, so ``cost_tracker`` reflects real spend
+        instead of estimate+actual (which would exhaust
+        ``claude_max_cost_per_user`` too fast). Costs of 0 or less are ignored.
         """
         if cost <= 0:
             return
         async with self.locks[user_id]:
             self._maybe_reset_cost_tracker(user_id)
+            # Back out the heuristic estimate previously charged for this
+            # request (FIFO). A daily reset may have already cleared it, so
+            # never drive cost_tracker negative.
+            pending = self.pending_estimates.get(user_id)
+            if pending:
+                estimate = pending.popleft()
+                self.cost_tracker[user_id] = max(
+                    0.0, self.cost_tracker[user_id] - estimate
+                )
             self._track_cost(user_id, cost)
 
     async def reset_user_limits(self, user_id: int) -> None:
@@ -278,6 +303,7 @@ class RateLimiter:
             old_cost = self.cost_tracker[user_id]
             self.cost_tracker[user_id] = 0
             self.cost_reset_time[user_id] = datetime.now(UTC)
+            self.pending_estimates.pop(user_id, None)
 
             # Reset request bucket
             if user_id in self.request_buckets:
@@ -345,6 +371,7 @@ class RateLimiter:
             self.request_buckets.pop(user_id, None)
             self.cost_tracker.pop(user_id, None)
             self.cost_reset_time.pop(user_id, None)
+            self.pending_estimates.pop(user_id, None)
             self.locks.pop(user_id, None)
 
         if inactive_users:

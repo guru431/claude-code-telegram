@@ -157,15 +157,15 @@ class SessionExporter:
         # Header
         lines.append("# Claude Code Session Export")
         lines.append(f"\n**Session ID:** `{session['id']}`")
-        lines.append(f"**Created:** {session['created_at']}")
+        lines.append(f"**Created:** {_iso(session.get('created_at'))}")
         if session.get("updated_at"):
-            lines.append(f"**Last Updated:** {session['updated_at']}")
+            lines.append(f"**Last Updated:** {_iso(session['updated_at'])}")
         lines.append(f"**Message Count:** {len(messages)}")
         lines.append("\n---\n")
 
         # Messages
         for msg in messages:
-            timestamp = msg["created_at"]
+            timestamp = _iso(msg.get("created_at"))
             role = "You" if msg["role"] == "user" else "Claude"
             content = msg["content"]
 

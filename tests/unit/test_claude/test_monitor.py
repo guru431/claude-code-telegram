@@ -152,13 +152,17 @@ class TestCheckBashDirectoryBoundary:
         assert valid
         assert error is None
 
-    def test_unparseable_command_passes_through(self) -> None:
-        """Malformed quoting should pass through (sandbox catches it at OS level)."""
+    def test_unparseable_command_denied(self) -> None:
+        """Malformed quoting can't be boundary-checked, so it's denied (fail-closed).
+
+        Failing open here would let any malformed command bypass the path check
+        whenever the OS sandbox is disabled; such input is invalid for bash too.
+        """
         valid, error = check_bash_directory_boundary(
             "mkdir 'unclosed quote", self.cwd, self.approved
         )
-        assert valid
-        assert error is None
+        assert not valid
+        assert "could not be parsed" in error
 
     def test_rm_outside_approved_directory(self) -> None:
         valid, error = check_bash_directory_boundary(

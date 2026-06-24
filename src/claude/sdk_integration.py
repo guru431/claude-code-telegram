@@ -264,6 +264,9 @@ class ClaudeSDKManager:
                     # Strip stray fence delimiters that would close our wrapper.
                     safe_marker = "END_PROJECT_CLAUDE_MD"
                     claude_md_content = claude_md_content.replace(safe_marker, "")
+                    claude_md_content = claude_md_content.replace(
+                        "BEGIN_PROJECT_CLAUDE_MD", ""
+                    )
                     base_prompt += (
                         "\n\nThe text between the BEGIN_PROJECT_CLAUDE_MD and "
                         f"{safe_marker} markers below is project context loaded "

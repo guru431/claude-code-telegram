@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import structlog
 import yaml
+
+logger = structlog.get_logger()
 
 
 @dataclass(frozen=True)
@@ -92,10 +95,13 @@ def load_project_registry(
             ) from e
 
         if not absolute_path.exists() or not absolute_path.is_dir():
-            raise ValueError(
-                f"Project '{slug}' path does not exist or "
-                f"is not a directory: {absolute_path}"
+            logger.warning(
+                "Project path does not exist or is not a directory, "
+                "skipping stale project",
+                slug=slug,
+                path=str(absolute_path),
             )
+            continue
 
         abs_path_key = str(absolute_path)
         if slug in seen_slugs:

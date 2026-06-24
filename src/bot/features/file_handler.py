@@ -9,6 +9,9 @@ Features:
 """
 
 import asyncio
+import bz2
+import gzip
+import lzma
 import shutil
 import sys
 import tarfile
@@ -18,7 +21,7 @@ import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from telegram import Document
 
@@ -39,7 +42,7 @@ class ProcessedFile:
 
     type: str
     prompt: str
-    metadata: Dict[str, any]
+    metadata: Dict[str, Any]
 
 
 @dataclass
@@ -234,8 +237,15 @@ class FileHandler:
         try:
             extract_dir_resolved = extract_dir.resolve()
 
+            # Lowercased name so the tar-compressed vs standalone-compressed
+            # distinction (e.g. ".tar.gz" vs a bare ".gz") works regardless of
+            # case. ``suffix`` only sees the last component, so a standalone
+            # ".gz" and a tar ".tar.gz" share the same suffix.
+            name_lower = archive_path.name.lower()
+            ext = archive_path.suffix.lower()
+
             # Extract based on type
-            if archive_path.suffix == ".zip":
+            if ext == ".zip":
                 with zipfile.ZipFile(archive_path) as zf:
                     # Security check - prevent zip bombs
                     if len(zf.filelist) > MAX_ARCHIVE_FILES:
@@ -285,7 +295,9 @@ class FileHandler:
                         ):
                             shutil.copyfileobj(source, target)
 
-            elif archive_path.suffix in {".tar", ".gz", ".bz2", ".xz"}:
+            elif ext == ".tar" or name_lower.endswith(
+                (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz")
+            ):
                 with tarfile.open(archive_path) as tf:
                     members = tf.getmembers()
                     if len(members) > MAX_ARCHIVE_FILES:
@@ -353,6 +365,42 @@ class FileHandler:
                                 except OSError:
                                     pass
                                 continue
+
+            elif ext in {".gz", ".bz2", ".xz"}:
+                # Standalone single-file compression (not a tar archive).
+                # tarfile.open would raise ReadError on these, so decompress
+                # the single member directly. The output name is the archive
+                # name with the compression suffix stripped.
+                if ext == ".gz":
+                    source = gzip.open(archive_path, "rb")
+                elif ext == ".bz2":
+                    source = bz2.open(archive_path, "rb")
+                else:
+                    source = lzma.open(archive_path, "rb")
+                out_name = archive_path.stem or f"file_{uuid.uuid4()}"
+                # Bare filename inside extract_dir (defense-in-depth; stem of a
+                # sanitized download is already a single component).
+                out_path = extract_dir / Path(out_name).name
+                limit = 100 * 1024 * 1024  # 100MB cap, matches archive limits
+                written = 0
+                with source, open(out_path, "wb") as target:
+                    while True:
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        if written > limit:
+                            raise ValueError("Archive too large")
+                        target.write(chunk)
+
+            elif ext == ".7z":
+                # No bundled 7z extractor and adding a dependency is out of
+                # scope; reject explicitly rather than silently analyzing an
+                # empty extraction directory.
+                raise ValueError("7z archives are not supported")
+
+            else:
+                raise ValueError(f"Unsupported archive type: {ext}")
 
             # Analyze contents
             file_tree = self._build_file_tree(extract_dir)

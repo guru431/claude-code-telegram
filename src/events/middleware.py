@@ -1,7 +1,8 @@
-"""Event bus middleware wrapping existing security and auth systems.
+"""Event bus audit middleware.
 
-Provides event-level validation before handlers process events,
-reusing SecurityValidator and AuthenticationManager.
+Logs bus events for audit purposes. This is log-only and not an
+enforcement gate -- see ``EventSecurityMiddleware`` for why, and for where
+the real signature/tool-level enforcement lives.
 """
 
 import structlog
@@ -15,10 +16,24 @@ logger = structlog.get_logger()
 
 
 class EventSecurityMiddleware:
-    """Validates events before they reach handlers.
+    """Audit logger for bus events; not an enforcement gate.
 
-    Wraps the existing SecurityValidator for path/input validation
-    and AuthenticationManager for user authentication.
+    This is deliberately log-only. Webhook payloads carry no user identity
+    or filesystem path to authenticate or validate, so ``SecurityValidator``
+    and ``AuthenticationManager`` have nothing meaningful to check here.
+    The bus also dispatches all matching handlers concurrently with
+    ``return_exceptions=True`` (see ``EventBus._dispatch``), so even a raised
+    error would not veto ``AgentHandler``. Actual enforcement lives upstream
+    and downstream of this audit point:
+
+    - API layer: GitHub HMAC-SHA256 signature / Bearer-token verification
+      and atomic deduplication before an event is ever published.
+    - Agent layer: webhook-driven runs use a read-only tool set
+      (``_WEBHOOK_READONLY_TOOLS`` in ``events.handlers``), and tool calls
+      are gated by the SDK ``can_use_tool`` callback / ``ToolMonitor``.
+
+    ``security`` and ``auth`` are retained for future per-user/path events
+    (e.g. authenticated bus sources) that would carry validatable fields.
     """
 
     def __init__(

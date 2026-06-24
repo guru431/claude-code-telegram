@@ -161,9 +161,15 @@ class Storage:
                 # Update user stats (atomic increment to avoid lost updates
                 # under concurrent interactions). Session counters are owned by
                 # SessionManager/SQLiteSessionStorage and must NOT be
-                # incremented here.
+                # incremented here. message_count is only bumped when the
+                # message row was actually stored (has_session), otherwise the
+                # counter would drift from the real stored rows.
                 await self.users.increment_stats(
-                    user_id, response.cost, messages=1, last_active=now, conn=conn
+                    user_id,
+                    response.cost,
+                    messages=1 if has_session else 0,
+                    last_active=now,
+                    conn=conn,
                 )
 
                 # Log audit event (no session FK).

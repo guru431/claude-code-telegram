@@ -5,6 +5,7 @@ to the event bus when jobs fire.
 """
 
 import sqlite3
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -78,23 +79,12 @@ class JobScheduler:
         """
         trigger = CronTrigger.from_crontab(cron_expression)
         work_dir = working_directory or self.default_working_directory
+        job_id = uuid.uuid4().hex
 
-        job = self._scheduler.add_job(
-            self._fire_event,
-            trigger=trigger,
-            kwargs={
-                "job_name": job_name,
-                "prompt": prompt,
-                "working_directory": str(work_dir),
-                "target_chat_ids": target_chat_ids or [],
-                "skill_name": skill_name,
-            },
-            name=job_name,
-        )
-
-        # Persist to database
+        # Persist to the database first so a scheduler-side failure cannot leave
+        # an in-memory-only job that is lost on restart.
         await self._save_job(
-            job_id=job.id,
+            job_id=job_id,
             job_name=job_name,
             cron_expression=cron_expression,
             prompt=prompt,
@@ -104,13 +94,33 @@ class JobScheduler:
             created_by=created_by,
         )
 
+        try:
+            self._scheduler.add_job(
+                self._fire_event,
+                trigger=trigger,
+                kwargs={
+                    "job_name": job_name,
+                    "prompt": prompt,
+                    "working_directory": str(work_dir),
+                    "target_chat_ids": target_chat_ids or [],
+                    "skill_name": skill_name,
+                },
+                id=job_id,
+                name=job_name,
+            )
+        except Exception:
+            # Roll back the persisted row so the DB does not keep a job that
+            # the scheduler refused to register.
+            await self._delete_job(job_id)
+            raise
+
         logger.info(
             "Scheduled job added",
-            job_id=job.id,
+            job_id=job_id,
             job_name=job_name,
             cron=cron_expression,
         )
-        return str(job.id)
+        return job_id
 
     async def remove_job(self, job_id: str) -> bool:
         """Remove a scheduled job."""

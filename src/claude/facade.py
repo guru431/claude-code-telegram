@@ -56,6 +56,11 @@ class ClaudeIntegration:
         session_manager: Optional[SessionManager] = None,
     ):
         """Initialize Claude integration facade."""
+        if session_manager is None:
+            raise ValueError(
+                "session_manager is required: ClaudeIntegration methods depend "
+                "on it and would otherwise raise AttributeError"
+            )
         self.config = config
         self.sdk_manager = sdk_manager or ClaudeSDKManager(config)
         self.session_manager = session_manager
@@ -269,9 +274,7 @@ class ClaudeIntegration:
         # context. A blank/unresolvable cwd is rejected (fail closed).
         if local and local.cwd:
             try:
-                same_dir = (
-                    Path(local.cwd).resolve() == working_directory.resolve()
-                )
+                same_dir = Path(local.cwd).resolve() == working_directory.resolve()
             except (ValueError, OSError):
                 same_dir = False
             if not same_dir:

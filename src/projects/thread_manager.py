@@ -1,6 +1,7 @@
 """Telegram forum topic synchronization and project resolution."""
 
 import asyncio
+import html
 from dataclasses import dataclass
 from time import monotonic
 from typing import Awaitable, Callable, Optional, TypeVar
@@ -138,6 +139,12 @@ class ProjectThreadManager:
                     )
                     result.closed += 1
                 except TelegramError as e:
+                    # Topic already deleted out of band: deletion succeeded in
+                    # effect. Count it and let the finally block deactivate the
+                    # mapping; do not misread it as "topics disabled".
+                    if self._is_topic_unusable_error(e):
+                        result.closed += 1
+                        continue
                     if self._is_private_topics_unavailable_error(e):
                         raise PrivateTopicsUnavailableError(
                             "Private chat topics are not enabled for this bot chat."
@@ -358,6 +365,11 @@ class ProjectThreadManager:
         if not mapping:
             return None
 
+        # A closed/deactivated topic must not bind messages to the project
+        # (strict routing); the topic is no longer a valid project channel.
+        if not mapping.is_active:
+            return None
+
         project = self.registry.get_by_slug(mapping.project_slug)
         if not project or not project.enabled:
             return None
@@ -446,7 +458,7 @@ class ProjectThreadManager:
                     chat_id=chat_id,
                     message_thread_id=message_thread_id,
                     text=(
-                        f"🧵 <b>{project_name}</b>\n\n"
+                        f"🧵 <b>{html.escape(project_name)}</b>\n\n"
                         "This project topic is ready. "
                         "Send messages here to work on this project."
                     ),

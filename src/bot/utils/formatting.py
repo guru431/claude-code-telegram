@@ -19,8 +19,8 @@ class FormattedMessage:
     reply_markup: Optional[InlineKeyboardMarkup] = None
 
     def __len__(self) -> int:
-        """Return length of message text."""
-        return len(self.text)
+        """Return length of message text in Telegram's UTF-16 units."""
+        return tg_len(self.text)
 
 
 class ResponseFormatter:
@@ -300,15 +300,25 @@ class ResponseFormatter:
         current_lines: List[str] = []
         current_length = 0
         in_code_block = False
+        # Actual opening tag (with class) so reopening preserves highlighting.
+        open_tag = "<pre><code>"
+        close_tag = "</code></pre>"
+        close_len = tg_len(close_tag)
 
         lines = text.split("\n")
 
         for line in lines:
             line_length = tg_len(line) + 1  # +1 for newline
 
-            # Track HTML <pre> code block state
+            # Track HTML <pre> code block state, remembering the real opening
+            # tag (which may carry a class="language-..." attribute).
             if "<pre>" in line or "<pre><code" in line:
                 in_code_block = True
+                m = re.search(r"<pre><code[^>]*>", line)
+                if m:
+                    open_tag = m.group(0)
+                elif "<pre>" in line:
+                    open_tag = "<pre>"
             if "</pre>" in line:
                 in_code_block = False
 
@@ -320,27 +330,34 @@ class ResponseFormatter:
                     chunk_length = tg_len(chunk) + 1
 
                     if (
-                        current_length + chunk_length > self.max_message_length
+                        current_length
+                        + chunk_length
+                        + (close_len if in_code_block else 0)
+                        > self.max_message_length
                         and current_lines
                     ):
                         if in_code_block:
-                            current_lines.append("</code></pre>")
+                            current_lines.append(close_tag)
                         messages.append(FormattedMessage("\n".join(current_lines)))
 
                         current_lines = []
                         current_length = 0
                         if in_code_block:
-                            current_lines.append("<pre><code>")
-                            current_length = 12
+                            current_lines.append(open_tag)
+                            current_length = tg_len(open_tag)
 
                     current_lines.append(chunk)
                     current_length += chunk_length
                 continue
 
             # Check if adding this line would exceed the limit
-            if current_length + line_length > self.max_message_length and current_lines:
+            if (
+                current_length + line_length + (close_len if in_code_block else 0)
+                > self.max_message_length
+                and current_lines
+            ):
                 if in_code_block:
-                    current_lines.append("</code></pre>")
+                    current_lines.append(close_tag)
 
                 messages.append(FormattedMessage("\n".join(current_lines)))
 
@@ -348,8 +365,8 @@ class ResponseFormatter:
                 current_length = 0
 
                 if in_code_block:
-                    current_lines.append("<pre><code>")
-                    current_length = 12
+                    current_lines.append(open_tag)
+                    current_length = tg_len(open_tag)
 
             current_lines.append(line)
             current_length += line_length

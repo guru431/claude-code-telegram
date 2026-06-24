@@ -1,5 +1,6 @@
 """Handle inline keyboard callbacks."""
 
+import asyncio
 from pathlib import Path
 from typing import Optional
 
@@ -396,11 +397,16 @@ async def _handle_show_projects_action(
             )
             return
 
-        # Get directories in approved directory
-        projects = []
-        for item in sorted(settings.approved_directory.iterdir()):
-            if item.is_dir() and not item.name.startswith("."):
-                projects.append(item.name)
+        # Get directories in approved directory (these are "projects"). The
+        # blocking iterdir walk runs off the event loop.
+        def _list_projects() -> list[str]:
+            return [
+                item.name
+                for item in sorted(settings.approved_directory.iterdir())
+                if item.is_dir() and not item.name.startswith(".")
+            ]
+
+        projects = await asyncio.to_thread(_list_projects)
 
         if not projects:
             await query.edit_message_text(
@@ -411,19 +417,25 @@ async def _handle_show_projects_action(
             )
             return
 
-        # Create project buttons
+        # Create project buttons. Telegram caps callback_data at 64 UTF-8
+        # bytes; a multibyte name that overflows would break the whole
+        # keyboard, so omit its button (the name still shows in the text
+        # list and stays reachable via /cd).
         keyboard = []
         for i in range(0, len(projects), 2):
             row = []
             for j in range(2):
                 if i + j < len(projects):
                     project = projects[i + j]
+                    if len(f"cd:{project}".encode("utf-8")) > 64:
+                        continue
                     row.append(
                         InlineKeyboardButton(
                             f"📁 {project}", callback_data=f"cd:{project}"
                         )
                     )
-            keyboard.append(row)
+            if row:
+                keyboard.append(row)
 
         # Add navigation buttons
         keyboard.append(
@@ -770,29 +782,32 @@ async def _handle_ls_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     try:
-        # List directory contents (similar to /ls command)
-        items = []
-        directories = []
-        files = []
+        # List directory contents (similar to /ls command). The blocking
+        # iterdir/stat walk runs off the event loop so a slow/large directory
+        # doesn't stall other updates.
+        def _walk_directory() -> list[str]:
+            directories: list[str] = []
+            files: list[str] = []
+            for item in sorted(current_dir.iterdir()):
+                if item.name.startswith("."):
+                    continue
 
-        for item in sorted(current_dir.iterdir()):
-            if item.name.startswith("."):
-                continue
+                # Escape markdown special characters in filenames
+                safe_name = _escape_markdown(item.name)
 
-            # Escape markdown special characters in filenames
-            safe_name = _escape_markdown(item.name)
+                if item.is_dir():
+                    directories.append(f"📁 {safe_name}/")
+                else:
+                    try:
+                        size = item.stat().st_size
+                        size_str = _format_file_size(size)
+                        files.append(f"📄 {safe_name} ({size_str})")
+                    except OSError:
+                        files.append(f"📄 {safe_name}")
 
-            if item.is_dir():
-                directories.append(f"📁 {safe_name}/")
-            else:
-                try:
-                    size = item.stat().st_size
-                    size_str = _format_file_size(size)
-                    files.append(f"📄 {safe_name} ({size_str})")
-                except OSError:
-                    files.append(f"📄 {safe_name}")
+            return directories + files
 
-        items = directories + files
+        items = await asyncio.to_thread(_walk_directory)
         relative_path = current_dir.relative_to(settings.approved_directory)
 
         if not items:

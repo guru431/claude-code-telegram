@@ -25,6 +25,7 @@ Usage:
 """
 
 import hashlib
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -76,16 +77,27 @@ class ConversationContext:
 class ConversationEnhancer:
     """Enhance conversation experience."""
 
+    #: Maximum number of per-user contexts kept in memory (LRU eviction above this).
+    MAX_CONTEXTS = 1000
+
     def __init__(self) -> None:
         """Initialize conversation enhancer."""
-        self.conversation_contexts: Dict[int, ConversationContext] = {}
+        self.conversation_contexts: "OrderedDict[int, ConversationContext]" = (
+            OrderedDict()
+        )
 
     def get_or_create_context(self, user_id: int) -> ConversationContext:
-        """Get or create conversation context for user."""
-        if user_id not in self.conversation_contexts:
-            self.conversation_contexts[user_id] = ConversationContext(user_id=user_id)
+        """Get or create conversation context for user (LRU-bounded)."""
+        if user_id in self.conversation_contexts:
+            self.conversation_contexts.move_to_end(user_id)
+            return self.conversation_contexts[user_id]
 
-        return self.conversation_contexts[user_id]
+        context = ConversationContext(user_id=user_id)
+        self.conversation_contexts[user_id] = context
+        if len(self.conversation_contexts) > self.MAX_CONTEXTS:
+            self.conversation_contexts.popitem(last=False)
+
+        return context
 
     def update_context(self, user_id: int, response: ClaudeResponse) -> None:
         """Update conversation context with response."""

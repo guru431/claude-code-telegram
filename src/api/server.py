@@ -6,6 +6,7 @@ Receives external webhooks and publishes them as events on the bus.
 
 import json
 import uuid
+from datetime import UTC, datetime
 from typing import Any, Dict, Optional
 
 import structlog
@@ -85,13 +86,16 @@ def create_api_app(
             # Generic provider — require auth (fail-closed)
             secret = settings.webhook_api_secret
             if not secret:
+                # Log the actionable config detail server-side only; the client
+                # gets a generic message so the env-var name is not leaked for
+                # reconnaissance.
+                logger.error(
+                    "Generic webhook rejected: WEBHOOK_API_SECRET not configured",
+                    provider=provider,
+                )
                 raise HTTPException(
                     status_code=500,
-                    detail=(
-                        "Webhook API secret not configured. "
-                        "Set WEBHOOK_API_SECRET to accept "
-                        "webhooks from this provider."
-                    ),
+                    detail="Webhook endpoint not configured",
                 )
             if not verify_shared_secret(authorization, secret):
                 raise HTTPException(status_code=401, detail="Invalid authorization")
@@ -189,8 +193,39 @@ async def _try_record_webhook(
         return inserted
 
 
-async def _replay_webhook_rows(rows: Any, event_bus: EventBus) -> int:
-    """Re-publish a set of webhook_events rows to the bus. Returns the count."""
+async def _claim_and_replay(
+    db_manager: DatabaseManager,
+    event_bus: EventBus,
+    where_extra: str,
+    params: tuple[Any, ...],
+) -> int:
+    """Atomically claim eligible pending deliveries and re-publish them.
+
+    Both startup recovery and the periodic sweep funnel through here so a row is
+    only ever replayed by one caller at a time. The claim stamps
+    ``last_attempt_at`` in the SAME ``UPDATE ... RETURNING`` that selects the
+    rows, so a concurrent claim (recovery racing the first sweep, or two sweeps)
+    sees the just-stamped timestamp and skips the row within its backoff window
+    instead of replaying the same in-flight delivery twice.
+
+    ``where_extra`` is appended to the ``processed = 0`` predicate; ``params``
+    are bound to it plus the claim timestamp. Returns the number replayed.
+    """
+    now = datetime.now(UTC).isoformat()
+    try:
+        async with db_manager.get_connection() as conn:
+            cursor = await conn.execute(
+                "UPDATE webhook_events SET last_attempt_at = ? "
+                "WHERE processed = 0" + where_extra + " "
+                "RETURNING provider, event_type, delivery_id, payload",
+                (now, *params),
+            )
+            rows = list(await cursor.fetchall())
+            await conn.commit()
+    except Exception:
+        logger.exception("Failed to claim webhook events for replay")
+        return 0
+
     replayed = 0
     for row in rows:
         row_dict = dict(row)
@@ -217,21 +252,12 @@ async def recover_unprocessed_webhooks(
 
     On a hard crash a delivery can be persisted yet never run, and the provider
     blocks re-delivery as a duplicate. Dead-lettered rows (``processed=2``) and
-    completed rows (``processed=1``) are excluded. The agent handler flips the
-    row to 1 on success or bumps ``attempts``/dead-letters it on failure.
+    completed rows (``processed=1``) are excluded. Each claimed row is stamped
+    in-flight (``last_attempt_at``) before publishing so the first retry sweep
+    does not immediately replay it again; the agent handler flips the row to 1
+    on success or bumps ``attempts``/dead-letters it on failure.
     """
-    try:
-        async with db_manager.get_connection() as conn:
-            cursor = await conn.execute(
-                "SELECT provider, event_type, delivery_id, payload "
-                "FROM webhook_events WHERE processed = 0 ORDER BY received_at"
-            )
-            rows = list(await cursor.fetchall())
-    except Exception:
-        logger.exception("Failed to load unprocessed webhook events for recovery")
-        return 0
-
-    replayed = await _replay_webhook_rows(rows, event_bus)
+    replayed = await _claim_and_replay(db_manager, event_bus, "", ())
     if replayed:
         logger.info("Replayed unprocessed webhook events on startup", count=replayed)
     return replayed
@@ -245,26 +271,20 @@ async def retry_pending_webhooks(
     Backoff is exponential per attempt (``base_delay_seconds * 2**attempts``).
     Rows that exhausted their retry budget are already dead-lettered
     (``processed=2``) and excluded; ``processed=0`` rows never attempted yet
-    (``last_attempt_at IS NULL``) are eligible immediately.
+    (``last_attempt_at IS NULL``) are eligible immediately. The claim stamps
+    ``last_attempt_at`` atomically, so an in-flight row recovered at startup or
+    by a prior sweep is not re-replayed until its backoff window elapses.
     """
-    try:
-        async with db_manager.get_connection() as conn:
-            cursor = await conn.execute(
-                "SELECT provider, event_type, delivery_id, payload "
-                "FROM webhook_events "
-                "WHERE processed = 0 AND ("
-                "  last_attempt_at IS NULL OR "
-                "  datetime(last_attempt_at) <= "
-                "  datetime('now', '-' || (? * (1 << attempts)) || ' seconds')"
-                ") ORDER BY received_at",
-                (base_delay_seconds,),
-            )
-            rows = list(await cursor.fetchall())
-    except Exception:
-        logger.exception("Failed to load webhook events for retry")
-        return 0
-
-    replayed = await _replay_webhook_rows(rows, event_bus)
+    where_extra = (
+        " AND ("
+        "  last_attempt_at IS NULL OR "
+        "  datetime(last_attempt_at) <= "
+        "  datetime('now', '-' || (? * (1 << attempts)) || ' seconds')"
+        ")"
+    )
+    replayed = await _claim_and_replay(
+        db_manager, event_bus, where_extra, (base_delay_seconds,)
+    )
     if replayed:
         logger.info("Retried pending webhook events", count=replayed)
     return replayed

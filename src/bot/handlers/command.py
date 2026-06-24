@@ -1213,7 +1213,7 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         relative_path = current_dir.relative_to(settings.approved_directory)
         status_message = "🔗 <b>Git Repository Status</b>\n\n"
         status_message += f"📂 Directory: <code>{relative_path}/</code>\n"
-        status_message += f"🌿 Branch: <code>{git_status.branch}</code>\n"
+        status_message += f"🌿 Branch: <code>{escape_html(git_status.branch)}</code>\n"
 
         if git_status.ahead > 0:
             status_message += f"⬆️ Ahead: {git_status.ahead} commits\n"

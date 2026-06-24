@@ -32,6 +32,22 @@ _SHUTDOWN: AgentResponseEvent = AgentResponseEvent(source="__shutdown_sentinel__
 # Matches an HTML start/end tag (Telegram's subset: b, i, code, pre, a, …).
 _TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9-]*)(\s[^>]*)?>")
 
+# Maps an event's ``parse_mode`` string to Telegram's ParseMode enum. ``None``
+# is plain text. An unrecognized value is rejected explicitly rather than being
+# silently downgraded to plain text (which would strip all formatting).
+_PARSE_MODES: dict[Optional[str], Optional[str]] = {
+    None: None,
+    "": None,
+    "HTML": ParseMode.HTML,
+    "Markdown": ParseMode.MARKDOWN,
+    "MarkdownV2": ParseMode.MARKDOWN_V2,
+}
+
+# Void elements never have a matching close tag, so they must not be pushed onto
+# the open-tag stack — otherwise they accumulate forever (carry_open grows, the
+# split budget goes <= 0) and _split_message loops endlessly.
+_VOID_TAGS = frozenset({"br", "hr", "img", "input", "meta", "link", "wbr"})
+
 
 def _open_tags_at(html: str) -> List[Tuple[str, str]]:
     """Return formatting tags left open at the end of *html*.
@@ -48,6 +64,9 @@ def _open_tags_at(html: str) -> List[Tuple[str, str]]:
                 if stack[i][1] == name:
                     del stack[i]
                     break
+        elif name in _VOID_TAGS or (m.group(3) or "").rstrip().endswith("/"):
+            # Void (<br>) or self-closing (<x/>) tag: not an open tag, skip it.
+            continue
         else:
             stack.append((m.group(0), name))
     return stack
@@ -268,7 +287,10 @@ class NotificationService:
         On RetryAfter (flood control), sleep the server-provided delay and retry
         once rather than dropping the message. Bounded to 2 attempts total.
         """
-        parse_mode = ParseMode.HTML if event.parse_mode == "HTML" else None
+        try:
+            parse_mode = _PARSE_MODES[event.parse_mode]
+        except KeyError:
+            raise ValueError(f"Unsupported parse_mode: {event.parse_mode!r}") from None
         for attempt in range(2):
             try:
                 await self.bot.send_message(
@@ -312,6 +334,14 @@ class NotificationService:
 
             budget = max_length - tg_len(prefix)
             split_len = _choose_split_point(rest, budget)
+            # Guard: a non-positive split point would never advance ``rest``
+            # (infinite loop) or yield a negative slice. Force progress by
+            # dropping the carried-over open tags and cutting at the raw limit.
+            if split_len <= 0:
+                carry_open = []
+                prefix = ""
+                budget = max_length
+                split_len = _utf16_cut(rest, budget) or len(rest)
             segment = rest[:split_len]
             open_now = _open_tags_at(prefix + segment)
             closing = "".join(f"</{name}>" for _, name in reversed(open_now))

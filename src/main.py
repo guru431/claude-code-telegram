@@ -369,6 +369,17 @@ async def run_application(app: Dict[str, Any]) -> int:
         # Start event bus
         await event_bus.start()
 
+        # Notification service — created and subscribed BEFORE webhook recovery
+        # so that any AgentResponseEvent produced while replaying still-pending
+        # deliveries has a subscriber and is not dispatched into the void.
+        notification_service = NotificationService(
+            event_bus=event_bus,
+            bot=telegram_bot,
+            default_chat_ids=config.notification_chat_ids or [],
+        )
+        notification_service.register()
+        await notification_service.start()
+
         # Replay webhook deliveries that were recorded but never processed
         # (e.g. a hard crash between accepting the delivery and finishing the
         # agent run). The provider blocks re-delivery as a duplicate, so this
@@ -377,15 +388,6 @@ async def run_application(app: Dict[str, Any]) -> int:
             from src.api.server import recover_unprocessed_webhooks
 
             await recover_unprocessed_webhooks(storage.db_manager, event_bus)
-
-        # Notification service
-        notification_service = NotificationService(
-            event_bus=event_bus,
-            bot=telegram_bot,
-            default_chat_ids=config.notification_chat_ids or [],
-        )
-        notification_service.register()
-        await notification_service.start()
 
         # Collect concurrent tasks
         tasks = []
@@ -606,24 +608,58 @@ async def run_application(app: Dict[str, Any]) -> int:
         # behind an exited sender and be lost silently.
         logger.info("Shutting down application")
 
+        # Each step is isolated so a failure in one does not abort the rest of
+        # the cleanup, which would leak resources (bus worker, bot, DB handles).
         try:
             if discovery_scheduler:
                 discovery_scheduler.shutdown(wait=False)
+        except Exception as e:
+            logger.error(
+                "Error during shutdown", step="discovery_scheduler", error=str(e)
+            )
+        try:
             if maintenance_scheduler:
                 maintenance_scheduler.shutdown(wait=False)
+        except Exception as e:
+            logger.error(
+                "Error during shutdown", step="maintenance_scheduler", error=str(e)
+            )
+        try:
             if scheduler:
                 await scheduler.stop()
+        except Exception as e:
+            logger.error("Error during shutdown", step="scheduler", error=str(e))
+        try:
             # Drain in-flight background agent runs while the bus is still live
             # so their responses get published before the bus/notifications stop.
             await agent_handler.aclose()
+        except Exception as e:
+            logger.error("Error during shutdown", step="agent_handler", error=str(e))
+        try:
             await event_bus.stop()
+        except Exception as e:
+            logger.error("Error during shutdown", step="event_bus", error=str(e))
+        try:
             if notification_service:
                 await notification_service.stop()
+        except Exception as e:
+            logger.error(
+                "Error during shutdown", step="notification_service", error=str(e)
+            )
+        try:
             await bot.stop()
+        except Exception as e:
+            logger.error("Error during shutdown", step="bot", error=str(e))
+        try:
             await claude_integration.shutdown()
+        except Exception as e:
+            logger.error(
+                "Error during shutdown", step="claude_integration", error=str(e)
+            )
+        try:
             await storage.close()
         except Exception as e:
-            logger.error("Error during shutdown", error=str(e))
+            logger.error("Error during shutdown", step="storage", error=str(e))
 
         logger.info("Application shutdown complete")
 

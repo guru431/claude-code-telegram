@@ -665,14 +665,24 @@ async def handle_text_message(
                     "Conversation enhancement failed", error=str(e), user_id=user_id
                 )
 
-        # Log successful message processing
+        # Log successful message processing. The response was already delivered
+        # above, so an audit failure here must not fall through to the outer
+        # except — that would send the user a duplicate error message and log
+        # the interaction as failed.
         if audit_logger:
-            await audit_logger.log_command(
-                user_id=user_id,
-                command="text_message",
-                args=[update.message.text[:100]],  # First 100 chars
-                success=True,
-            )
+            try:
+                await audit_logger.log_command(
+                    user_id=user_id,
+                    command="text_message",
+                    args=[update.message.text[:100]],  # First 100 chars
+                    success=True,
+                )
+            except Exception as audit_err:
+                logger.warning(
+                    "Failed to write success audit log",
+                    error=str(audit_err),
+                    user_id=user_id,
+                )
 
         logger.info("Text message processed successfully", user_id=user_id)
 
@@ -725,9 +735,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
     try:
-        # Validate filename using security validator
+        # Validate filename using security validator. ``file_name`` is optional
+        # in Telegram and may be None for nameless uploads — fall back to a
+        # placeholder so the typed validator never receives None.
         if security_validator:
-            valid, error = security_validator.validate_filename(document.file_name)
+            valid, error = security_validator.validate_filename(
+                document.file_name or "document"
+            )
             if not valid:
                 await update.message.reply_text(
                     f"❌ <b>File Upload Rejected</b>\n\n{escape_html(error)}",
@@ -1243,10 +1257,13 @@ def _update_working_directory_from_claude_response(
                     # Absolute path
                     new_path = Path(new_path).resolve()
 
-                # Validate that the new path is within the approved directory
+                # Validate that the new path is within the approved directory.
+                # Require a directory — Claude may also mention existing file
+                # paths (e.g. "Working directory: .../file.txt"); storing a file
+                # as current_directory breaks subsequent file operations.
                 if (
                     new_path.is_relative_to(settings.approved_directory)
-                    and new_path.exists()
+                    and new_path.is_dir()
                 ):
                     context.user_data["current_directory"] = new_path
                     logger.info(

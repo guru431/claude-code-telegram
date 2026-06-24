@@ -57,6 +57,9 @@ class UserModel:
         for field in ["first_seen", "last_active"]:
             data[field] = _parse_datetime(data.get(field))
 
+        if "is_allowed" in data:
+            data["is_allowed"] = bool(data["is_allowed"])
+
         return cls(**data)
 
 
@@ -91,6 +94,9 @@ class SessionModel:
         # Parse datetime fields
         for field in ["created_at", "last_used"]:
             data[field] = _parse_datetime(data.get(field))
+
+        if "is_active" in data:
+            data["is_active"] = bool(data["is_active"])
 
         return cls(**data)
 
@@ -136,9 +142,7 @@ class ProjectThreadModel:
         data = dict(row)
 
         for field in ["created_at", "updated_at"]:
-            val = data.get(field)
-            if val and isinstance(val, str):
-                data[field] = datetime.fromisoformat(val)
+            data[field] = _parse_datetime(data.get(field))
         data["is_active"] = bool(data.get("is_active", True))
 
         return cls(**data)
@@ -216,6 +220,9 @@ class ToolUsageModel:
             except (json.JSONDecodeError, TypeError):
                 data["tool_input"] = {}
 
+        if "success" in data:
+            data["success"] = bool(data["success"])
+
         return cls(**data)
 
 
@@ -256,6 +263,9 @@ class AuditLogModel:
                 data["event_data"] = json.loads(data["event_data"])
             except (json.JSONDecodeError, TypeError):
                 data["event_data"] = {}
+
+        if "success" in data:
+            data["success"] = bool(data["success"])
 
         return cls(**data)
 
@@ -316,4 +326,11 @@ class UserTokenModel:
         """Check if token has expired."""
         if not self.expires_at:
             return False
-        return datetime.now(UTC) > self.expires_at
+
+        # Legacy persisted tokens may contain naive timestamps; treat them
+        # as UTC to mirror SessionModel.is_expired and avoid a TypeError.
+        expires_at = self.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+
+        return datetime.now(UTC) > expires_at

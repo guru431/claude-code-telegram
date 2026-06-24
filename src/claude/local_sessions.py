@@ -127,6 +127,8 @@ def _build_local_session(entry: Path) -> Optional[LocalSession]:
     ts_str = first.get("timestamp", "")
     try:
         ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
     except (ValueError, AttributeError):
         ts = datetime.fromtimestamp(entry.stat().st_mtime, tz=UTC)
 
@@ -146,9 +148,19 @@ def _entries_by_mtime(target_dir: Path) -> List[Path]:
     parse lazily (e.g. stop at the first non-excluded match) instead of reading
     every file up front.
     """
-    entries = [e for e in target_dir.iterdir() if e.suffix == ".jsonl" and e.is_file()]
-    entries.sort(key=lambda e: e.stat().st_mtime, reverse=True)
-    return entries
+    # Pair each entry with its mtime, skipping files that vanish between
+    # iterdir() and stat() (FileNotFoundError is an OSError subclass).
+    entries: List[tuple[Path, float]] = []
+    for e in target_dir.iterdir():
+        if e.suffix != ".jsonl" or not e.is_file():
+            continue
+        try:
+            mtime = e.stat().st_mtime
+        except OSError:
+            continue
+        entries.append((e, mtime))
+    entries.sort(key=lambda pair: pair[1], reverse=True)
+    return [e for e, _ in entries]
 
 
 def find_local_sessions(working_directory: Path) -> List[LocalSession]:
@@ -249,7 +261,11 @@ def list_all_local_sessions(
         for entry in project_dir.iterdir():
             if entry.suffix != ".jsonl" or not entry.is_file():
                 continue
-            candidates.append((entry, entry.stat().st_mtime))
+            try:
+                candidates.append((entry, entry.stat().st_mtime))
+            except OSError:
+                # File vanished between iterdir() and stat() — skip it.
+                continue
 
     candidates.sort(key=lambda c: c[1], reverse=True)
 
@@ -269,6 +285,8 @@ def list_all_local_sessions(
         ts_str = first.get("timestamp", "")
         try:
             ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=UTC)
         except (ValueError, AttributeError):
             ts = datetime.fromtimestamp(mtime, tz=UTC)
 
