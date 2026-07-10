@@ -254,9 +254,7 @@ class Storage:
                 await conn.rollback()
                 raise
 
-        logger.info(
-            "Created session", session_id=session.session_id, user_id=user_id
-        )
+        logger.info("Created session", session_id=session.session_id, user_id=user_id)
 
         return session
 
