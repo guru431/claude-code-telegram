@@ -33,13 +33,14 @@ _MAX_WEBHOOK_ATTEMPTS = 3
 # unattended with no human-in-the-loop. A prompt-injection payload could turn a
 # full tool set into RCE inside the approved directory. Restrict webhook-driven
 # runs to read-only / analysis tools — no Bash, Write, Edit, or Task.
+# WebFetch/WebSearch are intentionally excluded: they are not needed to summarize
+# a payload and would give an injected prompt an outbound channel to exfiltrate
+# in-boundary file contents (Read/Grep) to an attacker-controlled host / SSRF.
 _WEBHOOK_READONLY_TOOLS = [
     "Read",
     "Glob",
     "Grep",
     "LS",
-    "WebFetch",
-    "WebSearch",
     "TodoRead",
     "TodoWrite",
 ]
@@ -115,6 +116,7 @@ class AgentHandler:
                     prompt=prompt,
                     working_directory=self.default_working_directory,
                     user_id=self.default_user_id,
+                    force_new=True,
                     allowed_tools_override=_WEBHOOK_READONLY_TOOLS,
                 )
 
@@ -205,6 +207,7 @@ class AgentHandler:
                     prompt=prompt,
                     working_directory=working_dir,
                     user_id=self.default_user_id,
+                    force_new=True,
                 )
 
             if response.content:

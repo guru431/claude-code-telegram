@@ -78,6 +78,10 @@ def _make_can_use_tool_callback(
     # File tools whose input carries a path. NotebookRead/NotebookEdit use
     # "notebook_path", and MultiEdit (like Edit) uses "file_path"; without them
     # those default-allowed tools would bypass the boundary + secret checks.
+    # Grep/Glob/LS also take a "path" argument; without them a caller could read
+    # or enumerate files outside the approved directory (e.g. Grep(path=
+    # '/etc/passwd'), LS('/root')) or read an in-boundary secret like
+    # <approved>/.env, since these tools otherwise fall through to allow.
     _FILE_TOOLS = {
         "Write",
         "Edit",
@@ -85,6 +89,9 @@ def _make_can_use_tool_callback(
         "Read",
         "NotebookRead",
         "NotebookEdit",
+        "Grep",
+        "Glob",
+        "LS",
         "create_file",
         "edit_file",
         "read_file",

@@ -6,6 +6,8 @@ import shlex
 from pathlib import Path
 from typing import Optional, Set, Tuple
 
+from src.security.validators import SecurityValidator
+
 # Subdirectories under ~/.claude/ that Claude Code uses internally.
 # NOTE: settings.json is intentionally excluded — writing ~/.claude/settings.json
 # allows arbitrary hook execution, so it must fall through to validate_path.
@@ -31,6 +33,11 @@ _FS_MODIFYING_COMMANDS: Set[str] = {
     "chgrp",
     "truncate",
     "shred",
+    # Archive tool that creates/extracts files; its ``-C``/``-f`` path flags are
+    # declared in ``_PATH_BEARING_FLAGS`` but stay dead unless ``tar`` reaches the
+    # path-check loop, so classify it here (``tar xf a -C /outside`` must be
+    # boundary-checked when the OS sandbox is disabled).
+    "tar",
 }
 
 # Read-only commands that take filesystem-path arguments. They don't modify
@@ -385,6 +392,20 @@ def check_bash_directory_boundary(
             # Unresolvable: rely on the OS-level sandbox rather than guessing.
             return False
 
+    def _secret_reason(path_token: str) -> Optional[str]:
+        """Return a denial reason if *path_token*'s basename is a secret file.
+
+        Applied to in-boundary path operands so a bash command can't read/modify
+        a secret (``.env``, ``id_rsa``, ``*.pem``) that the Read/Write/Edit tools
+        block via ``is_forbidden_secret_file``.
+        """
+        try:
+            name = Path(os.path.expanduser(path_token)).name
+        except (ValueError, OSError):
+            return None
+        forbidden, reason = _is_forbidden_secret_basename(name)
+        return reason if forbidden else None
+
     # Check each command in the chain
     for cmd_tokens in command_chains:
         if not cmd_tokens:
@@ -427,6 +448,12 @@ def check_bash_directory_boundary(
                         f"Directory boundary violation: redirection targets "
                         f"'{target}' which is outside approved directory "
                         f"'{resolved_approved}'"
+                    )
+                secret_reason = _secret_reason(target)
+                if secret_reason:
+                    return False, (
+                        f"Directory boundary violation: redirection targets "
+                        f"secret file '{target}' ({secret_reason})"
                     )
 
         # Read-only commands that take no filesystem path are always allowed.
@@ -529,6 +556,13 @@ def check_bash_directory_boundary(
                         f"targets '{path_value}' which is outside approved "
                         f"directory '{resolved_approved}'"
                     )
+                if path_value:
+                    secret_reason = _secret_reason(path_value)
+                    if secret_reason:
+                        return False, (
+                            f"Directory boundary violation: '{base_command}' "
+                            f"targets secret file '{path_value}' ({secret_reason})"
+                        )
                 continue
 
             # A ``scheme://`` argument to a network command (curl/wget/fetch …)
@@ -585,6 +619,15 @@ def check_bash_directory_boundary(
                         f"'{token}' which is outside approved directory "
                         f"'{resolved_approved}'"
                     )
+
+                # In-boundary but a secret/credential file: deny so a bash
+                # read/modify can't bypass the is_forbidden_secret_file gate.
+                secret_reason = _secret_reason(token)
+                if secret_reason:
+                    return False, (
+                        f"Directory boundary violation: '{base_command}' targets "
+                        f"secret file '{token}' ({secret_reason})"
+                    )
             except (ValueError, OSError):
                 # If path resolution fails, the command might be malformed or
                 # using bash features we can't statically analyze.
@@ -592,6 +635,26 @@ def check_bash_directory_boundary(
                 continue
 
     return True, None
+
+
+def _is_forbidden_secret_basename(name: str) -> Tuple[bool, Optional[str]]:
+    """Match a basename against the secret/credential blocklist.
+
+    Mirrors :meth:`SecurityValidator.is_forbidden_secret_file` (reusing the same
+    ``FORBIDDEN_FILENAMES`` / ``DANGEROUS_FILE_PATTERNS`` data) so a bash
+    read/modify of an in-boundary secret (``cat .env``, ``head .ssh/id_rsa``) is
+    denied just like the Read/Write/Edit tools are — the bash path must not
+    bypass the ``is_forbidden_secret_file`` gate.
+    """
+    if not name:
+        return False, None
+    name = name.strip()
+    if name.lower() in {n.lower() for n in SecurityValidator.FORBIDDEN_FILENAMES}:
+        return True, f"Forbidden filename: {name}"
+    for pattern in SecurityValidator.DANGEROUS_FILE_PATTERNS:
+        if re.match(pattern, name, re.IGNORECASE):
+            return True, f"File type not allowed: {name}"
+    return False, None
 
 
 def _is_claude_internal_path(file_path: str) -> bool:

@@ -251,7 +251,11 @@ class ClaudeCodeBot:
 
     async def stop(self) -> None:
         """Gracefully stop the bot."""
-        if not self.is_running:
+        # Gate on teardown state, not ``is_running``: ``start()`` runs as a
+        # cancelled task on shutdown and its ``finally`` already flips
+        # ``is_running`` to False, so an ``is_running`` guard would early-return
+        # here and skip the entire PTB teardown (updater/app stop + shutdown).
+        if self.app is None:
             logger.warning("Bot is not running")
             return
 
@@ -264,14 +268,14 @@ class ClaudeCodeBot:
             if self.feature_registry:
                 self.feature_registry.shutdown()
 
-            if self.app:
-                # Stop the updater if it's running
-                if self.app.updater.running:
-                    await self.app.updater.stop()
+            # Stop the updater if it's running
+            if self.app.updater and self.app.updater.running:
+                await self.app.updater.stop()
 
-                # Stop the application
+            # Stop the application if it's running, then release resources
+            if self.app.running:
                 await self.app.stop()
-                await self.app.shutdown()
+            await self.app.shutdown()
 
             logger.info("Bot stopped successfully")
         except Exception as e:

@@ -12,9 +12,11 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, List, Optional
+from uuid import uuid4
 
 import structlog
+from structlog.contextvars import bind_contextvars, unbind_contextvars
 from telegram import (
     BotCommand,
     InlineKeyboardButton,
@@ -38,11 +40,15 @@ from ..security.secret_patterns import redact_secrets
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
 from .utils.html_format import escape_html
 from .utils.image_extractor import (
+    MAX_IMAGES_PER_RESPONSE,
     ImageAttachment,
     should_send_as_animation,
     should_send_as_photo,
     validate_image_path,
 )
+
+if TYPE_CHECKING:
+    from .utils.formatting import FormattedMessage
 
 logger = structlog.get_logger()
 
@@ -105,10 +111,23 @@ class MessageOrchestrator:
         # heartbeat/progress message and stealing its Stop button).
         self._request_locks: Dict[int, asyncio.Lock] = {}
 
+    _MAX_REQUEST_LOCKS = 10_000
+
     def _get_request_lock(self, user_id: int) -> asyncio.Lock:
         """Return (creating if needed) the per-user request serialization lock."""
         lock = self._request_locks.get(user_id)
         if lock is None:
+            if len(self._request_locks) >= self._MAX_REQUEST_LOCKS:
+                # Evict provably-unheld locks before growing the map, so an
+                # unbounded user population (ALLOW_ALL_USERS) can't leak locks.
+                # Only removes locks whose ``locked()`` is False, so an in-flight
+                # request never loses the lock serializing it.
+                for uid in [
+                    uid
+                    for uid, existing in self._request_locks.items()
+                    if not existing.locked()
+                ]:
+                    self._request_locks.pop(uid, None)
             lock = asyncio.Lock()
             self._request_locks[user_id] = lock
         return lock
@@ -211,6 +230,11 @@ class MessageOrchestrator:
 
         context.user_data["current_directory"] = current_dir
         context.user_data["claude_session_id"] = state.get("claude_session_id")
+        # Scope the one-shot /new flag per thread so a /new in one topic does
+        # not force a new session (orphaning the resumable one) in another.
+        context.user_data["force_new_session"] = bool(
+            state.get("force_new_session", False)
+        )
         context.user_data["_thread_context"] = {
             "chat_id": chat.id,
             "message_thread_id": message_thread_id,
@@ -240,6 +264,9 @@ class MessageOrchestrator:
             "current_directory": str(current_dir),
             "claude_session_id": context.user_data.get("claude_session_id"),
             "project_slug": thread_context["project_slug"],
+            "force_new_session": bool(
+                context.user_data.get("force_new_session", False)
+            ),
         }
 
     @staticmethod
@@ -739,6 +766,58 @@ class MessageOrchestrator:
 
         return asyncio.create_task(_heartbeat())
 
+    @staticmethod
+    def _build_stop_kb(user_id: int) -> InlineKeyboardMarkup:
+        """Build the inline 'Stop' keyboard that interrupts a running request."""
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Stop", callback_data=f"stop:{user_id}")]]
+        )
+
+    @staticmethod
+    def _error_with_ref(message: str, request_id: str) -> str:
+        """Append a short correlation id to a user-facing error for log grep."""
+        return f"{message}\n\n<code>ref: {request_id[:8]}</code>"
+
+    @contextlib.asynccontextmanager
+    async def _claude_run(
+        self,
+        *,
+        user_id: int,
+        chat: Any,
+        progress_msg: Any,
+    ) -> AsyncIterator[asyncio.Event]:
+        """Own the lifecycle of one in-flight Claude run.
+
+        Sets up on entry: the interrupt event (fed to ``run_command`` and the
+        stream callback so the Stop button can cancel the run), the per-user
+        serialization lock (so a second concurrent request can't clobber this
+        one's ActiveRequest), the ActiveRequest registration (so the Stop
+        callback can find and interrupt it) and the typing heartbeat. Tears all
+        of it down on exit — heartbeat cancelled, ActiveRequest dropped, lock
+        released — whether the body returns, raises or is cancelled. Yields the
+        interrupt event.
+
+        The Stop keyboard itself is built by the caller via ``_build_stop_kb``
+        and shown on *progress_msg* before entry (created fresh with the button
+        for the text path, edited onto an existing message for the media path),
+        because those two paths differ in how the progress message is made.
+        """
+        interrupt_event = asyncio.Event()
+        request_lock = self._get_request_lock(user_id)
+        await request_lock.acquire()
+        self._active_requests[user_id] = ActiveRequest(
+            user_id=user_id,
+            interrupt_event=interrupt_event,
+            progress_msg=progress_msg,
+        )
+        heartbeat = self._start_typing_heartbeat(chat)
+        try:
+            yield interrupt_event
+        finally:
+            heartbeat.cancel()
+            self._active_requests.pop(user_id, None)
+            request_lock.release()
+
     def _make_stream_callback(
         self,
         verbose_level: int,
@@ -792,7 +871,11 @@ class MessageOrchestrator:
                         img = validate_image_path(
                             file_path, approved_directory, caption
                         )
-                        if img:
+                        # Cap total collected images per run so a flood of
+                        # send_image_to_user calls can't spawn unbounded
+                        # sequential Telegram sends (animations/documents each
+                        # sleep 0.5s) or trip flood limits.
+                        if img and len(mcp_images) < MAX_IMAGES_PER_RESPONSE:
                             mcp_images.append(img)
 
             # Capture tool calls
@@ -817,6 +900,9 @@ class MessageOrchestrator:
                 if text:
                     first_line = text.split("\n", 1)[0].strip()
                     if first_line:
+                        # Redact secrets before this reasoning snippet reaches
+                        # Telegram via the draft stream or verbose progress edit.
+                        first_line = redact_secrets(first_line)
                         if verbose_level >= 1:
                             tool_log.append(
                                 {"kind": "text", "detail": first_line[:120]}
@@ -830,7 +916,9 @@ class MessageOrchestrator:
             # skip full assistant messages to avoid double-appending)
             if draft_streamer and update_obj.content:
                 if update_obj.type == "stream_delta":
-                    await draft_streamer.append_text(update_obj.content)
+                    # Redact secrets from live token deltas — the final message
+                    # is redacted too, but the draft must not leak first.
+                    await draft_streamer.append_text(redact_secrets(update_obj.content))
 
             # Throttle progress message edits to avoid Telegram rate limits
             if not draft_streamer and verbose_level >= 1:
@@ -919,6 +1007,10 @@ class MessageOrchestrator:
                         and single.original_reference != str(single.path)
                         else None
                     )
+                    if per_image_caption and len(per_image_caption) > 1024:
+                        # Telegram rejects captions over 1024 chars — truncate so
+                        # the photo still delivers instead of silently failing.
+                        per_image_caption = per_image_caption[:1021] + "…"
                     if per_image_caption:
                         photo_caption: Optional[str] = per_image_caption
                         photo_parse_mode: Optional[str] = None
@@ -989,203 +1081,20 @@ class MessageOrchestrator:
 
         return caption_sent
 
-    async def agentic_text(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    async def _deliver_response(
+        self,
+        update: Update,
+        formatted_messages: List["FormattedMessage"],
+        images: List[ImageAttachment],
     ) -> None:
-        """Direct Claude passthrough. Simple progress. No suggestions."""
-        user_id = update.effective_user.id
-        message_text = update.message.text
+        """Send a formatted Claude response back to the user.
 
-        logger.info(
-            "Agentic text message",
-            user_id=user_id,
-            message_length=len(message_text),
-        )
-
-        # Rate limiting was already enforced by rate_limit_middleware (group -1);
-        # re-checking here would double-charge the token bucket. We only need the
-        # rate_limiter reference later to record the run's actual cost.
-        rate_limiter = context.bot_data.get("rate_limiter")
-
-        chat = update.message.chat
-        await chat.send_action("typing")
-
-        verbose_level = self._get_verbose_level(context)
-
-        # Stop button + interrupt event so the user can cancel a running request
-        interrupt_event = asyncio.Event()
-        stop_kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Stop", callback_data=f"stop:{user_id}")]]
-        )
-        progress_msg = await update.message.reply_text(
-            "Working...", reply_markup=stop_kb
-        )
-
-        # Serialize per-user requests so a second concurrent message can't
-        # clobber this one's ActiveRequest while it is still in flight.
-        request_lock = self._get_request_lock(user_id)
-        await request_lock.acquire()
-
-        # Register active request so the stop callback can find it
-        self._active_requests[user_id] = ActiveRequest(
-            user_id=user_id,
-            interrupt_event=interrupt_event,
-            progress_msg=progress_msg,
-        )
-
-        claude_integration = context.bot_data.get("claude_integration")
-        if not claude_integration:
-            self._active_requests.pop(user_id, None)
-            request_lock.release()
-            await progress_msg.edit_text(
-                "Claude integration not available. Check configuration.",
-                reply_markup=None,
-            )
-            return
-
-        current_dir = context.user_data.get(
-            "current_directory", self.settings.approved_directory
-        )
-        session_id = context.user_data.get("claude_session_id")
-
-        # Check if /new was used — skip auto-resume for this first message.
-        # Flag is only cleared after a successful run so retries keep the intent.
-        force_new = bool(context.user_data.get("force_new_session"))
-
-        # --- Verbose progress tracking via stream callback ---
-        tool_log: List[Dict[str, Any]] = []
-        start_time = time.monotonic()
-        mcp_images: List[ImageAttachment] = []
-
-        # Stream drafts (private chats only)
-        draft_streamer: Optional[DraftStreamer] = None
-        if self.settings.enable_stream_drafts and chat.type == "private":
-            draft_streamer = DraftStreamer(
-                bot=context.bot,
-                chat_id=chat.id,
-                draft_id=generate_draft_id(),
-                message_thread_id=update.message.message_thread_id,
-                throttle_interval=self.settings.stream_draft_interval,
-            )
-
-        on_stream = self._make_stream_callback(
-            verbose_level,
-            progress_msg,
-            tool_log,
-            start_time,
-            mcp_images=mcp_images,
-            approved_directory=self.settings.approved_directory,
-            draft_streamer=draft_streamer,
-            reply_markup=stop_kb,
-            interrupt_event=interrupt_event,
-        )
-
-        # Independent typing heartbeat — stays alive even with no stream events
-        heartbeat = self._start_typing_heartbeat(chat)
-
-        success = True
-        try:
-            claude_response = await claude_integration.run_command(
-                prompt=message_text,
-                working_directory=current_dir,
-                user_id=user_id,
-                session_id=session_id,
-                on_stream=on_stream,
-                force_new=force_new,
-                interrupt_event=interrupt_event,
-            )
-
-            # New session created successfully — clear the one-shot flag
-            if force_new:
-                context.user_data["force_new_session"] = False
-
-            context.user_data["claude_session_id"] = claude_response.session_id
-
-            # The run completed without raising but the SDK flagged an error
-            # (e.g. no ResultMessage / budget cap). Surface it explicitly and
-            # don't charge cost for a run that produced no usable result.
-            if claude_response.is_error:
-                success = False
-                from .handlers.message import _format_error_message
-                from .utils.formatting import FormattedMessage
-
-                formatted_messages = [
-                    FormattedMessage(
-                        _format_error_message(
-                            claude_response.error_type or "Claude returned an error."
-                        ),
-                        parse_mode="HTML",
-                    )
-                ]
-            else:
-                # Charge the real cost so claude_max_cost_per_user is enforced.
-                if rate_limiter:
-                    await rate_limiter.record_actual_cost(user_id, claude_response.cost)
-
-                # Track directory changes
-                from .handlers.message import (
-                    _update_working_directory_from_claude_response,
-                )
-
-                _update_working_directory_from_claude_response(
-                    claude_response, context, self.settings, user_id
-                )
-
-                # Store interaction
-                storage = context.bot_data.get("storage")
-                if storage:
-                    try:
-                        await storage.save_claude_interaction(
-                            user_id=user_id,
-                            session_id=claude_response.session_id,
-                            prompt=message_text,
-                            response=claude_response,
-                            ip_address=None,
-                        )
-                    except Exception as e:
-                        logger.warning("Failed to log interaction", error=str(e))
-
-                # Format response (no reply_markup — strip keyboards)
-                from .utils.formatting import ResponseFormatter
-
-                formatter = ResponseFormatter(self.settings)
-
-                # Redact secrets from the response body before it leaves the
-                # bot — tool OUTPUT (e.g. a printenv dump) can land here.
-                response_content = redact_secrets(claude_response.content or "")
-                if claude_response.interrupted:
-                    response_content = response_content + "\n\n_(Interrupted by user)_"
-
-                formatted_messages = formatter.format_claude_response(response_content)
-
-        except Exception as e:
-            success = False
-            logger.error("Claude integration failed", error=str(e), user_id=user_id)
-            from .handlers.message import _format_error_message
-            from .utils.formatting import FormattedMessage
-
-            formatted_messages = [
-                FormattedMessage(_format_error_message(e), parse_mode="HTML")
-            ]
-        finally:
-            heartbeat.cancel()
-            self._active_requests.pop(user_id, None)
-            request_lock.release()
-            if draft_streamer:
-                try:
-                    await draft_streamer.flush()
-                except Exception:
-                    logger.debug("Draft flush failed in finally block", user_id=user_id)
-
-        try:
-            await progress_msg.delete()
-        except Exception:
-            logger.debug("Failed to delete progress message, ignoring")
-
-        # Use MCP-collected images (from send_image_to_user tool calls)
-        images: List[ImageAttachment] = mcp_images
-
-        # Try to combine text + images in one message when possible
+        Shared by the text and media agentic handlers. When there is a single
+        message that fits, text + images are combined into one captioned photo;
+        otherwise the text messages are sent (HTML, falling back to plain text
+        then a delivery-error notice) followed by the images. The messages are
+        assumed to already have secrets redacted by the caller.
+        """
         caption_sent = False
         if images and len(formatted_messages) == 1:
             msg = formatted_messages[0]
@@ -1201,7 +1110,6 @@ class MessageOrchestrator:
                 except Exception as img_err:
                     logger.warning("Image+caption send failed", error=str(img_err))
 
-        # Send text messages (skip if caption was already embedded in photos)
         if not caption_sent:
             for i, message in enumerate(formatted_messages):
                 if not message.text or not message.text.strip():
@@ -1215,8 +1123,6 @@ class MessageOrchestrator:
                             update.message.message_id if i == 0 else None
                         ),
                     )
-                    if i < len(formatted_messages) - 1:
-                        await asyncio.sleep(0.5)
                 except Exception as send_err:
                     logger.warning(
                         "Failed to send HTML response, retrying as plain text",
@@ -1240,8 +1146,9 @@ class MessageOrchestrator:
                                 update.message.message_id if i == 0 else None
                             ),
                         )
+                if i < len(formatted_messages) - 1:
+                    await asyncio.sleep(0.5)
 
-            # Send images separately if caption wasn't used
             if images:
                 try:
                     await self._send_images(
@@ -1252,15 +1159,238 @@ class MessageOrchestrator:
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
 
-        # Audit log
-        audit_logger = context.bot_data.get("audit_logger")
-        if audit_logger:
-            await audit_logger.log_command(
+    async def agentic_text(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Direct Claude passthrough. Simple progress. No suggestions."""
+        # Correlation id tying this message through the Claude run, storage and
+        # reply together in the logs. Bound so every downstream log carries it;
+        # unbound in the finally below.
+        request_id = uuid4().hex
+        bind_contextvars(request_id=request_id)
+        try:
+            user_id = update.effective_user.id
+            message_text = update.message.text
+
+            logger.info(
+                "Agentic text message",
                 user_id=user_id,
-                command="text_message",
-                args=[message_text[:100]],
-                success=success,
+                message_length=len(message_text),
             )
+
+            # Rate limiting was already enforced by rate_limit_middleware
+            # (group -1); re-checking here would double-charge the token bucket.
+            # We only need the rate_limiter reference later to record the run's
+            # actual cost.
+            rate_limiter = context.bot_data.get("rate_limiter")
+
+            chat = update.message.chat
+            await chat.send_action("typing")
+
+            verbose_level = self._get_verbose_level(context)
+
+            # Stop button lives on the progress message; the run lifecycle
+            # (interrupt event, lock, ActiveRequest, heartbeat) is owned by the
+            # _claude_run context manager.
+            stop_kb = self._build_stop_kb(user_id)
+            progress_msg = await update.message.reply_text(
+                "Working...", reply_markup=stop_kb
+            )
+
+            success = True
+            draft_streamer: Optional[DraftStreamer] = None
+            mcp_images: List[ImageAttachment] = []
+            formatted_messages: List["FormattedMessage"] = []
+            try:
+                async with self._claude_run(
+                    user_id=user_id, chat=chat, progress_msg=progress_msg
+                ) as interrupt_event:
+                    claude_integration = context.bot_data.get("claude_integration")
+                    if not claude_integration:
+                        await progress_msg.edit_text(
+                            "Claude integration not available. Check configuration.",
+                            reply_markup=None,
+                        )
+                        return
+
+                    current_dir = context.user_data.get(
+                        "current_directory", self.settings.approved_directory
+                    )
+                    session_id = context.user_data.get("claude_session_id")
+
+                    # Check if /new was used — skip auto-resume for this first
+                    # message. Flag is only cleared after a successful run so
+                    # retries keep the intent.
+                    force_new = bool(context.user_data.get("force_new_session"))
+
+                    # --- Verbose progress tracking via stream callback ---
+                    tool_log: List[Dict[str, Any]] = []
+                    start_time = time.monotonic()
+
+                    # Stream drafts (private chats only)
+                    if self.settings.enable_stream_drafts and chat.type == "private":
+                        draft_streamer = DraftStreamer(
+                            bot=context.bot,
+                            chat_id=chat.id,
+                            draft_id=generate_draft_id(),
+                            message_thread_id=update.message.message_thread_id,
+                            throttle_interval=self.settings.stream_draft_interval,
+                        )
+
+                    on_stream = self._make_stream_callback(
+                        verbose_level,
+                        progress_msg,
+                        tool_log,
+                        start_time,
+                        mcp_images=mcp_images,
+                        approved_directory=self.settings.approved_directory,
+                        draft_streamer=draft_streamer,
+                        reply_markup=stop_kb,
+                        interrupt_event=interrupt_event,
+                    )
+
+                    try:
+                        claude_response = await claude_integration.run_command(
+                            prompt=message_text,
+                            working_directory=current_dir,
+                            user_id=user_id,
+                            session_id=session_id,
+                            on_stream=on_stream,
+                            force_new=force_new,
+                            interrupt_event=interrupt_event,
+                        )
+
+                        context.user_data["claude_session_id"] = (
+                            claude_response.session_id
+                        )
+
+                        # The run completed without raising but the SDK flagged
+                        # an error (e.g. no ResultMessage / budget cap). Surface
+                        # it explicitly and don't charge cost for a run that
+                        # produced no usable result.
+                        if claude_response.is_error:
+                            success = False
+                            from .handlers.message import _format_error_message
+                            from .utils.formatting import FormattedMessage
+
+                            formatted_messages = [
+                                FormattedMessage(
+                                    self._error_with_ref(
+                                        _format_error_message(
+                                            claude_response.error_type
+                                            or "Claude returned an error."
+                                        ),
+                                        request_id,
+                                    ),
+                                    parse_mode="HTML",
+                                )
+                            ]
+                        else:
+                            # New session produced a usable result — clear the
+                            # one-shot flag now. A soft error (is_error above)
+                            # keeps it so the next message still forces a new
+                            # session, matching the exception path.
+                            if force_new:
+                                context.user_data["force_new_session"] = False
+
+                            # Charge the real cost so claude_max_cost_per_user
+                            # is enforced.
+                            if rate_limiter:
+                                await rate_limiter.record_actual_cost(
+                                    user_id, claude_response.cost
+                                )
+
+                            # Track directory changes
+                            from .handlers.message import (
+                                _update_working_directory_from_claude_response,
+                            )
+
+                            _update_working_directory_from_claude_response(
+                                claude_response, context, self.settings, user_id
+                            )
+
+                            # Store interaction
+                            storage = context.bot_data.get("storage")
+                            if storage:
+                                try:
+                                    await storage.save_claude_interaction(
+                                        user_id=user_id,
+                                        session_id=claude_response.session_id,
+                                        prompt=message_text,
+                                        response=claude_response,
+                                        ip_address=None,
+                                    )
+                                except Exception as e:
+                                    logger.warning(
+                                        "Failed to log interaction", error=str(e)
+                                    )
+
+                            # Format response (no reply_markup — strip keyboards)
+                            from .utils.formatting import ResponseFormatter
+
+                            formatter = ResponseFormatter(self.settings)
+
+                            # Redact secrets from the response body before it
+                            # leaves the bot — tool OUTPUT (e.g. a printenv dump)
+                            # can land here.
+                            response_content = redact_secrets(
+                                claude_response.content or ""
+                            )
+                            if claude_response.interrupted:
+                                response_content = (
+                                    response_content + "\n\n_(Interrupted by user)_"
+                                )
+
+                            formatted_messages = formatter.format_claude_response(
+                                response_content
+                            )
+
+                    except Exception as e:
+                        success = False
+                        logger.error(
+                            "Claude integration failed",
+                            error=str(e),
+                            user_id=user_id,
+                        )
+                        from .handlers.message import _format_error_message
+                        from .utils.formatting import FormattedMessage
+
+                        formatted_messages = [
+                            FormattedMessage(
+                                self._error_with_ref(
+                                    _format_error_message(e), request_id
+                                ),
+                                parse_mode="HTML",
+                            )
+                        ]
+            finally:
+                if draft_streamer:
+                    try:
+                        await draft_streamer.flush()
+                    except Exception:
+                        logger.debug(
+                            "Draft flush failed in finally block", user_id=user_id
+                        )
+
+            try:
+                await progress_msg.delete()
+            except Exception:
+                logger.debug("Failed to delete progress message, ignoring")
+
+            # Use MCP-collected images (from send_image_to_user tool calls)
+            await self._deliver_response(update, formatted_messages, mcp_images)
+
+            # Audit log
+            audit_logger = context.bot_data.get("audit_logger")
+            if audit_logger:
+                await audit_logger.log_command(
+                    user_id=user_id,
+                    command="text_message",
+                    args=[message_text[:100]],
+                    success=success,
+                )
+        finally:
+            unbind_contextvars("request_id")
 
     async def agentic_document(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1481,197 +1611,137 @@ class MessageOrchestrator:
         images: Optional[List[Dict[str, str]]] = None,
     ) -> None:
         """Run a media-derived prompt through Claude and send responses."""
-        claude_integration = context.bot_data.get("claude_integration")
-        if not claude_integration:
-            await progress_msg.edit_text(
-                "Claude integration not available. Check configuration."
-            )
-            return
-
-        current_dir = context.user_data.get(
-            "current_directory", self.settings.approved_directory
-        )
-        session_id = context.user_data.get("claude_session_id")
-        force_new = bool(context.user_data.get("force_new_session"))
-
-        verbose_level = self._get_verbose_level(context)
-
-        # Stop button + interrupt event so long media-derived runs can be
-        # cancelled too (same mechanism as agentic_text).
-        interrupt_event = asyncio.Event()
-        stop_kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Stop", callback_data=f"stop:{user_id}")]]
-        )
+        # Correlation id tying this media message through the Claude run,
+        # storage and reply together in the logs. Unbound in the finally below.
+        request_id = uuid4().hex
+        bind_contextvars(request_id=request_id)
         try:
-            await progress_msg.edit_reply_markup(reply_markup=stop_kb)
-        except Exception:
-            pass
-        # Serialize per-user requests so a second concurrent message can't
-        # clobber this one's ActiveRequest while it is still in flight.
-        request_lock = self._get_request_lock(user_id)
-        await request_lock.acquire()
-        self._active_requests[user_id] = ActiveRequest(
-            user_id=user_id,
-            interrupt_event=interrupt_event,
-            progress_msg=progress_msg,
-        )
+            claude_integration = context.bot_data.get("claude_integration")
+            if not claude_integration:
+                await progress_msg.edit_text(
+                    "Claude integration not available. Check configuration."
+                )
+                return
 
-        tool_log: List[Dict[str, Any]] = []
-        mcp_images_media: List[ImageAttachment] = []
-        on_stream = self._make_stream_callback(
-            verbose_level,
-            progress_msg,
-            tool_log,
-            time.monotonic(),
-            mcp_images=mcp_images_media,
-            approved_directory=self.settings.approved_directory,
-            reply_markup=stop_kb,
-            interrupt_event=interrupt_event,
-        )
-
-        heartbeat = self._start_typing_heartbeat(chat)
-        try:
-            claude_response = await claude_integration.run_command(
-                prompt=prompt,
-                working_directory=current_dir,
-                user_id=user_id,
-                session_id=session_id,
-                on_stream=on_stream,
-                force_new=force_new,
-                images=images,
-                interrupt_event=interrupt_event,
+            current_dir = context.user_data.get(
+                "current_directory", self.settings.approved_directory
             )
-        except Exception:
-            # Clear the dead "Working..." progress message (with its now-useless
-            # Stop button) before the caller reports the error — otherwise it
-            # lingers forever in the chat.
+            session_id = context.user_data.get("claude_session_id")
+            force_new = bool(context.user_data.get("force_new_session"))
+
+            verbose_level = self._get_verbose_level(context)
+
+            # Stop button on the existing progress message; the run lifecycle
+            # (interrupt event, lock, ActiveRequest, heartbeat) is owned by the
+            # _claude_run context manager (same mechanism as agentic_text).
+            stop_kb = self._build_stop_kb(user_id)
             try:
-                await progress_msg.delete()
+                await progress_msg.edit_reply_markup(reply_markup=stop_kb)
             except Exception:
-                logger.debug("Failed to delete progress message, ignoring")
-            raise
-        finally:
-            heartbeat.cancel()
-            self._active_requests.pop(user_id, None)
-            request_lock.release()
+                pass
 
-        if force_new:
-            context.user_data["force_new_session"] = False
+            tool_log: List[Dict[str, Any]] = []
+            mcp_images_media: List[ImageAttachment] = []
+            formatted_messages: List["FormattedMessage"] = []
 
-        context.user_data["claude_session_id"] = claude_response.session_id
-
-        from .handlers.message import _update_working_directory_from_claude_response
-        from .utils.formatting import ResponseFormatter
-
-        # The run completed without raising but the SDK flagged an error
-        # (e.g. no ResultMessage / budget cap). Surface it and skip the cost
-        # charge for a 'no_result_message' run that produced nothing usable.
-        if claude_response.is_error:
-            from .handlers.message import _format_error_message
-
-            try:
-                await progress_msg.delete()
-            except Exception:
-                logger.debug("Failed to delete progress message, ignoring")
-            await update.effective_message.reply_text(
-                _format_error_message(
-                    claude_response.error_type or "Claude returned an error."
-                ),
-                parse_mode="HTML",
-            )
-            return
-
-        # The run succeeded; from here on always clear the "Working..." message
-        # (with its Stop button) even if post-processing raises — otherwise the
-        # caller reports an error AND a stale progress message lingers.
-        try:
-            rate_limiter = context.bot_data.get("rate_limiter")
-            if rate_limiter:
-                await rate_limiter.record_actual_cost(user_id, claude_response.cost)
-
-            _update_working_directory_from_claude_response(
-                claude_response, context, self.settings, user_id
-            )
-
-            formatter = ResponseFormatter(self.settings)
-            # Redact secrets from the response body before it leaves the bot —
-            # tool OUTPUT (e.g. a printenv dump) can land here.
-            response_content = redact_secrets(claude_response.content or "")
-            if claude_response.interrupted:
-                response_content = response_content + "\n\n_(Interrupted by user)_"
-            formatted_messages = formatter.format_claude_response(response_content)
-        finally:
-            try:
-                await progress_msg.delete()
-            except Exception:
-                logger.debug("Failed to delete progress message, ignoring")
-
-        # Use MCP-collected images (from send_image_to_user tool calls).
-        images: List[ImageAttachment] = mcp_images_media
-
-        caption_sent = False
-        if images and len(formatted_messages) == 1:
-            msg = formatted_messages[0]
-            if msg.text and len(msg.text) <= 1024:
+            async with self._claude_run(
+                user_id=user_id, chat=chat, progress_msg=progress_msg
+            ) as interrupt_event:
+                on_stream = self._make_stream_callback(
+                    verbose_level,
+                    progress_msg,
+                    tool_log,
+                    time.monotonic(),
+                    mcp_images=mcp_images_media,
+                    approved_directory=self.settings.approved_directory,
+                    reply_markup=stop_kb,
+                    interrupt_event=interrupt_event,
+                )
                 try:
-                    caption_sent = await self._send_images(
-                        update,
-                        images,
-                        reply_to_message_id=update.message.message_id,
-                        caption=msg.text,
-                        caption_parse_mode=msg.parse_mode,
+                    claude_response = await claude_integration.run_command(
+                        prompt=prompt,
+                        working_directory=current_dir,
+                        user_id=user_id,
+                        session_id=session_id,
+                        on_stream=on_stream,
+                        force_new=force_new,
+                        images=images,
+                        interrupt_event=interrupt_event,
                     )
-                except Exception as img_err:
-                    logger.warning("Image+caption send failed", error=str(img_err))
-
-        if not caption_sent:
-            for i, message in enumerate(formatted_messages):
-                if not message.text or not message.text.strip():
-                    continue
-                try:
-                    await update.message.reply_text(
-                        message.text,
-                        parse_mode=message.parse_mode,
-                        reply_markup=None,
-                        reply_to_message_id=(
-                            update.message.message_id if i == 0 else None
-                        ),
-                    )
-                except Exception as send_err:
-                    logger.warning(
-                        "Failed to send HTML response, retrying as plain text",
-                        error=str(send_err),
-                        message_index=i,
-                    )
+                except Exception:
+                    # Clear the dead "Working..." progress message (with its
+                    # now-useless Stop button) before the caller reports the
+                    # error — otherwise it lingers forever in the chat.
                     try:
-                        await update.message.reply_text(
-                            message.text,
-                            reply_markup=None,
-                            reply_to_message_id=(
-                                update.message.message_id if i == 0 else None
-                            ),
-                        )
-                    except Exception as plain_err:
-                        await update.message.reply_text(
-                            f"Failed to deliver response "
-                            f"(Telegram error: {str(plain_err)[:150]}). "
-                            f"Please try again.",
-                            reply_to_message_id=(
-                                update.message.message_id if i == 0 else None
-                            ),
-                        )
-                if i < len(formatted_messages) - 1:
-                    await asyncio.sleep(0.5)
+                        await progress_msg.delete()
+                    except Exception:
+                        logger.debug("Failed to delete progress message, ignoring")
+                    raise
 
-            if images:
+            context.user_data["claude_session_id"] = claude_response.session_id
+
+            from .handlers.message import (
+                _update_working_directory_from_claude_response,
+            )
+            from .utils.formatting import ResponseFormatter
+
+            # The run completed without raising but the SDK flagged an error
+            # (e.g. no ResultMessage / budget cap). Surface it and skip the cost
+            # charge for a 'no_result_message' run that produced nothing usable.
+            if claude_response.is_error:
+                from .handlers.message import _format_error_message
+
                 try:
-                    await self._send_images(
-                        update,
-                        images,
-                        reply_to_message_id=update.message.message_id,
-                    )
-                except Exception as img_err:
-                    logger.warning("Image send failed", error=str(img_err))
+                    await progress_msg.delete()
+                except Exception:
+                    logger.debug("Failed to delete progress message, ignoring")
+                await update.effective_message.reply_text(
+                    self._error_with_ref(
+                        _format_error_message(
+                            claude_response.error_type or "Claude returned an error."
+                        ),
+                        request_id,
+                    ),
+                    parse_mode="HTML",
+                )
+                return
+
+            # The run succeeded; from here on always clear the "Working..."
+            # message (with its Stop button) even if post-processing raises —
+            # otherwise the caller reports an error AND a stale progress message
+            # lingers.
+            try:
+                # New session produced a usable result — clear the one-shot flag
+                # now. A soft error (is_error above) keeps it so the next message
+                # still forces a new session, matching the exception path.
+                if force_new:
+                    context.user_data["force_new_session"] = False
+
+                rate_limiter = context.bot_data.get("rate_limiter")
+                if rate_limiter:
+                    await rate_limiter.record_actual_cost(user_id, claude_response.cost)
+
+                _update_working_directory_from_claude_response(
+                    claude_response, context, self.settings, user_id
+                )
+
+                formatter = ResponseFormatter(self.settings)
+                # Redact secrets from the response body before it leaves the
+                # bot — tool OUTPUT (e.g. a printenv dump) can land here.
+                response_content = redact_secrets(claude_response.content or "")
+                if claude_response.interrupted:
+                    response_content = response_content + "\n\n_(Interrupted by user)_"
+                formatted_messages = formatter.format_claude_response(response_content)
+            finally:
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    logger.debug("Failed to delete progress message, ignoring")
+
+            # Use MCP-collected images (from send_image_to_user tool calls).
+            await self._deliver_response(update, formatted_messages, mcp_images_media)
+        finally:
+            unbind_contextvars("request_id")
 
     async def _handle_stop_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1810,6 +1880,15 @@ class MessageOrchestrator:
                 f"{git_badge}{session_badge}",
                 parse_mode="HTML",
             )
+
+            audit_logger = context.bot_data.get("audit_logger")
+            if audit_logger:
+                await audit_logger.log_command(
+                    user_id=update.effective_user.id,
+                    command="repo",
+                    args=[target_name],
+                    success=True,
+                )
             return
 
         # No args — list repos
@@ -2284,3 +2363,12 @@ class MessageOrchestrator:
             f"Resumed session <code>{short_id}…</code>{dir_display}",
             parse_mode="HTML",
         )
+
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=query.from_user.id,
+                command="resume",
+                args=[short_id],
+                success=True,
+            )

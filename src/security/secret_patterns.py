@@ -36,7 +36,7 @@ SECRET_PATTERNS: List["re.Pattern[str]"] = [
         r"|(SG\.[A-Za-z0-9_-]{5})[A-Za-z0-9_.-]*"
     ),
     # Telegram bot token (digits:alphanum_-, ~46 chars)
-    re.compile(r"(\d{6,12}:AAE[A-Za-z0-9_-]{5})[A-Za-z0-9_-]*"),
+    re.compile(r"(\d{6,12}:AA[A-Za-z0-9_-]{5})[A-Za-z0-9_-]{27,}"),
     # Anthropic / OpenAI / generic project key prefixes that vary in length
     re.compile(r"(sk-proj-[A-Za-z0-9_-]{8})[A-Za-z0-9_-]*"),
     # AWS access keys

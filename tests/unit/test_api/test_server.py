@@ -271,8 +271,22 @@ async def test_retry_sweep_excludes_dead_letter(tmp_path) -> None:
         await conn.commit()
 
     bus = AsyncMock()
-    # The pending row was never attempted (last_attempt_at IS NULL) so it is
-    # eligible immediately; the dead-lettered row (processed=2) is skipped.
+    # A freshly-received pending row (received_at ~ now, last_attempt_at IS NULL)
+    # is still in flight — the initial publish runs the agent as a long-lived
+    # background task — so the sweep must NOT replay it yet (that would spawn a
+    # second concurrent run for the same delivery).
+    assert await retry_pending_webhooks(db, bus, base_delay_seconds=60) == 0
+    bus.publish.assert_not_awaited()
+
+    # Once the in-flight grace elapses the run is treated as orphaned and the row
+    # becomes eligible; the dead-lettered row (processed=2) stays excluded.
+    async with db.get_connection() as conn:
+        await conn.execute(
+            "UPDATE webhook_events SET received_at = datetime('now', '-1000 seconds') "
+            "WHERE delivery_id = 'pending'"
+        )
+        await conn.commit()
+
     replayed = await retry_pending_webhooks(db, bus, base_delay_seconds=60)
 
     assert replayed == 1

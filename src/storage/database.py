@@ -355,6 +355,32 @@ class DatabaseManager:
                     ON webhook_events(processed, attempts);
                 """,
             ),
+            (
+                7,
+                """
+                -- Expression indexes matching the retention-purge / windowed
+                -- analytics predicates. Those queries filter on
+                -- ``datetime(<col>) </> datetime('now', ...)``. Wrapping the
+                -- indexed column in datetime() makes the plain
+                -- column indexes (idx_messages_timestamp, ...) unusable, so
+                -- every purge/analytics run degrades to a full table scan
+                -- (under a write lock for the DELETEs). SQLite can use an index
+                -- on the *expression* datetime(<col>) when the WHERE clause
+                -- uses the exact same expression -- so these are additive and
+                -- require no query rewrite or data migration. datetime(<col>)
+                -- is deterministic (no 'now' argument), so it is indexable.
+                CREATE INDEX IF NOT EXISTS idx_messages_ts_expr
+                    ON messages(datetime(timestamp));
+                CREATE INDEX IF NOT EXISTS idx_audit_log_ts_expr
+                    ON audit_log(datetime(timestamp));
+                CREATE INDEX IF NOT EXISTS idx_tool_usage_ts_expr
+                    ON tool_usage(datetime(timestamp));
+                CREATE INDEX IF NOT EXISTS idx_sessions_last_used_expr
+                    ON sessions(datetime(last_used));
+                CREATE INDEX IF NOT EXISTS idx_webhook_events_received_expr
+                    ON webhook_events(datetime(received_at));
+                """,
+            ),
         ]
 
     async def _init_pool(self):
@@ -378,6 +404,10 @@ class DatabaseManager:
                 )
                 conn.row_factory = aiosqlite.Row
                 await conn.execute("PRAGMA foreign_keys = ON")
+                # busy_timeout is per-connection (not persisted): make a
+                # concurrent writer wait for the WAL write lock instead of
+                # failing immediately with SQLITE_BUSY.
+                await conn.execute("PRAGMA busy_timeout=5000")
                 self._connection_pool.append(conn)
 
     @asynccontextmanager
@@ -396,6 +426,7 @@ class DatabaseManager:
             )
             transient_conn.row_factory = aiosqlite.Row
             await transient_conn.execute("PRAGMA foreign_keys = ON")
+            await transient_conn.execute("PRAGMA busy_timeout=5000")
             try:
                 yield transient_conn
             finally:
@@ -418,6 +449,7 @@ class DatabaseManager:
                 )
                 conn.row_factory = aiosqlite.Row
                 await conn.execute("PRAGMA foreign_keys = ON")
+                await conn.execute("PRAGMA busy_timeout=5000")
 
             yield conn
         finally:

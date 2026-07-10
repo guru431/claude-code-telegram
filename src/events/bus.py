@@ -156,21 +156,13 @@ class EventBus:
             logger.debug("No handlers for event", event_type=event.event_type)
             return
 
-        # Run all handlers concurrently
-        results = await asyncio.gather(
+        # Run all handlers concurrently. Each is wrapped in _safe_call, which
+        # logs and isolates its own exception; return_exceptions=True keeps one
+        # handler's failure from cancelling the others.
+        await asyncio.gather(
             *(self._safe_call(handler, event) for handler in handlers),
             return_exceptions=True,
         )
-
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(
-                    "Event handler failed",
-                    event_type=event.event_type,
-                    event_id=event.id,
-                    handler=handlers[i].__qualname__,
-                    error=str(result),
-                )
 
     async def _safe_call(self, handler: EventHandler, event: Event) -> None:
         """Call handler with error isolation."""
@@ -181,5 +173,5 @@ class EventBus:
                 "Unhandled error in event handler",
                 handler=handler.__qualname__,
                 event_type=event.event_type,
+                event_id=event.id,
             )
-            raise

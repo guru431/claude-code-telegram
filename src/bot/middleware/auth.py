@@ -68,7 +68,11 @@ async def auth_middleware(handler: Callable, event: Any, data: Dict[str, Any]) -
         "Attempting authentication for user", user_id=user_id, username=username
     )
 
-    # Try to authenticate (providers will check whitelist and tokens)
+    # Try to authenticate. No credentials are collected on the message path
+    # (there is no token-login command), so this always passes empty
+    # credentials: whitelist auth works, but TokenAuthProvider always sees
+    # token=None and returns False. Token auth is therefore non-functional as
+    # the sole provider -- see FINDINGS.md 2026-07-09 "TokenAuthProvider".
     authentication_successful = await auth_manager.authenticate_user(user_id)
 
     # Log authentication attempt
@@ -125,57 +129,3 @@ async def auth_middleware(handler: Callable, event: Any, data: Dict[str, Any]) -
                 parse_mode="HTML",
             )
         return  # Stop processing
-
-
-async def require_auth(handler: Callable, event: Any, data: Dict[str, Any]) -> Any:
-    """Decorator-style middleware that requires authentication.
-
-    This is a stricter version that only allows authenticated users.
-    """
-    user_id = event.effective_user.id if event.effective_user else None
-    auth_manager = data.get("auth_manager")
-
-    if not auth_manager or not auth_manager.is_authenticated(user_id):
-        if event.effective_message:
-            await event.effective_message.reply_text(
-                "🔒 Authentication required to use this command."
-            )
-        return
-
-    return await handler(event, data)
-
-
-async def admin_required(handler: Callable, event: Any, data: Dict[str, Any]) -> Any:
-    """Middleware that requires admin privileges.
-
-    Note: This is a placeholder - admin privileges would need to be
-    implemented in the authentication system.
-    """
-    user_id = event.effective_user.id if event.effective_user else None
-    auth_manager = data.get("auth_manager")
-
-    if not auth_manager or not auth_manager.is_authenticated(user_id):
-        if event.effective_message:
-            await event.effective_message.reply_text("🔒 Authentication required.")
-        return
-
-    session = auth_manager.get_session(user_id)
-    if not session or not session.user_info:
-        if event.effective_message:
-            await event.effective_message.reply_text(
-                "🔒 Session information unavailable."
-            )
-        return
-
-    # Check for admin permissions (placeholder logic)
-    permissions = session.user_info.get("permissions", [])
-    if "admin" not in permissions:
-        if event.effective_message:
-            await event.effective_message.reply_text(
-                "🔒 <b>Admin Access Required</b>\n\n"
-                "This command requires administrator privileges.",
-                parse_mode="HTML",
-            )
-        return
-
-    return await handler(event, data)

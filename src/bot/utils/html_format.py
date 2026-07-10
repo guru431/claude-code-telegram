@@ -86,7 +86,8 @@ def markdown_to_telegram_html(text: str) -> str:
 
     # --- 4. Bold: **text** or __text__ ---
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
+    # __text__ only at word boundaries (avoid some_var__thing__more)
+    text = re.sub(r"(?<!\w)__(\S.*?\S|\S)__(?!\w)", r"<b>\1</b>", text)
 
     # --- 5. Italic: *text* (require non-space after/before) ---
     text = re.sub(r"\*(\S.*?\S|\S)\*", r"<i>\1</i>", text)

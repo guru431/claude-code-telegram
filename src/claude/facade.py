@@ -264,9 +264,13 @@ class ClaudeIntegration:
         if matching_sessions:
             return max(matching_sessions, key=lambda s: s.last_used)
 
-        # Fallback: discover sessions from ~/.claude/projects/ (VS Code / CLI)
+        # Fallback: discover sessions from ~/.claude/projects/ (VS Code / CLI).
+        # Synchronous JSONL filesystem scan — offload to a thread so it does not
+        # block the event loop.
         known_ids = {s.session_id for s in sessions if s.session_id}
-        local = find_latest_local_session(working_directory, exclude_ids=known_ids)
+        local = await asyncio.to_thread(
+            find_latest_local_session, working_directory, exclude_ids=known_ids
+        )
         # _encode_path() collapses distinct dirs to the same folder name, so the
         # folder match alone can return a *sibling* directory's session. Verify
         # the session's recorded cwd actually equals the requested directory

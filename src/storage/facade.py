@@ -207,21 +207,56 @@ class Storage:
         self, user_id: int, project_path: str, session_id: str
     ) -> SessionModel:
         """Create new session."""
+        now = datetime.now(UTC)
         session = SessionModel(
             session_id=session_id,
             user_id=user_id,
             project_path=project_path,
-            created_at=datetime.now(UTC),
-            last_used=datetime.now(UTC),
+            created_at=now,
+            last_used=now,
         )
 
-        await self.sessions.create_session(session)
+        # Insert the session row and bump the user's session counter in a single
+        # transaction on one borrowed connection, committing both together. Two
+        # independent commits (SessionRepository.create_session then
+        # UserRepository.increment_session_count) can desync users.session_count
+        # if the process crashes or the second write hits "database is locked"
+        # in between. The UPDATE only touches the create_session-owned columns
+        # (session_count/last_active), so it still cannot clobber a concurrent
+        # increment_stats (which owns total_cost/message_count).
+        async with self.db_manager.get_connection() as conn:
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO sessions
+                    (session_id, user_id, project_path, created_at, last_used)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session.session_id,
+                        session.user_id,
+                        session.project_path,
+                        session.created_at,
+                        session.last_used,
+                    ),
+                )
+                await conn.execute(
+                    """
+                    UPDATE users
+                    SET session_count = session_count + 1,
+                        last_active = ?
+                    WHERE user_id = ?
+                    """,
+                    (now, user_id),
+                )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
 
-        # Atomically bump the session counter without a read-modify-write that
-        # could clobber a concurrent increment_stats (which owns total_cost /
-        # message_count). increment_session_count touches only the
-        # create_session-owned columns.
-        await self.users.increment_session_count(user_id, last_active=datetime.now(UTC))
+        logger.info(
+            "Created session", session_id=session.session_id, user_id=user_id
+        )
 
         return session
 

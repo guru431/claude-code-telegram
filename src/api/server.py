@@ -4,6 +4,7 @@ Runs in the same process as the bot, sharing the event loop.
 Receives external webhooks and publishes them as events on the bus.
 """
 
+import hashlib
 import json
 import uuid
 from datetime import UTC, datetime
@@ -19,6 +20,12 @@ from ..storage.database import DatabaseManager
 from .auth import verify_github_signature, verify_shared_secret
 
 logger = structlog.get_logger()
+
+# Reject webhook bodies larger than this before buffering them into memory.
+# The body is read in full (needed for signature verification) before auth
+# runs, so an unauthenticated caller could otherwise force an OOM. GitHub caps
+# webhook payloads at 25 MB; anything larger is treated as abuse.
+_MAX_WEBHOOK_BODY_BYTES = 25 * 1024 * 1024
 
 
 def create_api_app(
@@ -49,7 +56,23 @@ def create_api_app(
         authorization: Optional[str] = Header(None),
     ) -> Dict[str, str]:
         """Receive and validate webhook from an external provider."""
-        body = await request.body()
+        # Reject oversized payloads before buffering them into memory. Check the
+        # declared Content-Length first for a cheap reject, then cap the actual
+        # stream to defend against a missing/spoofed length (chunked transfer).
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared = int(content_length)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid Content-Length")
+            if declared > _MAX_WEBHOOK_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="Payload too large")
+
+        body = b""
+        async for chunk in request.stream():
+            body += chunk
+            if len(body) > _MAX_WEBHOOK_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="Payload too large")
 
         # Verify signature based on provider
         if provider == "github":
@@ -100,7 +123,15 @@ def create_api_app(
             if not verify_shared_secret(authorization, secret):
                 raise HTTPException(status_code=401, detail="Invalid authorization")
             event_type_name = request.headers.get("X-Event-Type", "unknown")
-            delivery_id = request.headers.get("X-Delivery-ID", str(uuid.uuid4()))
+            delivery_id = request.headers.get("X-Delivery-ID")
+            if not delivery_id:
+                # No stable delivery id from the provider: derive one
+                # deterministically from provider + raw body so an at-least-once
+                # retry of the same payload collides on the dedup key instead of
+                # generating a fresh random id that would defeat deduplication.
+                delivery_id = hashlib.sha256(
+                    provider.encode("utf-8") + b"\0" + body
+                ).hexdigest()
 
         # Parse JSON payload from the already-buffered body so we do not
         # re-read the request stream after signature verification.
@@ -264,26 +295,39 @@ async def recover_unprocessed_webhooks(
 
 
 async def retry_pending_webhooks(
-    db_manager: DatabaseManager, event_bus: EventBus, base_delay_seconds: int = 60
+    db_manager: DatabaseManager,
+    event_bus: EventBus,
+    base_delay_seconds: int = 60,
+    in_flight_grace_seconds: int = 900,
 ) -> int:
     """Periodic retry sweep: replay pending deliveries whose backoff has elapsed.
 
     Backoff is exponential per attempt (``base_delay_seconds * 2**attempts``).
     Rows that exhausted their retry budget are already dead-lettered
-    (``processed=2``) and excluded; ``processed=0`` rows never attempted yet
-    (``last_attempt_at IS NULL``) are eligible immediately. The claim stamps
-    ``last_attempt_at`` atomically, so an in-flight row recovered at startup or
-    by a prior sweep is not re-replayed until its backoff window elapses.
+    (``processed=2``) and excluded. A ``processed=0`` row never attempted yet
+    (``last_attempt_at IS NULL``) is normally still in flight — the initial
+    publish runs the agent as a background task for minutes — so it becomes
+    eligible only once its ``received_at`` is older than
+    ``in_flight_grace_seconds`` (i.e. the run was orphaned, not merely slow);
+    replaying it sooner would spawn a second concurrent run for the same
+    delivery. The claim stamps ``last_attempt_at`` atomically, so an in-flight
+    row recovered at startup or by a prior sweep is not re-replayed until its
+    backoff window elapses.
     """
     where_extra = (
         " AND ("
-        "  last_attempt_at IS NULL OR "
-        "  datetime(last_attempt_at) <= "
-        "  datetime('now', '-' || (? * (1 << attempts)) || ' seconds')"
+        "  (last_attempt_at IS NULL AND"
+        "   datetime(received_at) <= datetime('now', '-' || ? || ' seconds')) OR"
+        "  (last_attempt_at IS NOT NULL AND"
+        "   datetime(last_attempt_at) <="
+        "   datetime('now', '-' || (? * (1 << attempts)) || ' seconds'))"
         ")"
     )
     replayed = await _claim_and_replay(
-        db_manager, event_bus, where_extra, (base_delay_seconds,)
+        db_manager,
+        event_bus,
+        where_extra,
+        (in_flight_grace_seconds, base_delay_seconds),
     )
     if replayed:
         logger.info("Retried pending webhook events", count=replayed)

@@ -40,7 +40,11 @@ def verify_github_signature(
         ).hexdigest()
     )
 
-    return hmac.compare_digest(expected_signature, signature_header)
+    try:
+        return hmac.compare_digest(expected_signature, signature_header)
+    except TypeError:
+        logger.warning("GitHub webhook signature contains non-ASCII characters")
+        return False
 
 
 def verify_shared_secret(
@@ -58,4 +62,7 @@ def verify_shared_secret(
         return False
 
     token = authorization_header[7:]
-    return hmac.compare_digest(token, secret)
+    try:
+        return hmac.compare_digest(token, secret)
+    except TypeError:
+        return False

@@ -445,7 +445,13 @@ async def run_application(app: Dict[str, Any]) -> int:
                 except Exception:
                     _log.exception("Rate-limiter eviction failed")
 
-        maintenance_scheduler = _MaintenanceScheduler()
+        # misfire_grace_time survives the process being suspended (Windows
+        # sleep) across the fire time: without it APScheduler's ~1s default
+        # grace silently skips the run on wake. coalesce collapses several
+        # missed fires into one catch-up run.
+        maintenance_scheduler = _MaintenanceScheduler(
+            job_defaults={"misfire_grace_time": 3600, "coalesce": True},
+        )
         maintenance_scheduler.add_job(
             _daily_maintenance,
             trigger=_MaintenanceCronTrigger(hour=4, minute=30),
@@ -508,17 +514,24 @@ async def run_application(app: Dict[str, Any]) -> int:
                         config_path=config.projects_config_path,  # type: ignore[arg-type]
                         approved_directory=config.approved_directory,
                     )
-                    fresh_manager = ProjectThreadManager(
-                        registry=fresh_registry,
-                        repository=storage.project_threads,
-                        sync_action_interval_seconds=(
-                            config.project_threads_sync_action_interval_seconds
-                        ),
-                    )
+                    # Reuse the existing manager (only repoint its registry)
+                    # instead of building a new one: sync_topics serializes runs
+                    # via the instance-level _sync_lock, so a /sync_threads still
+                    # running on the current manager and a nightly sync on a
+                    # fresh manager would hold different locks and race,
+                    # duplicating forum topics. Sharing the manager shares the
+                    # lock.
+                    manager = project_threads_manager
+                    if manager is None:
+                        _log.warning(
+                            "Nightly discovery: project thread manager missing; "
+                            "skipping topic sync"
+                        )
+                        return
+                    manager.registry = fresh_registry
 
                     # Update bot deps so new topics are routable
                     bot.deps["project_registry"] = fresh_registry
-                    bot.deps["project_threads_manager"] = fresh_manager
 
                     # Sync topics in Telegram
                     if config.project_threads_mode == "group":
@@ -528,7 +541,7 @@ async def run_application(app: Dict[str, Any]) -> int:
                             config.allowed_users[0] if config.allowed_users else None
                         )
                     if chat_id:
-                        sync_result = await fresh_manager.sync_topics(
+                        sync_result = await manager.sync_topics(
                             telegram_bot, chat_id=chat_id
                         )
                         _log.info(
@@ -542,7 +555,9 @@ async def run_application(app: Dict[str, Any]) -> int:
                 except Exception:
                     _log.exception("Nightly project discovery failed")
 
-            discovery_scheduler = _DiscoveryScheduler()
+            discovery_scheduler = _DiscoveryScheduler(
+                job_defaults={"misfire_grace_time": 3600, "coalesce": True},
+            )
             discovery_scheduler.add_job(
                 _nightly_project_discovery,
                 trigger=_DiscoveryCronTrigger(hour=3, minute=0),

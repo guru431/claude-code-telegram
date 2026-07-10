@@ -225,7 +225,20 @@ class NotificationService:
 
     async def _deliver(self, event: AgentResponseEvent) -> None:
         """Send one event to all its resolved chats with rate limiting."""
-        for chat_id in self._resolve_chat_ids(event):
+        chat_ids = self._resolve_chat_ids(event)
+        if not chat_ids:
+            # No chat_id on the event and no NOTIFICATION_CHAT_IDS configured:
+            # the response has nowhere to go. Log it so an operator who enabled
+            # the scheduler/API but forgot default chats sees a diagnostic
+            # instead of silent zero output.
+            logger.warning(
+                "No chat to deliver notification to; dropping response",
+                event_id=event.id,
+                source=event.source,
+                originating_event=event.originating_event_id,
+            )
+            return
+        for chat_id in chat_ids:
             await self._rate_limited_send(chat_id, event)
 
     def _resolve_chat_ids(self, event: AgentResponseEvent) -> List[int]:
