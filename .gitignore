@@ -158,3 +158,8 @@ config/projects.yaml
 FINDINGS.md
 # local-only secret denylist for pre-commit hook (never commit)
 .sanitize-patterns
+
+# Agent-side backlog files (private to maintainer, never published)
+FINDINGS-archive.md
+IDEAS.md
+IDEAS-archive.md
