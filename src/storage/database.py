@@ -89,6 +89,10 @@ CREATE TABLE tool_usage (
 );
 
 -- Audit log table
+-- NOTE: user_id deliberately carries NO foreign key to users(user_id).
+-- Audit records the *subject* of a security event, who need not be a
+-- registered user (rejected auth attempts, unknown senders). See migration 8,
+-- which drops this FK on databases created before that decision.
 CREATE TABLE audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -96,8 +100,7 @@ CREATE TABLE audit_log (
     event_data JSON,
     success BOOLEAN DEFAULT TRUE,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    ip_address TEXT,
-    FOREIGN KEY (user_id) REFERENCES users(user_id)
+    ip_address TEXT
 );
 
 -- User tokens table (for token auth)
@@ -379,6 +382,67 @@ class DatabaseManager:
                     ON sessions(datetime(last_used));
                 CREATE INDEX IF NOT EXISTS idx_webhook_events_received_expr
                     ON webhook_events(datetime(received_at));
+                """,
+            ),
+            (
+                8,
+                """
+                -- Drop the FOREIGN KEY on audit_log.user_id.
+                --
+                -- audit_log records the *subject* of a security event. The auth
+                -- middleware logs an auth attempt before any users row exists
+                -- (the row is only created later by the handler/session layer),
+                -- so on a fresh install the very first update from any user hit
+                -- "FOREIGN KEY constraint failed" and neither the user nor the
+                -- audit row was written. Creating a users row per inbound update
+                -- is not an option -- any unauthorized sender could then inflate
+                -- the users table -- so the constraint itself goes.
+                --
+                -- SQLite has no DROP CONSTRAINT, so the table is rebuilt
+                -- (new -> copy -> drop -> rename). ``audit_log`` has no children
+                -- referencing it, so no other table needs fixing up. The
+                -- explicit transaction makes the rebuild atomic; DROP ... IF
+                -- EXISTS keeps the script re-runnable if a previous attempt died
+                -- before the version row was committed.
+                --
+                -- Rollback: recreate audit_log with
+                -- "FOREIGN KEY (user_id) REFERENCES users(user_id)" using the
+                -- same rebuild dance and delete the version-8 row from
+                -- schema_version. Rows whose user_id has no users entry must be
+                -- purged first or the copy will fail.
+                BEGIN;
+
+                DROP TABLE IF EXISTS audit_log_new;
+
+                CREATE TABLE audit_log_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_data JSON,
+                    success BOOLEAN DEFAULT TRUE,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    ip_address TEXT
+                );
+
+                INSERT INTO audit_log_new
+                    (id, user_id, event_type, event_data, success, timestamp,
+                     ip_address)
+                SELECT id, user_id, event_type, event_data, success, timestamp,
+                       ip_address
+                FROM audit_log;
+
+                DROP TABLE audit_log;
+                ALTER TABLE audit_log_new RENAME TO audit_log;
+
+                -- Indexes lived on the dropped table; recreate them.
+                CREATE INDEX IF NOT EXISTS idx_audit_log_user_id
+                    ON audit_log(user_id);
+                CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp
+                    ON audit_log(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_audit_log_ts_expr
+                    ON audit_log(datetime(timestamp));
+
+                COMMIT;
                 """,
             ),
         ]

@@ -7,7 +7,7 @@ and adds them automatically.
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 import structlog
 import yaml
@@ -32,18 +32,88 @@ SKIP_DIRS: Set[str] = {
 }
 
 
-def _slugify(name: str) -> str:
-    """Convert directory name to a URL-friendly slug.
+def slugify(name: str) -> str:
+    """Convert a directory name or relative path to a URL-friendly slug.
 
-    Underscores and any other non-alphanumeric characters collapse to hyphens
-    (e.g. ``real_project`` -> ``real-project``), so slugs are consistently
-    hyphenated. Leading/trailing separators are stripped.
+    Underscores, path separators and any other non-alphanumeric characters
+    collapse to hyphens (e.g. ``real_project`` -> ``real-project``,
+    ``site/univer`` -> ``site-univer``), so slugs are consistently hyphenated.
+    Leading/trailing separators are stripped.
+
+    This is the single source of truth for slug generation: both auto-discovery
+    and ``scripts/sync_projects_yaml.py`` use it so the same directory always
+    yields the same slug. Slugs already present in projects.yaml are never
+    recomputed (both writers dedupe by ``path``), so existing entries such as
+    ``digital_me`` keep their historical slug.
     """
     slug = name.lower().strip().strip("_").strip("-")
     slug = re.sub(r"[^a-z0-9-]", "-", slug)
     slug = re.sub(r"[-]+", "-", slug)
     slug = slug.strip("-")
     return slug or name.lower()
+
+
+def path_dedupe_key(approved_root: Path, rel_path: str) -> Optional[str]:
+    """Return a canonical key identifying the directory ``rel_path`` points at.
+
+    Registry paths are hand-editable, so the same directory can be spelled
+    several ways: ``foo``, ``./foo``, ``Foo``, ``site\\lingva``, ``a/../foo``.
+    Comparing the raw strings lets a second entry for the same directory slip
+    into projects.yaml, which then makes ``load_project_registry`` raise
+    "Duplicate project path" and takes the bot down on the next startup.
+
+    Resolving and casefolding collapses all those spellings onto one key.
+    Casefold is required because Windows paths are case-insensitive and
+    ``Path.resolve()`` only restores the on-disk casing for paths that already
+    exist.
+
+    Returns ``None`` for paths that must never be registered: absolute paths
+    and anything resolving to (or outside of) ``approved_root``.
+    """
+    raw = rel_path.strip().replace("\\", "/")
+    if not raw:
+        return None
+
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        return None
+
+    resolved = (approved_root / candidate).resolve()
+    if resolved == approved_root:
+        return None
+    try:
+        resolved.relative_to(approved_root)
+    except ValueError:
+        return None
+
+    return str(resolved).casefold()
+
+
+def iter_project_dirs(approved_root: Path) -> Iterator[Path]:
+    """Yield first-level directories of ``approved_root`` that may be projects.
+
+    Single source of truth for "which directories are scan candidates", shared
+    with ``scripts/sync_projects_yaml.py`` so both writers of projects.yaml
+    agree on what exists. Skips symlinks (they alias a directory that is either
+    already registered under its real path or lives outside the approved root),
+    dot-directories and known non-project directories.
+
+    Callers may narrow the result further; the sync script additionally
+    requires a ``.git`` directory before registering a *new* project.
+    """
+    if not approved_root.exists():
+        return
+
+    for entry in sorted(approved_root.iterdir()):
+        if entry.is_symlink():
+            continue
+        if not entry.is_dir():
+            continue
+        if entry.name.startswith("."):
+            continue
+        if entry.name in SKIP_DIRS:
+            continue
+        yield entry
 
 
 def _make_display_name(dir_name: str) -> str:
@@ -82,7 +152,9 @@ def discover_new_projects(
 
     existing_projects: List[Dict[str, str]] = data.get("projects", [])
 
-    # Collect existing paths (normalized) to avoid duplicates
+    # Collect existing paths (resolved + casefolded) to avoid duplicates. The
+    # registry dedupes by resolved absolute path, so discovery must use the same
+    # notion of identity or it will append an entry that breaks the next load.
     existing_paths: Set[str] = set()
     existing_slugs: Set[str] = set()
     existing_names: Set[str] = set()
@@ -90,7 +162,9 @@ def discover_new_projects(
     for proj in existing_projects:
         p = str(proj.get("path", "")).strip()
         if p:
-            existing_paths.add(p)
+            key = path_dedupe_key(approved_root, p)
+            if key:
+                existing_paths.add(key)
         s = str(proj.get("slug", "")).strip()
         if s:
             existing_slugs.add(s)
@@ -108,24 +182,15 @@ def discover_new_projects(
         )
         return [], len(existing_projects)
 
-    for entry in sorted(approved_root.iterdir()):
-        if not entry.is_dir():
-            continue
-
+    for entry in iter_project_dirs(approved_root):
         dir_name = entry.name
-
-        # Skip hidden dirs and known non-project dirs
-        if dir_name.startswith(".") and not dir_name.startswith("_"):
-            continue
-        if dir_name in SKIP_DIRS:
-            continue
-
         rel_path = dir_name  # first-level only
 
-        if rel_path in existing_paths:
+        path_key = path_dedupe_key(approved_root, rel_path)
+        if path_key is None or path_key in existing_paths:
             continue
 
-        slug = _slugify(dir_name)
+        slug = slugify(dir_name)
         name = _make_display_name(dir_name)
 
         # Ensure slug uniqueness
@@ -149,7 +214,7 @@ def discover_new_projects(
             "enabled": True,
         }
         new_projects.append(new_entry)
-        existing_paths.add(rel_path)
+        existing_paths.add(path_key)
         existing_slugs.add(slug)
         existing_names.add(name)
 

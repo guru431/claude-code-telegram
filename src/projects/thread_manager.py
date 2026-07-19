@@ -158,14 +158,15 @@ class ProjectThreadManager:
                             ),
                         )
                         result.closed += 1
-                    except TelegramError:
+                    except TelegramError as close_error:
                         result.failed += 1
                         logger.warning(
                             "Could not delete/close stale topic",
                             chat_id=stale.chat_id,
                             message_thread_id=stale.message_thread_id,
                             project_slug=stale.project_slug,
-                            error=str(e),
+                            error=str(close_error),
+                            delete_error=str(e),
                         )
                 finally:
                     await self.repository.set_active(

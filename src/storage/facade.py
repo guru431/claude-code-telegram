@@ -357,8 +357,10 @@ class Storage:
         if days > 0:
             # Sessions are only flipped inactive (kept resumable), not deleted.
             result["sessions_cleaned"] = await self.sessions.cleanup_old_sessions(days)
-            result["messages_purged"] = await self.messages.purge_old_messages(days)
-            result["tool_usage_purged"] = await self.tools.purge_old_tool_usage(days)
+            (
+                result["tool_usage_purged"],
+                result["messages_purged"],
+            ) = await self._purge_messages_and_tool_usage(days)
             result["webhook_events_purged"] = (
                 await self.webhooks.purge_old_webhook_events(days)
             )
@@ -371,6 +373,58 @@ class Storage:
         logger.info("Data cleanup complete", **result)
 
         return result
+
+    async def _purge_messages_and_tool_usage(self, days: int) -> tuple[int, int]:
+        """Purge old tool_usage then messages in one transaction.
+
+        ``tool_usage.message_id`` references ``messages.message_id``, so parents
+        must go last. Purging the two tables by age independently is not enough:
+        a tool_usage row can be newer than the message it belongs to and would
+        survive its own age filter, leaving the parent DELETE to fail with
+        "FOREIGN KEY constraint failed" mid-cleanup. Children are therefore
+        selected by age *or* by pointing at a message that is about to go.
+
+        Both DELETEs share one transaction so a failure rolls back cleanly and a
+        rerun starts from a consistent state. Returns
+        ``(tool_usage_purged, messages_purged)``.
+        """
+        cutoff = "datetime('now', '-' || ? || ' days')"
+        async with self.db_manager.get_connection() as conn:
+            try:
+                cursor = await conn.execute(
+                    f"""
+                    DELETE FROM tool_usage
+                    WHERE datetime(timestamp) < {cutoff}
+                       OR message_id IN (
+                           SELECT message_id FROM messages
+                           WHERE datetime(timestamp) < {cutoff}
+                       )
+                    """,  # noqa: S608 — cutoff is a static parameterized fragment
+                    (days, days),
+                )
+                tool_usage_purged = cursor.rowcount
+
+                cursor = await conn.execute(
+                    f"""
+                    DELETE FROM messages
+                    WHERE datetime(timestamp) < {cutoff}
+                    """,  # noqa: S608 — cutoff is a static parameterized fragment
+                    (days,),
+                )
+                messages_purged = cursor.rowcount
+
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+        logger.info(
+            "Purged old messages and tool usage",
+            messages=messages_purged,
+            tool_usage=tool_usage_purged,
+            days=days,
+        )
+        return tool_usage_purged, messages_purged
 
     async def get_user_dashboard(self, user_id: int) -> Dict[str, Any]:
         """Get comprehensive user dashboard data."""

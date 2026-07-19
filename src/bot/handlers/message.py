@@ -19,6 +19,7 @@ from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.rate_limiter import RateLimiter
 from ...security.validators import SecurityValidator
+from ..middleware.rate_limit import estimate_message_cost
 from ..utils.html_format import escape_html
 from ..utils.image_extractor import (
     ImageAttachment,
@@ -48,11 +49,11 @@ async def _format_progress_update(update_obj) -> Optional[str]:
             if update_obj.metadata and update_obj.metadata.get("execution_time_ms"):
                 time_ms = update_obj.metadata["execution_time_ms"]
                 execution_time = f" ({time_ms}ms)"
-            return f"✅ <b>{tool_name} completed</b>{execution_time}"
+            return f"✅ <b>{escape_html(tool_name)} completed</b>{execution_time}"
 
     elif update_obj.type == "progress":
         # Handle progress updates
-        progress_text = f"🔄 <b>{update_obj.content or 'Working...'}</b>"
+        progress_text = f"🔄 <b>{escape_html(update_obj.content or 'Working...')}</b>"
 
         percentage = update_obj.get_progress_percentage()
         if percentage is not None:
@@ -81,7 +82,7 @@ async def _format_progress_update(update_obj) -> Optional[str]:
         tool_names = update_obj.get_tool_names()
         if tool_names:
             tools_text = ", ".join(tool_names)
-            return f"🔧 <b>Using tools:</b> {tools_text}"
+            return f"🔧 <b>Using tools:</b> {escape_html(tools_text)}"
 
     elif update_obj.type == "assistant" and update_obj.content:
         # Regular content updates with preview
@@ -90,7 +91,10 @@ async def _format_progress_update(update_obj) -> Optional[str]:
             if len(update_obj.content) > 150
             else update_obj.content
         )
-        return f"🤖 <b>Claude is working...</b>\n\n<i>{content_preview}</i>"
+        return (
+            f"🤖 <b>Claude is working...</b>\n\n"
+            f"<i>{escape_html(content_preview)}</i>"
+        )
 
     elif update_obj.type == "system":
         # System initialization or other system messages
@@ -336,8 +340,9 @@ async def handle_text_message(
 
     try:
         # Rate limiting was already enforced by rate_limit_middleware (group -1);
-        # re-checking here would double-charge the token bucket. The real cost is
-        # recorded after the run via rate_limiter.record_actual_cost.
+        # re-checking here would double-charge the token bucket. Budget for the
+        # run is held via rate_limiter.reserve_cost and released with the real
+        # cost via rate_limiter.settle_reservation below.
 
         # Send typing indicator
         await update.message.chat.send_action("typing")
@@ -415,6 +420,21 @@ async def handle_text_message(
             except Exception as e:
                 logger.warning("Failed to update progress message", error=str(e))
 
+        # Hold budget for this specific run. The middleware only throttled;
+        # money is charged here and released in the finally below on every
+        # path (success, soft error, exception, cancel).
+        reservation_id: Optional[str] = None
+        actual_cost = 0.0
+        if rate_limiter:
+            reservation_id, reserve_error = await rate_limiter.reserve_cost(
+                user_id, estimate_message_cost(update)
+            )
+            if reserve_error:
+                await progress_msg.edit_text(
+                    f"⏱️ {escape_html(reserve_error)}", parse_mode="HTML"
+                )
+                return
+
         # Run Claude command. Initialize so a failure inside run_command leaves
         # claude_response bound (the inner except below references it).
         claude_response = None
@@ -435,9 +455,11 @@ async def handle_text_message(
             # Update session ID
             context.user_data["claude_session_id"] = claude_response.session_id
 
-            # Charge the real cost so claude_max_cost_per_user is enforced.
-            if rate_limiter:
-                await rate_limiter.record_actual_cost(user_id, claude_response.cost)
+            # Settled in the finally below so a later failure cannot leave the
+            # hold outstanding. A run flagged is_error produced nothing usable
+            # and is not charged.
+            if not claude_response.is_error:
+                actual_cost = claude_response.cost
 
             # Check if Claude changed the working directory and update our tracking
             _update_working_directory_from_claude_response(
@@ -472,6 +494,11 @@ async def handle_text_message(
             formatted_messages = [
                 FormattedMessage(_format_error_message(e), parse_mode="HTML")
             ]
+        finally:
+            # Always release the hold. A run that produced no usable result
+            # settles at 0.0 and costs the user nothing.
+            if rate_limiter and reservation_id:
+                await rate_limiter.settle_reservation(reservation_id, actual_cost)
 
         # Delete progress message
         await progress_msg.delete()
@@ -769,15 +796,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
 
-        # Check rate limit for file processing
-        file_cost = _estimate_file_processing_cost(document.file_size)
-        if rate_limiter:
-            allowed, limit_message = await rate_limiter.check_rate_limit(
-                user_id, file_cost
-            )
-            if not allowed:
-                await update.message.reply_text(f"⏱️ {limit_message}")
-                return
+        # Throttling was already applied to this update by rate_limit_middleware
+        # (group -1); re-checking here would burn a second bucket token. Budget
+        # is held just before the Claude run below via reserve_cost.
 
         # Send processing indicator
         await update.message.chat.send_action("upload_document")
@@ -873,6 +894,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         session_id = context.user_data.get("claude_session_id")
 
+        # Hold budget for this run, sized from the actual upload; released in
+        # the finally below on every path so a failure costs the user nothing.
+        file_cost = _estimate_file_processing_cost(document.file_size)
+        reservation_id: Optional[str] = None
+        actual_cost = 0.0
+        if rate_limiter:
+            reservation_id, reserve_error = await rate_limiter.reserve_cost(
+                user_id, file_cost
+            )
+            if reserve_error:
+                await claude_progress_msg.edit_text(
+                    f"⏱️ {escape_html(reserve_error)}", parse_mode="HTML"
+                )
+                return
+
         # Process with Claude
         try:
             claude_response = await claude_integration.run_command(
@@ -885,9 +921,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             # Update session ID
             context.user_data["claude_session_id"] = claude_response.session_id
 
-            # Charge the real cost so claude_max_cost_per_user is enforced.
-            if rate_limiter:
-                await rate_limiter.record_actual_cost(user_id, claude_response.cost)
+            # Settled in the finally below; a run flagged is_error produced
+            # nothing usable and is not charged.
+            if not claude_response.is_error:
+                actual_cost = claude_response.cost
 
             # Check if Claude changed the working directory and update our tracking
             _update_working_directory_from_claude_response(
@@ -943,6 +980,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     success=False,
                     file_size=document.file_size,
                 )
+        finally:
+            # Always release the hold; a failed or empty run settles at 0.0.
+            if rate_limiter and reservation_id:
+                await rate_limiter.settle_reservation(reservation_id, actual_cost)
 
     except Exception as e:
         if progress_msg:
@@ -1018,6 +1059,21 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             session_id = context.user_data.get("claude_session_id")
 
+            # Hold budget for this run; released in the finally below on every
+            # path so a failure or empty result costs the user nothing.
+            rate_limiter: Optional[RateLimiter] = context.bot_data.get("rate_limiter")
+            reservation_id: Optional[str] = None
+            actual_cost = 0.0
+            if rate_limiter:
+                reservation_id, reserve_error = await rate_limiter.reserve_cost(
+                    user_id, estimate_message_cost(update)
+                )
+                if reserve_error:
+                    await claude_progress_msg.edit_text(
+                        f"⏱️ {escape_html(reserve_error)}", parse_mode="HTML"
+                    )
+                    return
+
             # Process with Claude
             try:
                 claude_response = await claude_integration.run_command(
@@ -1030,12 +1086,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 # Update session ID
                 context.user_data["claude_session_id"] = claude_response.session_id
 
-                # Charge the real cost so claude_max_cost_per_user is enforced.
-                rate_limiter: Optional[RateLimiter] = context.bot_data.get(
-                    "rate_limiter"
-                )
-                if rate_limiter:
-                    await rate_limiter.record_actual_cost(user_id, claude_response.cost)
+                # Settled in the finally below; a run flagged is_error produced
+                # nothing usable and is not charged.
+                if not claude_response.is_error:
+                    actual_cost = claude_response.cost
 
                 # Check if Claude changed the working directory and update tracking
                 _update_working_directory_from_claude_response(
@@ -1074,6 +1128,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 logger.error(
                     "Claude image processing failed", error=str(e), user_id=user_id
                 )
+            finally:
+                # Always release the hold; a failed or empty run settles at 0.0.
+                if rate_limiter and reservation_id:
+                    await rate_limiter.settle_reservation(reservation_id, actual_cost)
 
         except Exception as e:
             logger.error("Image processing failed", error=str(e), user_id=user_id)
@@ -1146,6 +1204,21 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         session_id = context.user_data.get("claude_session_id")
 
+        # Hold budget for this run; released in the finally below on every path
+        # so a failure or empty result costs the user nothing.
+        rate_limiter: Optional[RateLimiter] = context.bot_data.get("rate_limiter")
+        reservation_id: Optional[str] = None
+        actual_cost = 0.0
+        if rate_limiter:
+            reservation_id, reserve_error = await rate_limiter.reserve_cost(
+                user_id, estimate_message_cost(update)
+            )
+            if reserve_error:
+                await progress_msg.edit_text(
+                    f"⏱️ {escape_html(reserve_error)}", parse_mode="HTML"
+                )
+                return
+
         try:
             # Keep classic mode aligned with handle_photo: single progress message,
             # no streaming callback or typing heartbeat.
@@ -1158,10 +1231,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
             context.user_data["claude_session_id"] = claude_response.session_id
 
-            # Charge the real cost so claude_max_cost_per_user is enforced.
-            rate_limiter: Optional[RateLimiter] = context.bot_data.get("rate_limiter")
-            if rate_limiter:
-                await rate_limiter.record_actual_cost(user_id, claude_response.cost)
+            # Settled in the finally below; a run flagged is_error produced
+            # nothing usable and is not charged.
+            if not claude_response.is_error:
+                actual_cost = claude_response.cost
 
             _update_working_directory_from_claude_response(
                 claude_response, context, settings, user_id
@@ -1191,6 +1264,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             logger.error(
                 "Claude voice processing failed", error=str(e), user_id=user_id
             )
+        finally:
+            # Always release the hold; a failed or empty run settles at 0.0.
+            if rate_limiter and reservation_id:
+                await rate_limiter.settle_reservation(reservation_id, actual_cost)
 
     except Exception as e:
         logger.error("Voice processing failed", error=str(e), user_id=user_id)
@@ -1224,12 +1301,15 @@ def _update_working_directory_from_claude_response(
     # Claude's actual cwd is tracked by the SDK. The patterns are anchored
     # tightly to reduce false-positive parsing (e.g. words like "racd" or
     # "I'd love to acd" no longer match).
+    # A path is either quoted (may contain spaces) or an unquoted run of
+    # non-space characters.
+    quoted_or_bare = "(\"[^\"\\n\\r]+\"|'[^'\\n\\r]+'|`[^`\\n\\r]+`|\\S+)"
     patterns = [
-        r"(?:^|[\n\r])\s*cd\s+(\S+)",  # cd command at start of a line
-        r"(?:^|[\n\r])(?:```|\$)\s*cd\s+(\S+)",  # cd in a shell block
-        r"(?:^|[\n\r])\s*Changed directory to:?\s*(\S+)",
-        r"(?:^|[\n\r])\s*Current directory:?\s*(\S+)",
-        r"(?:^|[\n\r])\s*Working directory:?\s*(\S+)",
+        rf"(?:^|[\n\r])\s*cd\s+{quoted_or_bare}",  # cd command at start of a line
+        rf"(?:^|[\n\r])(?:```|\$)\s*cd\s+{quoted_or_bare}",  # cd in a shell block
+        rf"(?:^|[\n\r])\s*Changed directory to:?\s*{quoted_or_bare}",
+        rf"(?:^|[\n\r])\s*Current directory:?\s*{quoted_or_bare}",
+        rf"(?:^|[\n\r])\s*Working directory:?\s*{quoted_or_bare}",
     ]
 
     # Match against the original-case content — the patterns already use
@@ -1244,8 +1324,15 @@ def _update_working_directory_from_claude_response(
         matches = re.findall(pattern, content, re.MULTILINE | re.IGNORECASE)
         for match in matches:
             try:
-                # Clean up the path
-                new_path = match.strip().strip("\"'`")
+                # Clean up the path: drop surrounding quotes, then trailing
+                # prose punctuation ("cd src." / "cd src, then ..."). The
+                # lookbehind keeps dot-segments intact ("..", "../.."), and the
+                # `or` guard restores the path if it was punctuation-only.
+                raw = match.strip()
+                if raw[:1] in ('"', "'", "`") and raw[-1:] == raw[:1]:
+                    new_path = raw[1:-1]
+                else:
+                    new_path = re.sub(r"(?<![./])[.,;:!?]+$", "", raw) or raw
 
                 # Handle relative paths
                 if new_path.startswith("./") or new_path.startswith("../"):

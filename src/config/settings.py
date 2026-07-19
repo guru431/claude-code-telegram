@@ -9,6 +9,7 @@ Features:
 """
 
 import json
+import re
 from pathlib import Path
 from typing import Any, List, Literal, Optional
 
@@ -319,6 +320,21 @@ class Settings(BaseSettings):
     webhook_url: Optional[str] = Field(None, description="Webhook URL for bot")
     webhook_port: int = Field(8443, description="Webhook port")
     webhook_path: str = Field("/webhook", description="Webhook path")
+    webhook_listen: str = Field(
+        "127.0.0.1",
+        description=(
+            "Bind address for the Telegram webhook listener. Defaults to "
+            "loopback; use 0.0.0.0 only when the listener must be reachable "
+            "directly instead of via a reverse proxy"
+        ),
+    )
+    telegram_webhook_secret: Optional[SecretStr] = Field(
+        None,
+        description=(
+            "Secret token echoed by Telegram in the "
+            "X-Telegram-Bot-Api-Secret-Token header; required in webhook mode"
+        ),
+    )
 
     # Agentic platform settings
     enable_api_server: bool = Field(False, description="Enable FastAPI webhook server")
@@ -539,6 +555,23 @@ class Settings(BaseSettings):
         # Check MCP requirements
         if self.enable_mcp and not self.mcp_config_path:
             raise ValueError("mcp_config_path required when enable_mcp is True")
+
+        # Webhook mode is fail-closed: without a secret token anyone who can
+        # reach the listener may POST a forged Update carrying an allowed
+        # user's ID and pass the whitelist.
+        if self.webhook_url:
+            if not self.telegram_webhook_secret:
+                raise ValueError(
+                    "telegram_webhook_secret required when webhook_url is set "
+                    "(TELEGRAM_WEBHOOK_SECRET); without it a forged Telegram "
+                    "Update can impersonate an allowed user"
+                )
+            secret = self.telegram_webhook_secret.get_secret_value()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", secret):
+                raise ValueError(
+                    "telegram_webhook_secret must be 1-256 characters of "
+                    "A-Z, a-z, 0-9, _ or - (Telegram setWebhook constraint)"
+                )
 
         if self.enable_project_threads:
             if (

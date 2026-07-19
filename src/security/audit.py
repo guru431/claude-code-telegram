@@ -143,7 +143,13 @@ class SQLiteAuditStorage(AuditStorage):
         self.storage = storage
 
     async def store_event(self, event: AuditEvent) -> None:
-        """Persist an audit event to the audit_log table."""
+        """Persist an audit event to the audit_log table.
+
+        A storage failure is logged and swallowed: audit logging sits on the
+        auth path (see ``auth_middleware``), and a locked/degraded database must
+        not turn every inbound message into an unhandled exception. The event is
+        still surfaced via structlog so it is not lost silently.
+        """
         from ..storage.models import AuditLogModel
 
         model = AuditLogModel(
@@ -154,7 +160,17 @@ class SQLiteAuditStorage(AuditStorage):
             timestamp=event.timestamp,
             ip_address=event.ip_address,
         )
-        await self.storage.audit.log_event(model)
+        try:
+            await self.storage.audit.log_event(model)
+        except Exception as e:
+            logger.warning(
+                "Failed to persist audit event",
+                error=str(e),
+                event_type=event.event_type,
+                user_id=event.user_id,
+                success=event.success,
+                details=event.details,
+            )
 
         # Log high-risk events immediately (matches InMemoryAuditStorage).
         if event.risk_level in ["high", "critical"]:

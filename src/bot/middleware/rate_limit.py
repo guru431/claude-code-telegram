@@ -10,11 +10,21 @@ logger = structlog.get_logger()
 async def rate_limit_middleware(
     handler: Callable, event: Any, data: Dict[str, Any]
 ) -> Any:
-    """Check rate limits before processing messages.
+    """Throttle requests before processing messages.
+
+    This middleware handles **request throttling only** — it consumes one
+    token from the user's bucket per update and rejects the update if the
+    user's cost budget is already too low to absorb the projected spend. It
+    does **not** charge money: an update may never reach Claude (free command,
+    callback, plain ack), so billing it would exhaust the budget for free.
+
+    The cost budget is spent by the Claude run itself, which takes an explicit
+    hold via ``RateLimiter.reserve_cost`` and must release it in a ``finally``
+    via ``RateLimiter.settle_reservation``.
 
     This middleware:
     1. Checks request rate limits
-    2. Estimates and checks cost limits
+    2. Checks (without charging) that the projected cost still fits the budget
     3. Logs rate limit violations
     4. Provides helpful error messages
     """
@@ -48,10 +58,11 @@ async def rate_limit_middleware(
         # Don't block on missing rate limiter - this could be a config issue
         return await handler(event, data)
 
-    # Estimate cost based on message content and type
+    # Projected (not charged) cost, used only to reject an update that could
+    # not fit in the remaining budget even in the best case.
     estimated_cost = estimate_message_cost(event)
 
-    # Check rate limits
+    # Throttle: one bucket token per update, plus a budget headroom check.
     allowed, message = await rate_limiter.check_rate_limit(
         user_id=user_id, cost=estimated_cost, tokens=1  # One token per message
     )
@@ -107,6 +118,10 @@ async def rate_limit_middleware(
 
 def estimate_message_cost(event: Any) -> float:
     """Estimate the cost of processing a message.
+
+    Used as a *projected* spend for the budget headroom check and as the
+    initial hold amount when a Claude run reserves budget. It is never
+    charged on its own.
 
     This is a simple heuristic - in practice, you'd want more
     sophisticated cost estimation based on:

@@ -9,6 +9,35 @@ import yaml
 
 logger = structlog.get_logger()
 
+_TRUE_VALUES = frozenset({"true", "yes", "y", "on", "1"})
+_FALSE_VALUES = frozenset({"false", "no", "n", "off", "0"})
+
+
+def parse_enabled(value: object, context: str) -> bool:
+    """Parse an ``enabled`` flag strictly.
+
+    ``bool(value)`` is wrong here: YAML quoting turns ``enabled: "false"`` into
+    the non-empty string ``"false"``, which is truthy, so a project the user
+    disabled would silently stay enabled. Only recognised spellings are
+    accepted; anything else is a config error rather than a silent default.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in _TRUE_VALUES:
+            return True
+        if normalized in _FALSE_VALUES:
+            return False
+    if isinstance(value, int):
+        if value in (0, 1):
+            return bool(value)
+
+    raise ValueError(
+        f"{context} has invalid 'enabled' value {value!r}; "
+        f"expected a boolean (true/false)"
+    )
+
 
 @dataclass(frozen=True)
 class ProjectDefinition:
@@ -72,7 +101,9 @@ def load_project_registry(
         slug = str(raw.get("slug", "")).strip()
         name = str(raw.get("name", "")).strip()
         rel_path_raw = str(raw.get("path", "")).strip()
-        enabled = bool(raw.get("enabled", True))
+        enabled = parse_enabled(
+            raw.get("enabled", True), f"Project entry at index {idx}"
+        )
 
         if not slug:
             raise ValueError(f"Project entry at index {idx} is missing 'slug'")
@@ -103,7 +134,9 @@ def load_project_registry(
             )
             continue
 
-        abs_path_key = str(absolute_path)
+        # Casefold: Windows paths are case-insensitive, so 'Foo' and 'foo' are
+        # the same directory and must collide here rather than register twice.
+        abs_path_key = str(absolute_path).casefold()
         if slug in seen_slugs:
             raise ValueError(f"Duplicate project slug: {slug}")
         if name in seen_names:

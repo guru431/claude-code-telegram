@@ -1,13 +1,19 @@
 """Tests for the notification service."""
 
 import asyncio
+from datetime import timedelta
 from unittest.mock import AsyncMock
 
 import pytest
+from telegram.error import RetryAfter
 
 from src.events.bus import EventBus
 from src.events.types import AgentResponseEvent
-from src.notifications.service import NotificationService
+from src.notifications.service import (
+    MAX_RETRY_AFTER_SECONDS,
+    NotificationService,
+    _retry_delay_seconds,
+)
 
 
 @pytest.fixture
@@ -228,6 +234,50 @@ class TestNotificationService:
         mock_bot.send_message = AsyncMock(side_effect=RetryAfter(0))
         event = AgentResponseEvent(chat_id=123, text="hello")
         # Re-raised RetryAfter is caught by the TelegramError handler (no raise).
+        await service._rate_limited_send(123, event)
+
+        assert mock_bot.send_message.call_count == 2
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (3, 3.0),
+            (0, 0.0),
+            (2.5, 2.5),
+            (timedelta(seconds=7), 7.0),
+            (timedelta(milliseconds=1500), 1.5),
+            # Clamped: a hostile/huge delay must not park the sender for hours.
+            (timedelta(hours=2), MAX_RETRY_AFTER_SECONDS),
+            (10_000, MAX_RETRY_AFTER_SECONDS),
+            # Never negative -- asyncio.sleep would still run, but clamp anyway.
+            (-5, 0.0),
+        ],
+    )
+    def test_retry_delay_normalizes_int_and_timedelta(
+        self, raw: object, expected: float
+    ) -> None:
+        """RetryAfter.retry_after is typed int | timedelta; both must work.
+
+        python-telegram-bot deprecated the int form in v22.2 and will switch the
+        attribute to timedelta. Passing a timedelta straight to asyncio.sleep
+        raises TypeError and loses the notification, so it is normalized here.
+        """
+        assert _retry_delay_seconds(raw) == pytest.approx(expected)
+
+    async def test_retry_after_accepts_timedelta_attribute(
+        self, service: NotificationService, mock_bot: AsyncMock
+    ) -> None:
+        """A RetryAfter exposing a timedelta still retries instead of raising."""
+
+        class FutureRetryAfter(RetryAfter):
+            """RetryAfter as PTB will expose it once the deprecation lands."""
+
+            @property
+            def retry_after(self) -> timedelta:  # type: ignore[override]
+                return timedelta(seconds=0)
+
+        mock_bot.send_message = AsyncMock(side_effect=[FutureRetryAfter(1), None])
+        event = AgentResponseEvent(chat_id=123, text="hello")
         await service._rate_limited_send(123, event)
 
         assert mock_bot.send_message.call_count == 2

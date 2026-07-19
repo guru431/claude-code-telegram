@@ -610,6 +610,106 @@ def test_computed_properties(tmp_path):
     assert memory_settings.database_path is None
 
 
+def test_webhook_mode_requires_secret(tmp_path):
+    """Webhook mode is fail-closed: no secret means the bot refuses to start."""
+    test_dir = tmp_path / "projects"
+    test_dir.mkdir()
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            _env_file=None,
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=str(test_dir),
+            webhook_url="https://example.com/webhook",
+        )
+
+    assert "telegram_webhook_secret required" in str(exc_info.value)
+
+
+def test_webhook_mode_accepts_valid_secret(tmp_path):
+    """A well-formed secret is accepted and readable in webhook mode."""
+    test_dir = tmp_path / "projects"
+    test_dir.mkdir()
+
+    settings = Settings(
+        _env_file=None,
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(test_dir),
+        webhook_url="https://example.com/webhook",
+        telegram_webhook_secret="valid-secret_123",
+    )
+
+    assert settings.telegram_webhook_secret is not None
+    assert settings.telegram_webhook_secret.get_secret_value() == "valid-secret_123"
+
+
+@pytest.mark.parametrize(
+    "bad_secret",
+    [
+        "has spaces",  # space is outside Telegram's charset
+        "has$dollar",  # punctuation outside [A-Za-z0-9_-]
+        "x" * 257,  # exceeds Telegram's 256-char limit
+    ],
+)
+def test_webhook_secret_rejects_malformed_values(tmp_path, bad_secret):
+    """Secrets Telegram's setWebhook would reject fail at config time."""
+    test_dir = tmp_path / "projects"
+    test_dir.mkdir()
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            _env_file=None,
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=str(test_dir),
+            webhook_url="https://example.com/webhook",
+            telegram_webhook_secret=bad_secret,
+        )
+
+    assert "telegram_webhook_secret must be" in str(exc_info.value)
+
+
+def test_polling_mode_does_not_require_webhook_secret(tmp_path):
+    """Without WEBHOOK_URL the bot polls and needs no secret."""
+    test_dir = tmp_path / "projects"
+    test_dir.mkdir()
+
+    settings = Settings(
+        _env_file=None,
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(test_dir),
+    )
+
+    assert settings.webhook_url is None
+    assert settings.telegram_webhook_secret is None
+
+
+def test_webhook_listen_defaults_to_loopback(tmp_path):
+    """The listener binds to loopback unless explicitly widened."""
+    test_dir = tmp_path / "projects"
+    test_dir.mkdir()
+
+    settings = Settings(
+        _env_file=None,
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(test_dir),
+    )
+    assert settings.webhook_listen == "127.0.0.1"
+
+    exposed = Settings(
+        _env_file=None,
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(test_dir),
+        webhook_listen="0.0.0.0",
+    )
+    assert exposed.webhook_listen == "0.0.0.0"
+
+
 def test_feature_flags():
     """Test feature flag system."""
     # Create test MCP config file with valid structure before creating settings

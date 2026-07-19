@@ -7,7 +7,12 @@ from typing import List, Optional
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ...config.settings import Settings
-from .html_format import escape_html, markdown_to_telegram_html, tg_len
+from .html_format import (
+    escape_html,
+    markdown_to_telegram_html,
+    split_telegram_html,
+    tg_len,
+)
 
 
 @dataclass
@@ -231,151 +236,20 @@ class ResponseFormatter:
             flags=re.DOTALL,
         )
 
-    def _split_long_line(self, line: str) -> List[str]:
-        """Split a single overlong line into tag-safe chunks.
-
-        Prefer breaking at the last whitespace that is not inside an HTML
-        ``<...>`` tag or an ``&...;`` entity before the offset; fall back to a
-        hard offset cut when no safe boundary exists. Length is measured in
-        Telegram's UTF-16 units via ``tg_len``.
-        """
-        step = self.max_message_length - 100
-        chunks: List[str] = []
-        rest = line
-
-        while tg_len(rest) > step:
-            # Candidate hard cut at code-point offset `step` (UTF-16 length is
-            # >= code-point length, so this stays within the budget).
-            cut = step
-            # Find the last whitespace before `cut` that is not inside a
-            # `<...>` tag or a `&...;` entity. Also track the last offset that is
-            # outside a tag/entity, so the fallback cut never slices through one.
-            safe = -1
-            outside = -1
-            in_tag = False
-            in_entity = False
-            for i, ch in enumerate(rest[:cut]):
-                if ch == "<":
-                    in_tag = True
-                elif ch == ">":
-                    in_tag = False
-                    outside = i + 1
-                elif ch == "&":
-                    in_entity = True
-                elif ch == ";":
-                    in_entity = False
-                    outside = i + 1
-                elif not in_tag and not in_entity:
-                    outside = i + 1
-                    if ch.isspace():
-                        safe = i
-            if safe > 0:
-                split_at = safe
-            elif outside > 0:
-                # No whitespace boundary: cut at the last position outside any
-                # tag/entity so we never split a `<...>`/`&...;` in two.
-                split_at = outside
-            else:
-                # A single tag/entity exceeds the budget; it cannot be sent as
-                # valid HTML at this size, so emit the chunk as escaped plain
-                # text rather than splitting the tag.
-                chunks.append(escape_html(rest[:cut]))
-                rest = rest[cut:]
-                continue
-            chunks.append(rest[:split_at])
-            rest = rest[split_at:]
-
-        if rest:
-            chunks.append(rest)
-        return chunks
-
     def _split_message(self, text: str) -> List[FormattedMessage]:
-        """Split long messages while preserving formatting."""
+        """Split long messages while preserving formatting.
+
+        Delegates to the shared :func:`split_telegram_html` splitter so classic
+        mode and the notification service cut text identically -- previously the
+        two had separate implementations that disagreed on whitespace handling
+        and on which tags they reopened across a boundary.
+        """
         if not text or not text.strip():
             return []
-        if tg_len(text) <= self.max_message_length:
-            return [FormattedMessage(text)]
-
-        messages = []
-        current_lines: List[str] = []
-        current_length = 0
-        in_code_block = False
-        # Actual opening tag (with class) so reopening preserves highlighting.
-        open_tag = "<pre><code>"
-        close_tag = "</code></pre>"
-        close_len = tg_len(close_tag)
-
-        lines = text.split("\n")
-
-        for line in lines:
-            line_length = tg_len(line) + 1  # +1 for newline
-
-            # Track HTML <pre> code block state, remembering the real opening
-            # tag (which may carry a class="language-..." attribute).
-            if "<pre>" in line or "<pre><code" in line:
-                in_code_block = True
-                m = re.search(r"<pre><code[^>]*>", line)
-                if m:
-                    open_tag = m.group(0)
-                elif "<pre>" in line:
-                    open_tag = "<pre>"
-            if "</pre>" in line:
-                in_code_block = False
-
-            # If this is a very long line that exceeds limit by itself, split it
-            if line_length > self.max_message_length:
-                chunks = self._split_long_line(line)
-
-                for chunk in chunks:
-                    chunk_length = tg_len(chunk) + 1
-
-                    if (
-                        current_length
-                        + chunk_length
-                        + (close_len if in_code_block else 0)
-                        > self.max_message_length
-                        and current_lines
-                    ):
-                        if in_code_block:
-                            current_lines.append(close_tag)
-                        messages.append(FormattedMessage("\n".join(current_lines)))
-
-                        current_lines = []
-                        current_length = 0
-                        if in_code_block:
-                            current_lines.append(open_tag)
-                            current_length = tg_len(open_tag)
-
-                    current_lines.append(chunk)
-                    current_length += chunk_length
-                continue
-
-            # Check if adding this line would exceed the limit
-            if (
-                current_length + line_length + (close_len if in_code_block else 0)
-                > self.max_message_length
-                and current_lines
-            ):
-                if in_code_block:
-                    current_lines.append(close_tag)
-
-                messages.append(FormattedMessage("\n".join(current_lines)))
-
-                current_lines = []
-                current_length = 0
-
-                if in_code_block:
-                    current_lines.append(open_tag)
-                    current_length = tg_len(open_tag)
-
-            current_lines.append(line)
-            current_length += line_length
-
-        # Add remaining content
-        if current_lines:
-            messages.append(FormattedMessage("\n".join(current_lines)))
-
-        return messages
+        return [
+            FormattedMessage(chunk)
+            for chunk in split_telegram_html(text, self.max_message_length)
+        ]
 
     def _get_quick_actions_keyboard(self) -> InlineKeyboardMarkup:
         """Get quick actions inline keyboard."""

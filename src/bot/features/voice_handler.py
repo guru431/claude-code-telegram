@@ -198,6 +198,12 @@ class VoiceHandler:
         if api_key:
             kwargs["api_key"] = api_key
         else:
+            logger.warning(
+                "No OpenAI API key configured; using placeholder key with "
+                "custom base_url. Requests will fail if the provider "
+                "requires authentication.",
+                base_url=base_url,
+            )
             kwargs["api_key"] = "not-needed"
         if base_url:
             kwargs["base_url"] = base_url

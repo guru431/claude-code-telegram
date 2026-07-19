@@ -216,12 +216,18 @@ class ClaudeCodeBot:
                 # because ``run_webhook`` is a synchronous PTB entrypoint that
                 # runs its own event loop -- calling it from a live loop raises
                 # RuntimeError.
+                # ``secret_token`` makes PTB verify the
+                # X-Telegram-Bot-Api-Secret-Token header and drop updates that
+                # do not match, so a forged POST cannot impersonate a
+                # whitelisted user. Settings enforce that it is always set.
+                secret = self.settings.telegram_webhook_secret
                 await self.app.start()
                 await self.app.updater.start_webhook(
-                    listen="0.0.0.0",
+                    listen=self.settings.webhook_listen,
                     port=self.settings.webhook_port,
                     url_path=self.settings.webhook_path,
                     webhook_url=self.settings.webhook_url,
+                    secret_token=secret.get_secret_value() if secret else None,
                     drop_pending_updates=True,
                     allowed_updates=Update.ALL_TYPES,
                 )

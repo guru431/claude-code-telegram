@@ -37,6 +37,7 @@ from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
 from ..security.secret_patterns import redact_secrets
+from .middleware.rate_limit import estimate_message_cost
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
 from .utils.html_format import escape_html
 from .utils.image_extractor import (
@@ -89,6 +90,17 @@ def _tool_icon(name: str) -> str:
 
 
 @dataclass
+class _SessionEntry:
+    """One row of the /sessions list, normalised across its two sources."""
+
+    session_id: str
+    cwd: str
+    when: datetime
+    preview: str = ""
+    is_local: bool = False
+
+
+@dataclass
 class ActiveRequest:
     """Tracks an in-flight Claude request so it can be interrupted."""
 
@@ -131,6 +143,24 @@ class MessageOrchestrator:
             lock = asyncio.Lock()
             self._request_locks[user_id] = lock
         return lock
+
+    async def _acquire_request_lock(self, user_id: int) -> asyncio.Lock:
+        """Acquire and return the *canonical* per-user request lock.
+
+        ``_get_request_lock`` is synchronous, so lookup+insert cannot interleave.
+        But acquiring is not: between getting the reference and awaiting it, an
+        eviction sweep (triggered by another user hitting ``_MAX_REQUEST_LOCKS``)
+        can drop this still-unlocked lock from the map, after which a second
+        request for the same user would create a *different* lock and run
+        concurrently — exactly what the lock exists to prevent. Re-check that
+        the acquired lock is still the mapped one and retry if it is not.
+        """
+        while True:
+            lock = self._get_request_lock(user_id)
+            await lock.acquire()
+            if self._request_locks.get(user_id) is lock:
+                return lock
+            lock.release()
 
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
         """Wrap handler to inject dependencies into context.bot_data."""
@@ -803,8 +833,7 @@ class MessageOrchestrator:
         because those two paths differ in how the progress message is made.
         """
         interrupt_event = asyncio.Event()
-        request_lock = self._get_request_lock(user_id)
-        await request_lock.acquire()
+        request_lock = await self._acquire_request_lock(user_id)
         self._active_requests[user_id] = ActiveRequest(
             user_id=user_id,
             interrupt_event=interrupt_event,
@@ -1249,6 +1278,22 @@ class MessageOrchestrator:
                         interrupt_event=interrupt_event,
                     )
 
+                    # Hold budget for this specific run. The middleware only
+                    # throttled; money is charged here and released in the
+                    # finally below on every path (success, soft error,
+                    # exception, cancel).
+                    reservation_id: Optional[str] = None
+                    actual_cost = 0.0
+                    if rate_limiter:
+                        reservation_id, reserve_error = await rate_limiter.reserve_cost(
+                            user_id, estimate_message_cost(update)
+                        )
+                        if reserve_error:
+                            await progress_msg.edit_text(
+                                escape_html(reserve_error), reply_markup=None
+                            )
+                            return
+
                     try:
                         claude_response = await claude_integration.run_command(
                             prompt=message_text,
@@ -1293,12 +1338,9 @@ class MessageOrchestrator:
                             if force_new:
                                 context.user_data["force_new_session"] = False
 
-                            # Charge the real cost so claude_max_cost_per_user
-                            # is enforced.
-                            if rate_limiter:
-                                await rate_limiter.record_actual_cost(
-                                    user_id, claude_response.cost
-                                )
+                            # Settled in the finally below so a later failure
+                            # cannot leave the hold outstanding.
+                            actual_cost = claude_response.cost
 
                             # Track directory changes
                             from .handlers.message import (
@@ -1363,6 +1405,14 @@ class MessageOrchestrator:
                                 parse_mode="HTML",
                             )
                         ]
+                    finally:
+                        # Always release the hold. A run that produced no
+                        # usable result settles at 0.0 and costs the user
+                        # nothing.
+                        if rate_limiter and reservation_id:
+                            await rate_limiter.settle_reservation(
+                                reservation_id, actual_cost
+                            )
             finally:
                 if draft_streamer:
                     try:
@@ -1644,6 +1694,10 @@ class MessageOrchestrator:
             mcp_images_media: List[ImageAttachment] = []
             formatted_messages: List["FormattedMessage"] = []
 
+            # Throttling already happened in rate_limit_middleware (group -1);
+            # this reference is only used to hold and settle the run's budget.
+            rate_limiter = context.bot_data.get("rate_limiter")
+
             async with self._claude_run(
                 user_id=user_id, chat=chat, progress_msg=progress_msg
             ) as interrupt_event:
@@ -1657,6 +1711,22 @@ class MessageOrchestrator:
                     reply_markup=stop_kb,
                     interrupt_event=interrupt_event,
                 )
+                # Hold budget for this run; released in the finally below on
+                # every path, so a soft error or exception costs nothing.
+                media_reservation_id: Optional[str] = None
+                media_cost = 0.0
+                if rate_limiter:
+                    media_reservation_id, reserve_error = (
+                        await rate_limiter.reserve_cost(
+                            user_id, estimate_message_cost(update)
+                        )
+                    )
+                    if reserve_error:
+                        await progress_msg.edit_text(
+                            escape_html(reserve_error), reply_markup=None
+                        )
+                        return
+
                 try:
                     claude_response = await claude_integration.run_command(
                         prompt=prompt,
@@ -1668,6 +1738,10 @@ class MessageOrchestrator:
                         images=images,
                         interrupt_event=interrupt_event,
                     )
+                    # A run flagged is_error produced nothing usable and is
+                    # not charged; it settles at 0.0 below.
+                    if not claude_response.is_error:
+                        media_cost = claude_response.cost
                 except Exception:
                     # Clear the dead "Working..." progress message (with its
                     # now-useless Stop button) before the caller reports the
@@ -1677,6 +1751,11 @@ class MessageOrchestrator:
                     except Exception:
                         logger.debug("Failed to delete progress message, ignoring")
                     raise
+                finally:
+                    if rate_limiter and media_reservation_id:
+                        await rate_limiter.settle_reservation(
+                            media_reservation_id, media_cost
+                        )
 
             context.user_data["claude_session_id"] = claude_response.session_id
 
@@ -1716,10 +1795,6 @@ class MessageOrchestrator:
                 # still forces a new session, matching the exception path.
                 if force_new:
                     context.user_data["force_new_session"] = False
-
-                rate_limiter = context.bot_data.get("rate_limiter")
-                if rate_limiter:
-                    await rate_limiter.record_actual_cost(user_id, claude_response.cost)
 
                 _update_working_directory_from_claude_response(
                     claude_response, context, self.settings, user_id
@@ -2212,41 +2287,94 @@ class MessageOrchestrator:
     async def agentic_sessions(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """List recent Claude Code sessions (local + bot) with resume buttons."""
-        from ..claude.local_sessions import list_all_local_sessions
+        """List resumable sessions with resume buttons.
 
+        A regular user only sees sessions the bot recorded against *their*
+        Telegram ID. Sessions discovered on disk under ``~/.claude/projects``
+        (CLI, VS Code, another operator's runs) carry no Telegram owner, so they
+        are listed for admins only.
+        """
+        from ..claude.local_sessions import _is_within, list_all_local_sessions
+
+        user_id = update.effective_user.id
         current_session_id = context.user_data.get("claude_session_id")
 
-        # Scope to the approved directory: never list sessions whose working
-        # directory lives outside it, or resuming one would move the bot's
-        # current_directory past the approved root.
-        # Synchronous JSONL filesystem scan — offload to a thread so it does not
-        # block the event loop.
-        local_sessions = await asyncio.to_thread(
-            list_all_local_sessions,
-            limit=15,
-            within=self.settings.approved_directory,
-        )
+        # Scope to the root the caller is currently pinned to — the project
+        # topic's root in thread mode, otherwise the approved directory. Every
+        # row here is one tap away from becoming current_directory, so listing
+        # anything outside that root would let a tap cross the boundary.
+        root = self._navigation_root(context)
+        limit = 15
 
-        if not local_sessions:
+        entries: List[_SessionEntry] = []
+        by_id: Dict[str, _SessionEntry] = {}
+
+        storage = context.bot_data.get("storage")
+        if storage is not None:
+            own = await storage.sessions.get_user_sessions(user_id, active_only=False)
+            for sess in own:
+                if len(entries) >= limit:
+                    break
+                if not sess.project_path or not _is_within(
+                    Path(sess.project_path), root
+                ):
+                    continue
+                when = sess.last_used
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=UTC)
+                entry = _SessionEntry(
+                    session_id=sess.session_id,
+                    cwd=sess.project_path,
+                    when=when,
+                )
+                by_id[sess.session_id] = entry
+                entries.append(entry)
+
+        if self.settings.is_admin(user_id):
+            # Synchronous JSONL filesystem scan — offload to a thread so it does
+            # not block the event loop.
+            local_sessions = await asyncio.to_thread(
+                list_all_local_sessions,
+                limit=limit,
+                within=root,
+            )
+            for local in local_sessions:
+                known = by_id.get(local.session_id)
+                if known is not None:
+                    # Same session from both sources: keep the owned entry but
+                    # borrow the JSONL preview, which storage does not record.
+                    if not known.preview:
+                        known.preview = local.first_message
+                    continue
+                entries.append(
+                    _SessionEntry(
+                        session_id=local.session_id,
+                        cwd=local.cwd,
+                        when=datetime.fromtimestamp(local.mtime, tz=UTC),
+                        preview=local.first_message,
+                        is_local=True,
+                    )
+                )
+
+        entries.sort(key=lambda e: e.when, reverse=True)
+        entries = entries[:limit]
+
+        if not entries:
             await update.message.reply_text("No sessions found.")
             return
 
         lines: list[str] = []
         keyboard_rows: list[list[InlineKeyboardButton]] = []
 
-        for i, sess in enumerate(local_sessions, 1):
-            # Show relative path from approved_directory if possible
+        for i, sess in enumerate(entries, 1):
+            # Show relative path from the scoping root if possible
             try:
-                display_path = Path(sess.cwd).relative_to(
-                    self.settings.approved_directory
-                )
+                display_path = Path(sess.cwd).relative_to(root)
             except ValueError:
                 display_path = Path(sess.cwd).name or sess.cwd
 
             short_id = sess.session_id[:8]
-            mtime = datetime.fromtimestamp(sess.mtime, tz=UTC)
-            age = datetime.now(UTC) - mtime
+            age = datetime.now(UTC) - sess.when
             if age.days > 0:
                 age_str = f"{age.days}d ago"
             elif age.seconds >= 3600:
@@ -2255,24 +2383,25 @@ class MessageOrchestrator:
                 age_str = f"{age.seconds // 60}m ago"
 
             marker = " \u25c0" if sess.session_id == current_session_id else ""
+            origin = " · local" if sess.is_local else ""
             preview = ""
-            if sess.first_message:
+            if sess.preview:
                 # Truncate to ~40 chars for display
-                msg_preview = sess.first_message[:40]
-                if len(sess.first_message) > 40:
+                msg_preview = sess.preview[:40]
+                if len(sess.preview) > 40:
                     msg_preview += "…"
                 preview = f"\n   <i>{escape_html(msg_preview)}</i>"
             lines.append(
                 f"{i}. <code>{escape_html(str(display_path))}/</code>"
-                f" · <code>{short_id}</code> · {age_str}{marker}{preview}"
+                f" · <code>{short_id}</code> · {age_str}{origin}{marker}{preview}"
             )
 
             # callback_data max 64 bytes — uuid is 36 chars, prefix 7 = 43
             # Button text: show first words of the conversation
             btn_label = f"{short_id}"
-            if sess.first_message:
-                btn_msg = sess.first_message[:30]
-                if len(sess.first_message) > 30:
+            if sess.preview:
+                btn_msg = sess.preview[:30]
+                if len(sess.preview) > 30:
                     btn_msg += "…"
                 btn_label = f"{short_id} {btn_msg}"
             keyboard_rows.append(
@@ -2295,13 +2424,19 @@ class MessageOrchestrator:
     async def _agentic_resume_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle resume: callbacks — switch to a session from /sessions list."""
+        """Handle resume: callbacks — switch to a session from /sessions list.
+
+        callback_data is attacker-controlled (any allowed user can craft a
+        ``resume:<uuid>``), so every check here re-derives authority from
+        ``query.from_user.id`` server-side rather than trusting the payload.
+        """
         query = update.callback_query
         await query.answer()
 
         _, session_id = query.data.split(":", 1)
+        user_id = query.from_user.id
+        root = self._navigation_root(context)
 
-        # Find the session's working directory from local storage
         from ..claude.local_sessions import (
             _claude_projects_dir,
             _encode_path,
@@ -2309,45 +2444,77 @@ class MessageOrchestrator:
             _parse_session_head,
         )
 
-        approved = self.settings.approved_directory
-        # Encoded prefix for the approved root — Claude encodes a cwd by
-        # replacing non-alphanumerics with "-", so any project dir inside the
-        # approved root has an encoded name starting with this prefix.
-        approved_prefix = _encode_path(approved.resolve())
+        cwd: Optional[str] = None
 
-        def _find_session_cwd() -> Optional[str]:
-            projects_dir = _claude_projects_dir()
-            if not projects_dir.is_dir():
-                return None
-            for project_dir in projects_dir.iterdir():
-                if not project_dir.is_dir():
-                    continue
-                # Scope to project dirs encoded under the approved root.
-                if not project_dir.name.startswith(approved_prefix):
-                    continue
-                jsonl = project_dir / f"{session_id}.jsonl"
-                if jsonl.is_file():
-                    first = _parse_session_head(jsonl)
-                    if not first:
-                        return None
-                    cwd = first.get("cwd")
-                    # Confirm the recorded cwd really resolves inside approved.
-                    if cwd and _is_within(Path(cwd), approved):
-                        return cwd
+        # 1. Sessions the bot recorded: resumable only by the user who owns them.
+        storage = context.bot_data.get("storage")
+        if storage is not None:
+            record = await storage.sessions.get_session(session_id)
+            if record is not None:
+                if record.user_id != user_id:
+                    logger.warning(
+                        "Rejected cross-user session resume",
+                        user_id=user_id,
+                        owner_id=record.user_id,
+                        session_id=session_id,
+                    )
+                    await query.edit_message_text(
+                        "❌ That session belongs to another user "
+                        "and cannot be resumed."
+                    )
+                    return
+                cwd = record.project_path
+
+        # 2. Sessions found on disk have no Telegram owner (CLI, VS Code,
+        #    another operator), so only admins may reach into them.
+        if cwd is None:
+            if not self.settings.is_admin(user_id):
+                logger.warning(
+                    "Rejected local session resume for non-admin",
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+                await query.edit_message_text(
+                    "❌ That session is not available to you."
+                )
+                return
+
+            # Encoded prefix for the scoping root — Claude encodes a cwd by
+            # replacing non-alphanumerics with "-", so any project dir inside
+            # the root has an encoded name starting with this prefix.
+            root_prefix = _encode_path(root.resolve())
+
+            def _find_session_cwd() -> Optional[str]:
+                projects_dir = _claude_projects_dir()
+                if not projects_dir.is_dir():
                     return None
-            return None
+                for project_dir in projects_dir.iterdir():
+                    if not project_dir.is_dir():
+                        continue
+                    # Scope to project dirs encoded under the scoping root.
+                    if not project_dir.name.startswith(root_prefix):
+                        continue
+                    jsonl = project_dir / f"{session_id}.jsonl"
+                    if jsonl.is_file():
+                        first = _parse_session_head(jsonl)
+                        if not first:
+                            return None
+                        return first.get("cwd")
+                return None
 
-        # Synchronous directory iteration + JSONL parse — offload to a thread so
-        # it does not block the event loop.
-        cwd = await asyncio.to_thread(_find_session_cwd)
+            # Synchronous directory iteration + JSONL parse — offload to a
+            # thread so it does not block the event loop.
+            cwd = await asyncio.to_thread(_find_session_cwd)
 
-        # Fail closed: if we cannot confirm a cwd within the approved root
-        # (missing/unscoped session, or first JSONL line had no cwd), refuse to
-        # resume rather than silently moving the bot outside the approved root.
-        if not cwd:
+        # 3. Fail closed: the cwd must resolve inside the root the caller is
+        #    currently pinned to (the project topic's root in thread mode,
+        #    otherwise the approved directory). Without this a user could jump
+        #    a topic to another project's session and bind the thread state to
+        #    a session ID that does not belong to it.
+        if not cwd or not _is_within(Path(cwd), root):
             await query.edit_message_text(
                 "❌ That session's working directory could not be confirmed "
-                "within the approved directory and cannot be resumed.",
+                "inside the current project root and cannot be resumed.",
             )
             return
 

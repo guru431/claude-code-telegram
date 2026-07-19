@@ -1,17 +1,26 @@
 """Rate limiting implementation with multiple strategies.
 
+Two independent concerns live here and must not be conflated:
+
+- **Request throttling** — a token bucket per user, consumed by every update
+  (``check_rate_limit``). It costs no money.
+- **Cost budget** — real dollars spent on Claude runs, held via an explicit
+  reservation (``reserve_cost``) and settled against the run's actual cost
+  (``settle_reservation``). Only a real Claude run may reserve budget.
+
 Features:
 - Token bucket algorithm
-- Cost-based limiting
+- Cost-based limiting with explicit, per-run reservations
 - Per-user tracking
 - Burst handling
 """
 
 import asyncio
-from collections import defaultdict, deque
+import uuid
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 import structlog
 
@@ -91,19 +100,39 @@ class RateLimitBucket:
         }
 
 
+@dataclass
+class CostReservation:
+    """A budget hold placed for exactly one real Claude run.
+
+    ``amount`` is the estimate currently counted against the user's budget.
+    A daily cost reset zeroes it (the tracker it was charged to is gone) so
+    settling later cannot drive the fresh window negative.
+    """
+
+    id: str
+    user_id: int
+    amount: float
+    created_at: datetime
+
+
 class RateLimiter:
     """Main rate limiting system with request and cost-based limits."""
+
+    # An unsettled reservation is a bug in the caller (a missing ``finally``).
+    # Sweep it after this long so a leaked hold cannot block a user forever.
+    RESERVATION_MAX_AGE = timedelta(hours=1)
 
     def __init__(self, config: Settings):
         self.config = config
         self.request_buckets: Dict[int, RateLimitBucket] = {}
         self.cost_tracker: Dict[int, float] = defaultdict(float)
         self.cost_reset_time: Dict[int, datetime] = {}
-        # Per-user FIFO of heuristic estimates charged by check_rate_limit but
-        # not yet reconciled against a real cost. record_actual_cost pops the
-        # matching estimate before adding actual spend so cost_tracker holds
-        # estimate-or-actual, never estimate+actual (no double-counting).
-        self.pending_estimates: Dict[int, Deque[float]] = defaultdict(deque)
+        # Outstanding budget holds, keyed by reservation id, plus a per-user
+        # index for reset/cleanup. A hold is created only by reserve_cost (a
+        # real Claude run) and removed only by settle_reservation or the
+        # stale sweep — never by an ordinary throttle check.
+        self.reservations: Dict[str, CostReservation] = {}
+        self.user_reservations: Dict[int, Set[str]] = defaultdict(set)
         self.locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
         # Calculate refill rate from config
@@ -121,9 +150,18 @@ class RateLimiter:
         )
 
     async def check_rate_limit(
-        self, user_id: int, cost: float = 1.0, tokens: int = 1
+        self, user_id: int, cost: float = 0.0, tokens: int = 1
     ) -> Tuple[bool, Optional[str]]:
-        """Check if request is allowed under rate limits."""
+        """Throttle a request: consume bucket tokens, verify budget headroom.
+
+        This is the **request throttling** path and it spends no money. It is
+        safe to call for every update, including free commands and callbacks.
+
+        ``cost`` is a *projected* spend used only to reject a request that
+        could not possibly fit in the remaining budget; it is checked but
+        never charged. Money is charged only by ``reserve_cost`` /
+        ``settle_reservation``, which a real Claude run must use.
+        """
         async with self.locks[user_id]:
             # Check request rate limit
             rate_allowed, rate_message = self._check_request_rate(user_id, tokens)
@@ -135,29 +173,148 @@ class RateLimiter:
                 )
                 return False, rate_message
 
-            # Check cost limit
+            # Check cost headroom without charging it.
             cost_allowed, cost_message = self._check_cost_limit(user_id, cost)
             if not cost_allowed:
                 logger.warning(
                     "Cost limit exceeded",
                     user_id=user_id,
-                    cost_requested=cost,
+                    cost_projected=cost,
                     current_usage=self.cost_tracker[user_id],
                 )
                 return False, cost_message
 
-            # If both checks pass, consume resources
+            # Only the request token is actually consumed here.
             self._consume_request_tokens(user_id, tokens)
-            self._track_cost(user_id, cost)
-            # Remember this estimate so record_actual_cost can swap it out for
-            # the real cost instead of stacking on top of it.
-            if cost > 0:
-                self.pending_estimates[user_id].append(cost)
 
             logger.debug(
-                "Rate limit check passed", user_id=user_id, cost=cost, tokens=tokens
+                "Rate limit check passed",
+                user_id=user_id,
+                projected_cost=cost,
+                tokens=tokens,
             )
             return True, None
+
+    async def reserve_cost(
+        self, user_id: int, estimated_cost: float
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Place a budget hold for one real Claude run.
+
+        Returns ``(reservation_id, None)`` on success, or ``(None, message)``
+        when the user's remaining budget cannot absorb *estimated_cost*.
+
+        The caller **must** settle the returned id in a ``finally`` block via
+        ``settle_reservation`` — for success, zero cost, error and cancel
+        alike. An unsettled hold keeps blocking budget until it is swept as
+        stale (``RESERVATION_MAX_AGE``).
+        """
+        amount = max(0.0, estimated_cost)
+
+        async with self.locks[user_id]:
+            self._maybe_reset_cost_tracker(user_id)
+            self._sweep_stale_reservations(user_id)
+
+            allowed, message = self._check_cost_limit(user_id, amount)
+            if not allowed:
+                logger.warning(
+                    "Cost reservation refused",
+                    user_id=user_id,
+                    estimated_cost=amount,
+                    current_usage=self.cost_tracker[user_id],
+                )
+                return None, message
+
+            reservation_id = uuid.uuid4().hex
+            self.reservations[reservation_id] = CostReservation(
+                id=reservation_id,
+                user_id=user_id,
+                amount=amount,
+                created_at=datetime.now(UTC),
+            )
+            self.user_reservations[user_id].add(reservation_id)
+            self._track_cost(user_id, amount)
+
+            logger.debug(
+                "Cost reserved",
+                user_id=user_id,
+                reservation_id=reservation_id,
+                estimated_cost=amount,
+            )
+            return reservation_id, None
+
+    async def settle_reservation(
+        self, reservation_id: str, actual_cost: float = 0.0
+    ) -> None:
+        """Release a specific hold and charge that run's real cost.
+
+        ``actual_cost`` of ``0.0`` is a valid outcome (cancelled run, cached
+        reply, failed run) and releases the hold **in full**. Unknown or
+        already-settled ids are ignored, so a ``finally`` block may call this
+        unconditionally without guarding against double-settlement.
+        """
+        reservation = self.reservations.get(reservation_id)
+        if reservation is None:
+            logger.debug(
+                "Unknown or already-settled cost reservation",
+                reservation_id=reservation_id,
+            )
+            return
+
+        user_id = reservation.user_id
+        async with self.locks[user_id]:
+            # Re-read under the lock: a concurrent settle/sweep may have won.
+            # The reset must run before the pop so it can zero this hold's
+            # amount if the daily window rolled over.
+            self._maybe_reset_cost_tracker(user_id)
+            reservation = self.reservations.pop(reservation_id, None)
+            if reservation is None:
+                return
+            self.user_reservations[user_id].discard(reservation_id)
+
+            # Back out exactly this run's hold, then charge what it really
+            # cost. Never drive the tracker negative.
+            self.cost_tracker[user_id] = max(
+                0.0, self.cost_tracker[user_id] - reservation.amount
+            )
+            if actual_cost > 0:
+                self._track_cost(user_id, actual_cost)
+
+            logger.debug(
+                "Cost reservation settled",
+                user_id=user_id,
+                reservation_id=reservation_id,
+                reserved=reservation.amount,
+                actual_cost=actual_cost,
+                total_usage=self.cost_tracker[user_id],
+            )
+
+    def _sweep_stale_reservations(self, user_id: int) -> None:
+        """Release this user's holds that were never settled (caller bug)."""
+        now = datetime.now(UTC)
+        stale = [
+            rid
+            for rid in self.user_reservations.get(user_id, set())
+            if rid in self.reservations
+            and now - self.reservations[rid].created_at > self.RESERVATION_MAX_AGE
+        ]
+        for rid in stale:
+            reservation = self.reservations.pop(rid)
+            self.user_reservations[user_id].discard(rid)
+            self.cost_tracker[user_id] = max(
+                0.0, self.cost_tracker[user_id] - reservation.amount
+            )
+            logger.warning(
+                "Cost reservation expired unsettled",
+                user_id=user_id,
+                reservation_id=rid,
+                amount=reservation.amount,
+                age_seconds=(now - reservation.created_at).total_seconds(),
+            )
+
+    def _drop_user_reservations(self, user_id: int) -> None:
+        """Forget a user's holds entirely (cleanup / admin reset)."""
+        for rid in self.user_reservations.pop(user_id, set()):
+            self.reservations.pop(rid, None)
 
     def _check_request_rate(
         self, user_id: int, tokens: int
@@ -242,10 +399,14 @@ class RateLimiter:
             old_cost = self.cost_tracker[user_id]
             self.cost_tracker[user_id] = 0
             self.cost_reset_time[user_id] = now
-            # Estimates charged before the reset are no longer in the (now
-            # zeroed) tracker; drop them so a late record_actual_cost can't
-            # back out a stale estimate against a fresh window.
-            self.pending_estimates.pop(user_id, None)
+            # Holds charged before the reset are no longer in the (now zeroed)
+            # tracker. Keep the reservations so a late settle still charges the
+            # real cost, but zero their amounts so settling cannot back out
+            # money that the fresh window never counted.
+            for rid in self.user_reservations.get(user_id, set()):
+                reservation = self.reservations.get(rid)
+                if reservation is not None:
+                    reservation.amount = 0.0
 
             if old_cost > 0:
                 logger.info(
@@ -270,30 +431,29 @@ class RateLimiter:
             return 0.0, now
         return self.cost_tracker[user_id], self.cost_reset_time.get(user_id, now)
 
-    async def record_actual_cost(self, user_id: int, cost: float) -> None:
-        """Reconcile a completed request's *actual* cost against the estimate.
+    async def record_actual_cost(
+        self, user_id: int, cost: float, reservation_id: Optional[str] = None
+    ) -> None:
+        """Record a completed run's *actual* cost.
 
-        The pre-flight ``check_rate_limit`` charges a small heuristic estimate
-        so the request rate is gated even before the real cost is known. Once
-        the real ``ClaudeResponse.cost`` is available, this swaps that estimate
-        out for the actual figure: it backs out the matching pending estimate
-        and then adds the actual cost, so ``cost_tracker`` reflects real spend
-        instead of estimate+actual (which would exhaust
-        ``claude_max_cost_per_user`` too fast). Costs of 0 or less are ignored.
+        Prefer ``reserve_cost`` + ``settle_reservation`` for anything that
+        runs Claude: the reservation makes the hold and its release refer to
+        one specific run.
+
+        When *reservation_id* is given this delegates to
+        ``settle_reservation``, so a zero cost still releases the hold. Without
+        it the actual cost is simply added — correct, because ``check_rate_limit``
+        no longer charges an unreconciled estimate that would need backing out.
         """
+        if reservation_id is not None:
+            await self.settle_reservation(reservation_id, cost)
+            return
+
         if cost <= 0:
             return
+
         async with self.locks[user_id]:
             self._maybe_reset_cost_tracker(user_id)
-            # Back out the heuristic estimate previously charged for this
-            # request (FIFO). A daily reset may have already cleared it, so
-            # never drive cost_tracker negative.
-            pending = self.pending_estimates.get(user_id)
-            if pending:
-                estimate = pending.popleft()
-                self.cost_tracker[user_id] = max(
-                    0.0, self.cost_tracker[user_id] - estimate
-                )
             self._track_cost(user_id, cost)
 
     async def reset_user_limits(self, user_id: int) -> None:
@@ -303,7 +463,7 @@ class RateLimiter:
             old_cost = self.cost_tracker[user_id]
             self.cost_tracker[user_id] = 0
             self.cost_reset_time[user_id] = datetime.now(UTC)
-            self.pending_estimates.pop(user_id, None)
+            self._drop_user_reservations(user_id)
 
             # Reset request bucket
             if user_id in self.request_buckets:
@@ -328,11 +488,18 @@ class RateLimiter:
         # Get cost status (computed without mutating the tracker)
         current_cost, effective_reset = self._effective_cost(user_id)
         cost_remaining = max(0, self.config.claude_max_cost_per_user - current_cost)
+        # Portion of ``current`` that is an in-flight hold rather than spend.
+        reserved = sum(
+            self.reservations[rid].amount
+            for rid in self.user_reservations.get(user_id, set())
+            if rid in self.reservations
+        )
 
         return {
             "request_bucket": bucket_status,
             "cost_usage": {
                 "current": current_cost,
+                "reserved": reserved,
                 "limit": self.config.claude_max_cost_per_user,
                 "remaining": cost_remaining,
                 "utilization": current_cost / self.config.claude_max_cost_per_user,
@@ -371,7 +538,7 @@ class RateLimiter:
             self.request_buckets.pop(user_id, None)
             self.cost_tracker.pop(user_id, None)
             self.cost_reset_time.pop(user_id, None)
-            self.pending_estimates.pop(user_id, None)
+            self._drop_user_reservations(user_id)
             self.locks.pop(user_id, None)
 
         if inactive_users:

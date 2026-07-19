@@ -120,9 +120,10 @@ class TestRateLimiter:
         assert allowed is True
         assert message is None
 
-        # Should have created bucket and tracked cost
+        # Bucket created, but throttling alone must not spend budget: the
+        # projected cost is checked, never charged.
         assert user_id in rate_limiter.request_buckets
-        assert rate_limiter.cost_tracker[user_id] == 0.5
+        assert rate_limiter.cost_tracker[user_id] == 0.0
 
     async def test_request_rate_limit_exceeded(self, rate_limiter):
         """Test request rate limit exceeded."""
@@ -153,13 +154,18 @@ class TestRateLimiter:
         assert "Remaining budget" in message
 
     async def test_cost_tracking(self, rate_limiter):
-        """Test cost tracking functionality."""
+        """Actual spend accumulates; throttle checks do not."""
         user_id = 123
 
-        # Track multiple costs
+        # Throttle checks are free.
         await rate_limiter.check_rate_limit(user_id, cost=1.0)
         await rate_limiter.check_rate_limit(user_id, cost=1.5)
-        await rate_limiter.check_rate_limit(user_id, cost=0.5)
+        assert rate_limiter.cost_tracker[user_id] == 0.0
+
+        # Real spend does accumulate.
+        await rate_limiter.record_actual_cost(user_id, 1.0)
+        await rate_limiter.record_actual_cost(user_id, 1.5)
+        await rate_limiter.record_actual_cost(user_id, 0.5)
 
         assert rate_limiter.cost_tracker[user_id] == 3.0
 
@@ -167,8 +173,9 @@ class TestRateLimiter:
         """Test resetting user limits."""
         user_id = 123
 
-        # Set up some usage
+        # Set up some usage: tokens via the throttle, money via a real charge.
         await rate_limiter.check_rate_limit(user_id, cost=2.0, tokens=5)
+        await rate_limiter.record_actual_cost(user_id, 2.0)
 
         # Verify usage
         assert rate_limiter.cost_tracker[user_id] == 2.0
@@ -207,6 +214,7 @@ class TestRateLimiter:
 
         # Set up some usage
         await rate_limiter.check_rate_limit(user_id, cost=2.0, tokens=3)
+        await rate_limiter.record_actual_cost(user_id, 2.0)
 
         status = rate_limiter.get_user_status(user_id)
 
@@ -221,6 +229,8 @@ class TestRateLimiter:
         # Set up multiple users
         await rate_limiter.check_rate_limit(123, cost=1.0)
         await rate_limiter.check_rate_limit(456, cost=2.0)
+        await rate_limiter.record_actual_cost(123, 1.0)
+        await rate_limiter.record_actual_cost(456, 2.0)
 
         status = rate_limiter.get_global_status()
 
@@ -264,9 +274,10 @@ class TestRateLimiter:
         # All should succeed (bucket has enough capacity)
         assert all(result[0] for result in results)
 
-        # Cost should be properly tracked
-        expected_cost = 10 * 0.1
-        assert abs(rate_limiter.cost_tracker[user_id] - expected_cost) < 0.01
+        # Throttling consumed tokens but no budget.
+        assert rate_limiter.cost_tracker[user_id] == 0.0
+        bucket = rate_limiter.request_buckets[user_id]
+        assert bucket.capacity - bucket.tokens == pytest.approx(10, abs=1.0)
 
     async def test_bucket_creation_per_user(self, rate_limiter):
         """Test that buckets are created per user."""
@@ -275,6 +286,8 @@ class TestRateLimiter:
         # Make requests for different users
         await rate_limiter.check_rate_limit(user1, cost=1.0)
         await rate_limiter.check_rate_limit(user2, cost=2.0)
+        await rate_limiter.record_actual_cost(user1, 1.0)
+        await rate_limiter.record_actual_cost(user2, 2.0)
 
         # Should have separate buckets and cost tracking
         assert user1 in rate_limiter.request_buckets
@@ -303,3 +316,199 @@ class TestRateLimiter:
         )
         assert allowed is False
         assert "Rate limit exceeded" in message
+
+
+class TestCostReservations:
+    """Cost budget is spent only by real Claude runs, via explicit holds."""
+
+    @pytest.fixture
+    def config(self):
+        return create_test_config(
+            rate_limit_requests=1000,
+            rate_limit_window=60,
+            rate_limit_burst=10000,
+            claude_max_cost_per_user=5.0,
+        )
+
+    @pytest.fixture
+    def rate_limiter(self, config):
+        return RateLimiter(config)
+
+    async def test_free_requests_never_exhaust_budget(self, rate_limiter):
+        """Regression: N throttle checks with no Claude run must cost $0.
+
+        Previously every update charged its heuristic estimate to the budget
+        and nothing ever reconciled it, so ~160 free commands exhausted the
+        whole $5.00 allowance without a cent actually being spent.
+        """
+        user_id = 777
+        per_command_estimate = 0.0307  # ~ estimate_message_cost() of "/status"
+
+        for _ in range(200):
+            allowed, _ = await rate_limiter.check_rate_limit(
+                user_id, cost=per_command_estimate, tokens=1
+            )
+            assert allowed is True
+
+        status = rate_limiter.get_user_status(user_id)
+        assert status["cost_usage"]["current"] == 0.0
+        assert status["cost_usage"]["remaining"] == 5.0
+
+    async def test_reserve_then_settle_charges_actual_cost(self, rate_limiter):
+        """A hold is replaced by the run's real cost, not stacked on top."""
+        user_id = 123
+
+        reservation_id, error = await rate_limiter.reserve_cost(user_id, 0.50)
+        assert reservation_id is not None
+        assert error is None
+        assert rate_limiter.cost_tracker[user_id] == 0.50
+
+        await rate_limiter.settle_reservation(reservation_id, 1.25)
+
+        assert rate_limiter.cost_tracker[user_id] == 1.25
+        assert rate_limiter.reservations == {}
+
+    async def test_zero_actual_cost_releases_hold_in_full(self, rate_limiter):
+        """Regression: 0.0 is a valid cost and must release the whole hold."""
+        user_id = 123
+
+        reservation_id, _ = await rate_limiter.reserve_cost(user_id, 0.50)
+        assert rate_limiter.cost_tracker[user_id] == 0.50
+
+        await rate_limiter.settle_reservation(reservation_id, 0.0)
+
+        assert rate_limiter.cost_tracker[user_id] == 0.0
+        assert rate_limiter.reservations == {}
+
+    async def test_settle_targets_its_own_reservation_not_fifo(self, rate_limiter):
+        """Regression: reconcile must release *this* run's hold.
+
+        Two concurrent runs with different estimates; the expensive one
+        finishes first. FIFO used to back out the cheap hold, leaving the
+        expensive one stuck on the budget.
+        """
+        user_id = 123
+
+        cheap_id, _ = await rate_limiter.reserve_cost(user_id, 0.02)
+        expensive_id, _ = await rate_limiter.reserve_cost(user_id, 1.00)
+        assert rate_limiter.cost_tracker[user_id] == pytest.approx(1.02)
+
+        # The expensive run settles first at its real cost.
+        await rate_limiter.settle_reservation(expensive_id, 1.10)
+
+        # Only the cheap hold remains outstanding: 1.10 spent + 0.02 held.
+        assert rate_limiter.cost_tracker[user_id] == pytest.approx(1.12)
+
+        await rate_limiter.settle_reservation(cheap_id, 0.03)
+        assert rate_limiter.cost_tracker[user_id] == pytest.approx(1.13)
+
+    async def test_hold_released_when_run_raises(self, rate_limiter):
+        """A ``finally`` settle must not leak the hold on an exception."""
+        user_id = 123
+
+        reservation_id, _ = await rate_limiter.reserve_cost(user_id, 0.50)
+        with pytest.raises(RuntimeError):
+            try:
+                raise RuntimeError("claude blew up")
+            finally:
+                await rate_limiter.settle_reservation(reservation_id, 0.0)
+
+        assert rate_limiter.cost_tracker[user_id] == 0.0
+        assert rate_limiter.reservations == {}
+
+    async def test_double_settle_is_safe(self, rate_limiter):
+        """Settling twice must not credit the user a second time."""
+        user_id = 123
+
+        reservation_id, _ = await rate_limiter.reserve_cost(user_id, 0.50)
+        await rate_limiter.settle_reservation(reservation_id, 1.00)
+        await rate_limiter.settle_reservation(reservation_id, 1.00)
+
+        assert rate_limiter.cost_tracker[user_id] == 1.00
+
+    async def test_unknown_reservation_id_is_ignored(self, rate_limiter):
+        """Unconditional settle in ``finally`` must tolerate a stale id."""
+        await rate_limiter.settle_reservation("does-not-exist", 1.0)
+        assert rate_limiter.cost_tracker[123] == 0.0
+
+    async def test_reserve_refused_when_budget_exhausted(self, rate_limiter):
+        """A hold that cannot fit the remaining budget is refused."""
+        user_id = 123
+        rate_limiter.cost_tracker[user_id] = 4.80
+        rate_limiter.cost_reset_time[user_id] = datetime.now(UTC)
+
+        reservation_id, error = await rate_limiter.reserve_cost(user_id, 0.50)
+
+        assert reservation_id is None
+        assert "Cost limit exceeded" in error
+        assert rate_limiter.cost_tracker[user_id] == 4.80
+
+    async def test_record_actual_cost_with_reservation_id(self, rate_limiter):
+        """The compatibility entry point still settles a hold, zero included."""
+        user_id = 123
+
+        reservation_id, _ = await rate_limiter.reserve_cost(user_id, 0.50)
+        await rate_limiter.record_actual_cost(user_id, 0.0, reservation_id)
+
+        assert rate_limiter.cost_tracker[user_id] == 0.0
+        assert rate_limiter.reservations == {}
+
+    async def test_record_actual_cost_without_reservation_is_additive(
+        self, rate_limiter
+    ):
+        """Legacy call sites keep working: actual cost is simply charged."""
+        user_id = 123
+
+        await rate_limiter.check_rate_limit(user_id, cost=0.03, tokens=1)
+        await rate_limiter.record_actual_cost(user_id, 0.42)
+
+        assert rate_limiter.cost_tracker[user_id] == pytest.approx(0.42)
+
+    async def test_stale_hold_is_swept(self, rate_limiter):
+        """An unsettled hold must not block the budget forever."""
+        user_id = 123
+
+        leaked_id, _ = await rate_limiter.reserve_cost(user_id, 2.0)
+        rate_limiter.reservations[leaked_id].created_at = datetime.now(UTC) - timedelta(
+            hours=2
+        )
+
+        # The next reservation sweeps the expired hold first.
+        new_id, error = await rate_limiter.reserve_cost(user_id, 1.0)
+
+        assert new_id is not None
+        assert error is None
+        assert leaked_id not in rate_limiter.reservations
+        assert rate_limiter.cost_tracker[user_id] == pytest.approx(1.0)
+
+    async def test_daily_reset_does_not_credit_a_fresh_window(self, rate_limiter):
+        """A hold from the previous window cannot refund the new one."""
+        user_id = 123
+
+        reservation_id, _ = await rate_limiter.reserve_cost(user_id, 0.50)
+        # Force the daily window to roll over.
+        rate_limiter.cost_reset_time[user_id] = datetime.now(UTC) - timedelta(days=2)
+
+        await rate_limiter.settle_reservation(reservation_id, 0.75)
+
+        # Reset zeroed the tracker; only the real cost of the run lands.
+        assert rate_limiter.cost_tracker[user_id] == pytest.approx(0.75)
+
+    async def test_reset_and_cleanup_drop_holds(self, rate_limiter):
+        """Admin reset and inactive-user cleanup forget outstanding holds."""
+        user_id = 123
+
+        reservation_id, _ = await rate_limiter.reserve_cost(user_id, 0.50)
+        await rate_limiter.reset_user_limits(user_id)
+
+        assert reservation_id not in rate_limiter.reservations
+        assert rate_limiter.cost_tracker[user_id] == 0.0
+
+        await rate_limiter.check_rate_limit(456, cost=0.0, tokens=1)
+        other_id, _ = await rate_limiter.reserve_cost(456, 0.50)
+        rate_limiter.request_buckets[456].last_update = datetime.now(UTC) - timedelta(
+            hours=25
+        )
+        await rate_limiter.cleanup_inactive_users(timedelta(hours=24))
+
+        assert other_id not in rate_limiter.reservations

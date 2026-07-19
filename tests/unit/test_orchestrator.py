@@ -2,6 +2,7 @@
 
 import asyncio
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -827,6 +828,81 @@ class TestTypingHeartbeat:
         assert "chat" not in sig.parameters
 
 
+class TestRequestLock:
+    """Per-user request serialization lock."""
+
+    async def test_returns_same_lock_for_same_user(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        assert orchestrator._get_request_lock(7) is orchestrator._get_request_lock(7)
+        assert orchestrator._get_request_lock(7) is not orchestrator._get_request_lock(
+            8
+        )
+
+    async def test_eviction_keeps_held_locks(self, agentic_settings, deps):
+        """A held lock survives the eviction sweep; idle ones are dropped."""
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        orchestrator._MAX_REQUEST_LOCKS = 3
+
+        held = orchestrator._get_request_lock(1)
+        await held.acquire()
+        orchestrator._get_request_lock(2)
+        orchestrator._get_request_lock(3)
+
+        orchestrator._get_request_lock(4)  # triggers eviction
+
+        assert orchestrator._request_locks.get(1) is held
+        assert 2 not in orchestrator._request_locks
+        held.release()
+
+    async def test_acquire_returns_canonical_lock_after_eviction(
+        self, agentic_settings, deps
+    ):
+        """If the lock is evicted while awaited, acquisition retries the new one."""
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        stale = orchestrator._get_request_lock(42)
+        # Simulate an eviction sweep racing the ``await lock.acquire()``:
+        # the mapped lock is replaced while the caller holds only a reference.
+        original_get = orchestrator._get_request_lock
+        swapped = [False]
+
+        def _get_and_evict(user_id: int) -> asyncio.Lock:
+            lock = original_get(user_id)
+            if not swapped[0]:
+                swapped[0] = True
+                orchestrator._request_locks[user_id] = asyncio.Lock()
+            return lock
+
+        orchestrator._get_request_lock = _get_and_evict  # type: ignore[method-assign]
+
+        acquired = await orchestrator._acquire_request_lock(42)
+
+        assert acquired is orchestrator._request_locks[42]
+        assert acquired is not stale
+        assert acquired.locked()
+        assert not stale.locked()  # the stale lock was released, not leaked
+        acquired.release()
+
+    async def test_acquire_serializes_same_user(self, agentic_settings, deps):
+        """Two concurrent acquisitions for one user do not overlap."""
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        order: list = []  # type: ignore[type-arg]
+
+        async def run(tag: str) -> None:
+            lock = await orchestrator._acquire_request_lock(5)
+            order.append(f"{tag}-in")
+            await asyncio.sleep(0.01)
+            order.append(f"{tag}-out")
+            lock.release()
+
+        await asyncio.gather(run("a"), run("b"))
+
+        assert order in (
+            ["a-in", "a-out", "b-in", "b-out"],
+            ["b-in", "b-out", "a-in", "a-out"],
+        )
+
+
 async def test_group_thread_mode_rejects_non_forum_chat(group_thread_settings, deps):
     """Strict thread mode rejects updates outside configured forum chat."""
     orchestrator = MessageOrchestrator(group_thread_settings, deps)
@@ -1042,3 +1118,355 @@ async def test_private_mode_rejects_help_outside_topics(private_thread_settings,
 
     assert called["value"] is False
     update.effective_message.reply_text.assert_called_once()
+
+
+# --- /sessions user + project isolation -------------------------------------
+
+
+@pytest.fixture
+def isolation_settings(tmp_dir):
+    """Two Telegram users allowed, neither of them an admin."""
+    return create_test_config(
+        approved_directory=str(tmp_dir),
+        agentic_mode=True,
+        allowed_users=[111, 222],
+        admin_users=[],
+    )
+
+
+@pytest.fixture
+def admin_isolation_settings(tmp_dir):
+    return create_test_config(
+        approved_directory=str(tmp_dir),
+        agentic_mode=True,
+        allowed_users=[111, 222],
+        admin_users=[111],
+    )
+
+
+def _sessions_update(user_id: int = 111) -> MagicMock:
+    update = MagicMock()
+    update.effective_user.id = user_id
+    update.message.reply_text = AsyncMock()
+    return update
+
+
+def _resume_update(user_id: int = 111, session_id: str = "s-1") -> MagicMock:
+    update = MagicMock()
+    update.callback_query.data = f"resume:{session_id}"
+    update.callback_query.from_user.id = user_id
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    return update
+
+
+def _storage_mock() -> MagicMock:
+    storage = MagicMock()
+    storage.sessions.get_user_sessions = AsyncMock(return_value=[])
+    storage.sessions.get_session = AsyncMock(return_value=None)
+    return storage
+
+
+def _session_record(session_id: str, user_id: int, project_path) -> SimpleNamespace:
+    return SimpleNamespace(
+        session_id=session_id,
+        user_id=user_id,
+        project_path=str(project_path),
+        last_used=datetime.now(UTC),
+    )
+
+
+def _ctx(storage) -> MagicMock:
+    context = MagicMock()
+    context.bot_data = {"storage": storage}
+    context.user_data = {}
+    return context
+
+
+async def test_sessions_only_queries_callers_own_sessions(
+    isolation_settings, deps, tmp_dir
+):
+    """A regular user's list is built from sessions keyed to their own ID."""
+    orchestrator = MessageOrchestrator(isolation_settings, deps)
+    storage = _storage_mock()
+    storage.sessions.get_user_sessions.return_value = [
+        _session_record("own-session-1", 111, tmp_dir)
+    ]
+
+    update = _sessions_update(user_id=111)
+    await orchestrator.agentic_sessions(update, _ctx(storage))
+
+    storage.sessions.get_user_sessions.assert_awaited_once_with(111, active_only=False)
+    assert "own-sess" in update.message.reply_text.call_args[0][0]
+
+
+async def test_sessions_excludes_sessions_outside_the_scoping_root(
+    isolation_settings, deps, tmp_dir
+):
+    """Own sessions whose project_path escapes the root are not listed."""
+    orchestrator = MessageOrchestrator(isolation_settings, deps)
+    storage = _storage_mock()
+    storage.sessions.get_user_sessions.return_value = [
+        _session_record("elsewhere-1", 111, tmp_dir.parent / "somewhere_else")
+    ]
+
+    update = _sessions_update(user_id=111)
+    await orchestrator.agentic_sessions(update, _ctx(storage))
+
+    assert update.message.reply_text.call_args[0][0] == "No sessions found."
+
+
+async def test_sessions_hides_local_sessions_from_non_admin(
+    isolation_settings, deps, tmp_dir, monkeypatch
+):
+    """Local ~/.claude/projects sessions are never scanned for a non-admin."""
+    import src.claude.local_sessions as local_sessions_mod
+
+    called = {"value": False}
+
+    def _fake_list(**kwargs):
+        called["value"] = True
+        return []
+
+    monkeypatch.setattr(local_sessions_mod, "list_all_local_sessions", _fake_list)
+
+    orchestrator = MessageOrchestrator(isolation_settings, deps)
+    update = _sessions_update(user_id=222)
+    await orchestrator.agentic_sessions(update, _ctx(_storage_mock()))
+
+    assert called["value"] is False
+    assert update.message.reply_text.call_args[0][0] == "No sessions found."
+
+
+async def test_sessions_shows_local_sessions_to_admin(
+    admin_isolation_settings, deps, tmp_dir, monkeypatch
+):
+    """An admin still sees CLI/VS Code sessions discovered on disk."""
+    import time
+
+    import src.claude.local_sessions as local_sessions_mod
+    from src.claude.local_sessions import LocalSession
+
+    def _fake_list(**kwargs):
+        return [
+            LocalSession(
+                session_id="local-abc12345",
+                cwd=str(tmp_dir),
+                timestamp=datetime.now(UTC),
+                jsonl_path=tmp_dir / "x.jsonl",
+                first_message="hello from vscode",
+                mtime=time.time(),
+            )
+        ]
+
+    monkeypatch.setattr(local_sessions_mod, "list_all_local_sessions", _fake_list)
+
+    orchestrator = MessageOrchestrator(admin_isolation_settings, deps)
+    update = _sessions_update(user_id=111)
+    await orchestrator.agentic_sessions(update, _ctx(_storage_mock()))
+
+    text = update.message.reply_text.call_args[0][0]
+    assert "local-ab" in text
+    assert "hello from vscode" in text
+
+
+async def test_resume_rejects_another_users_session(isolation_settings, deps, tmp_dir):
+    """Owner check is server-side: a forged callback for a foreign session fails."""
+    orchestrator = MessageOrchestrator(isolation_settings, deps)
+    storage = _storage_mock()
+    storage.sessions.get_session.return_value = _session_record(
+        "victim-session", 999, tmp_dir
+    )
+
+    update = _resume_update(user_id=111, session_id="victim-session")
+    context = _ctx(storage)
+    await orchestrator._agentic_resume_callback(update, context)
+
+    assert "another user" in update.callback_query.edit_message_text.call_args[0][0]
+    assert "claude_session_id" not in context.user_data
+    assert "current_directory" not in context.user_data
+
+
+async def test_resume_rejects_session_from_another_project_root(
+    isolation_settings, deps, tmp_dir
+):
+    """A session the user owns but that lives outside the topic root is refused."""
+    project_a = tmp_dir / "project_a"
+    project_b = tmp_dir / "project_b"
+    project_a.mkdir()
+    project_b.mkdir()
+
+    orchestrator = MessageOrchestrator(isolation_settings, deps)
+    storage = _storage_mock()
+    storage.sessions.get_session.return_value = _session_record(
+        "b-session", 111, project_b
+    )
+
+    update = _resume_update(user_id=111, session_id="b-session")
+    context = _ctx(storage)
+    # Pin the caller to project_a's topic.
+    context.user_data["_thread_context"] = {"project_root": str(project_a)}
+
+    await orchestrator._agentic_resume_callback(update, context)
+
+    assert (
+        "current project root"
+        in update.callback_query.edit_message_text.call_args[0][0]
+    )
+    assert "claude_session_id" not in context.user_data
+
+
+async def test_resume_local_session_denied_for_non_admin(
+    isolation_settings, deps, tmp_dir, monkeypatch
+):
+    """An unknown (local-only) session ID is not resumable by a non-admin."""
+    import src.claude.local_sessions as local_sessions_mod
+
+    scanned = {"value": False}
+
+    def _fake_head(path):
+        scanned["value"] = True
+        return {"cwd": str(tmp_dir)}
+
+    monkeypatch.setattr(local_sessions_mod, "_parse_session_head", _fake_head)
+
+    orchestrator = MessageOrchestrator(isolation_settings, deps)
+    update = _resume_update(user_id=222, session_id="cli-session")
+    context = _ctx(_storage_mock())
+
+    await orchestrator._agentic_resume_callback(update, context)
+
+    assert "not available to you" in (
+        update.callback_query.edit_message_text.call_args[0][0]
+    )
+    assert scanned["value"] is False
+    assert "claude_session_id" not in context.user_data
+
+
+async def test_resume_allows_own_session_in_root(isolation_settings, deps, tmp_dir):
+    """The happy path still works for a user's own in-root session."""
+    orchestrator = MessageOrchestrator(isolation_settings, deps)
+    storage = _storage_mock()
+    storage.sessions.get_session.return_value = _session_record("mine-1", 111, tmp_dir)
+
+    update = _resume_update(user_id=111, session_id="mine-1")
+    context = _ctx(storage)
+    await orchestrator._agentic_resume_callback(update, context)
+
+    assert context.user_data["claude_session_id"] == "mine-1"
+    assert context.user_data["current_directory"] == Path(str(tmp_dir))
+
+
+# --- Cost reservations are always settled -----------------------------------
+#
+# The budget hold is taken before the Claude run and must be released on every
+# exit path. A leaked hold is invisible until the user's budget is exhausted by
+# runs that never cost anything, which is exactly the bug this guards.
+
+
+def _reserving_limiter():
+    limiter = MagicMock()
+    limiter.reserve_cost = AsyncMock(return_value=("rid-1", None))
+    limiter.settle_reservation = AsyncMock()
+    return limiter
+
+
+def _cost_update():
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.text = "run something"
+    update.message.message_id = 1
+    update.message.chat.type = "private"
+    update.message.chat.send_action = AsyncMock()
+    update.message.reply_text = AsyncMock()
+    update.message.reply_text.return_value = AsyncMock()
+    return update
+
+
+def _cost_context(agentic_settings, claude_integration, limiter):
+    context = MagicMock()
+    context.user_data = {}
+    context.bot_data = {
+        "settings": agentic_settings,
+        "claude_integration": claude_integration,
+        "storage": None,
+        "rate_limiter": limiter,
+        "audit_logger": None,
+    }
+    return context
+
+
+async def test_agentic_text_settles_reservation_with_actual_cost(
+    agentic_settings, deps
+):
+    """A successful run settles the hold at its real cost."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    response = MagicMock()
+    response.session_id = "s-1"
+    response.content = "done"
+    response.tools_used = []
+    response.is_error = False
+    response.cost = 1.23
+
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock(return_value=response)
+    limiter = _reserving_limiter()
+
+    await orchestrator.agentic_text(
+        _cost_update(), _cost_context(agentic_settings, claude_integration, limiter)
+    )
+
+    limiter.settle_reservation.assert_awaited_once_with("rid-1", 1.23)
+
+
+async def test_agentic_text_settles_at_zero_on_soft_error(agentic_settings, deps):
+    """A run the SDK flagged as an error produced nothing usable — charge 0."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    response = MagicMock()
+    response.session_id = "s-1"
+    response.is_error = True
+    response.error_type = "no_result_message"
+    response.cost = 9.99  # must NOT be charged
+
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock(return_value=response)
+    limiter = _reserving_limiter()
+
+    await orchestrator.agentic_text(
+        _cost_update(), _cost_context(agentic_settings, claude_integration, limiter)
+    )
+
+    limiter.settle_reservation.assert_awaited_once_with("rid-1", 0.0)
+
+
+async def test_agentic_text_settles_at_zero_when_run_raises(agentic_settings, deps):
+    """An exception mid-run must still release the hold."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock(side_effect=RuntimeError("boom"))
+    limiter = _reserving_limiter()
+
+    await orchestrator.agentic_text(
+        _cost_update(), _cost_context(agentic_settings, claude_integration, limiter)
+    )
+
+    limiter.settle_reservation.assert_awaited_once_with("rid-1", 0.0)
+
+
+async def test_agentic_text_does_not_run_when_reservation_refused(
+    agentic_settings, deps
+):
+    """No budget, no run — and nothing to settle."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock()
+    limiter = MagicMock()
+    limiter.reserve_cost = AsyncMock(return_value=(None, "Cost limit exceeded"))
+    limiter.settle_reservation = AsyncMock()
+
+    await orchestrator.agentic_text(
+        _cost_update(), _cost_context(agentic_settings, claude_integration, limiter)
+    )
+
+    claude_integration.run_command.assert_not_called()
+    limiter.settle_reservation.assert_not_awaited()

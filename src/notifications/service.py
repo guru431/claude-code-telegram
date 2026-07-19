@@ -5,15 +5,18 @@ through the Telegram bot API with rate limiting (1 msg/sec per chat).
 """
 
 import asyncio
-import re
-from typing import List, Optional, Tuple
+from datetime import timedelta
+from typing import List, Optional, Union
 
 import structlog
 from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TelegramError
 
-from ..bot.utils.html_format import tg_len
+from ..bot.utils.html_format import (
+    TELEGRAM_MAX_MESSAGE_LENGTH,
+    split_telegram_html,
+)
 from ..events.bus import Event, EventBus
 from ..events.types import AgentResponseEvent
 from ..security.secret_patterns import redact_secrets
@@ -23,14 +26,16 @@ logger = structlog.get_logger()
 # Telegram rate limit: ~30 msgs/sec globally, ~1 msg/sec per chat
 SEND_INTERVAL_SECONDS = 1.1
 
+# Upper bound for a server-provided flood-control delay. A hostile or buggy
+# value (or a misparsed unit) must not park the sender worker for hours and
+# stall every other queued notification behind it.
+MAX_RETRY_AFTER_SECONDS = 60.0
+
 
 # Sentinel enqueued by stop() to wake an idle sender promptly without
 # cancelling it (cancellation would drop an in-flight, already-dequeued send).
 # A real event instance so the typed queue accepts it; compared by identity.
 _SHUTDOWN: AgentResponseEvent = AgentResponseEvent(source="__shutdown_sentinel__")
-
-# Matches an HTML start/end tag (Telegram's subset: b, i, code, pre, a, …).
-_TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9-]*)(\s[^>]*)?>")
 
 # Maps an event's ``parse_mode`` string to Telegram's ParseMode enum. ``None``
 # is plain text. An unrecognized value is rejected explicitly rather than being
@@ -43,80 +48,23 @@ _PARSE_MODES: dict[Optional[str], Optional[str]] = {
     "MarkdownV2": ParseMode.MARKDOWN_V2,
 }
 
-# Void elements never have a matching close tag, so they must not be pushed onto
-# the open-tag stack — otherwise they accumulate forever (carry_open grows, the
-# split budget goes <= 0) and _split_message loops endlessly.
-_VOID_TAGS = frozenset({"br", "hr", "img", "input", "meta", "link", "wbr"})
 
+def _retry_delay_seconds(retry_after: Union[int, float, timedelta]) -> float:
+    """Normalize a Telegram ``RetryAfter`` delay to bounded seconds.
 
-def _open_tags_at(html: str) -> List[Tuple[str, str]]:
-    """Return formatting tags left open at the end of *html*.
-
-    Each item is ``(full_opening_tag, tag_name)`` in nesting order, so callers
-    can close them in reverse and reopen them verbatim (preserving attributes
-    such as an anchor's ``href``).
+    ``RetryAfter.retry_after`` is typed ``int | timedelta``: python-telegram-bot
+    stores it internally as a ``timedelta`` and currently down-converts it to an
+    ``int`` while emitting a ``PTBDeprecationWarning`` (deprecated in v22.2).
+    Once that default flips, passing the raw attribute to ``asyncio.sleep``
+    would raise ``TypeError`` and the notification would be lost, so accept both
+    shapes here and clamp the result to a sane ceiling.
     """
-    stack: List[Tuple[str, str]] = []
-    for m in _TAG_RE.finditer(html):
-        name = m.group(2).lower()
-        if m.group(1) == "/":  # closing tag: pop the nearest matching open
-            for i in range(len(stack) - 1, -1, -1):
-                if stack[i][1] == name:
-                    del stack[i]
-                    break
-        elif name in _VOID_TAGS or (m.group(3) or "").rstrip().endswith("/"):
-            # Void (<br>) or self-closing (<x/>) tag: not an open tag, skip it.
-            continue
-        else:
-            stack.append((m.group(0), name))
-    return stack
-
-
-def _utf16_cut(text: str, max_length: int) -> int:
-    """Largest code-point index whose UTF-16 length is <= *max_length*.
-
-    Telegram counts message length in UTF-16 units (emoji = 2), so a code-point
-    slice can exceed the byte budget. This finds the index where the UTF-16
-    length first reaches the limit.
-    """
-    if tg_len(text) <= max_length:
-        return len(text)
-    units = 0
-    for i, ch in enumerate(text):
-        units += len(ch.encode("utf-16-le")) // 2
-        if units > max_length:
-            return i
-    return len(text)
-
-
-def _choose_split_point(text: str, max_length: int) -> int:
-    """Pick an index <= max_length (UTF-16 units) to cut *text*.
-
-    Prefers a paragraph break, then a newline, then a space; falls back to a
-    hard cut at the UTF-16 limit. If the chosen point lands inside a ``<...>``
-    tag, it is moved back to just before that tag.
-    """
-    pos = _utf16_cut(text, max_length)
-    window = text[:pos]
-    for sep in ("\n\n", "\n", " "):
-        idx = window.rfind(sep)
-        if idx != -1:
-            pos = idx
-            break
-
-    # Never cut in the middle of a tag: if the last '<' before pos is not yet
-    # closed by a '>', back up to that '<'.
-    last_open = text.rfind("<", 0, pos)
-    if last_open != -1 and text.find(">", last_open, pos) == -1:
-        pos = last_open
-
-    # Likewise, never cut inside an HTML entity (&...;). Entities are short, so
-    # only look back a small window for an unterminated '&'.
-    amp = text.rfind("&", max(0, pos - 12), pos)
-    if amp != -1 and text.find(";", amp, pos) == -1:
-        pos = amp
-
-    return pos if pos > 0 else max_length
+    seconds = (
+        retry_after.total_seconds()
+        if isinstance(retry_after, timedelta)
+        else float(retry_after)
+    )
+    return max(0.0, min(seconds, MAX_RETRY_AFTER_SECONDS))
 
 
 class NotificationService:
@@ -315,66 +263,20 @@ class NotificationService:
             except RetryAfter as e:
                 if attempt + 1 >= 2:
                     raise
+                delay = _retry_delay_seconds(e.retry_after)
                 logger.warning(
                     "Telegram flood control, retrying after delay",
                     chat_id=chat_id,
-                    retry_after=e.retry_after,
+                    retry_after=delay,
                 )
-                await asyncio.sleep(e.retry_after)
+                await asyncio.sleep(delay)
 
-    def _split_message(self, text: str, max_length: int = 4096) -> List[str]:
+    def _split_message(
+        self, text: str, max_length: int = TELEGRAM_MAX_MESSAGE_LENGTH
+    ) -> List[str]:
         """Split long messages without breaking Telegram HTML tags.
 
-        Messages are sent with ``ParseMode.HTML``; a naive positional split can
-        cut a ``<code>``/``<a>`` tag or leave one unbalanced, which Telegram
-        rejects (``TelegramError``) and the notification is lost. Each emitted
-        chunk is kept well-formed: tags still open at a cut are closed at the
-        chunk's end and reopened (with their attributes) at the next chunk's
-        start.
+        Thin wrapper over the shared :func:`split_telegram_html` splitter so
+        notifications and the classic-mode formatter cut text identically.
         """
-        if tg_len(text) <= max_length:
-            return [text]
-
-        chunks: List[str] = []
-        carry_open: List[str] = []  # opening tags to reopen on the next chunk
-        rest = text
-
-        while rest:
-            prefix = "".join(carry_open)
-            if tg_len(prefix) + tg_len(rest) <= max_length:
-                chunks.append(prefix + rest)
-                break
-
-            budget = max_length - tg_len(prefix)
-            split_len = _choose_split_point(rest, budget)
-            # Guard: a non-positive split point would never advance ``rest``
-            # (infinite loop) or yield a negative slice. Force progress by
-            # dropping the carried-over open tags and cutting at the raw limit.
-            if split_len <= 0:
-                carry_open = []
-                prefix = ""
-                budget = max_length
-                split_len = _utf16_cut(rest, budget) or len(rest)
-            segment = rest[:split_len]
-            open_now = _open_tags_at(prefix + segment)
-            closing = "".join(f"</{name}>" for _, name in reversed(open_now))
-
-            # If the closing tags push the chunk past the limit, re-cut leaving
-            # room for them. Plain text has no closing tags, so the exact cut is
-            # preserved.
-            if (
-                closing
-                and tg_len(prefix) + tg_len(segment) + tg_len(closing) > max_length
-            ):
-                budget = max_length - tg_len(prefix) - tg_len(closing)
-                split_len = _choose_split_point(rest, budget)
-                segment = rest[:split_len]
-                open_now = _open_tags_at(prefix + segment)
-                closing = "".join(f"</{name}>" for _, name in reversed(open_now))
-
-            chunks.append(prefix + segment + closing)
-            carry_open = [full for full, _ in open_now]
-            # Drop leading whitespace of the next part (matches old behavior).
-            rest = rest[split_len:].lstrip()
-
-        return chunks
+        return split_telegram_html(text, max_length)

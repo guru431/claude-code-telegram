@@ -355,3 +355,23 @@ async def test_transcribe_openai_reuses_cached_client(openai_voice_handler):
 
     openai_ctor.assert_called_once_with(api_key="test-openai-key")
     assert mock_transcriptions.create.await_count == 2
+
+
+def test_get_openai_client_warns_when_using_placeholder_key(openai_config):
+    """A custom base_url without an API key logs a warning about the stub key."""
+    openai_config.openai_api_key_str = None
+    openai_config.voice_base_url = "http://localhost:8000/v1"
+    handler = VoiceHandler(config=openai_config)
+
+    openai_ctor = MagicMock(return_value=MagicMock())
+    mock_logger = MagicMock()
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(sys.modules, "openai", SimpleNamespace(AsyncOpenAI=openai_ctor))
+        mp.setattr("src.bot.features.voice_handler.logger", mock_logger)
+        handler._get_openai_client()
+
+    openai_ctor.assert_called_once_with(
+        api_key="not-needed", base_url="http://localhost:8000/v1"
+    )
+    mock_logger.warning.assert_called_once()

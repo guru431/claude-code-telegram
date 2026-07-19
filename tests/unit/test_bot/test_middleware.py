@@ -217,6 +217,94 @@ class TestMiddlewareBlocksSubsequentGroups:
         assert handler_called is True
         rate_limiter.check_rate_limit.assert_not_called()
 
+    async def test_rejection_reply_map_evicts_stale_entries(
+        self, bot, mock_update, mock_context
+    ):
+        """The rejection-throttle map must not grow without bound.
+
+        A stream of distinct unauthorized senders adds one entry each; entries
+        older than the throttle window are swept (the sweep itself is throttled
+        to once per window, so it is forced here by rewinding its timestamp).
+        """
+        import time
+
+        from src.bot.middleware import auth as auth_mod
+
+        auth_manager = MagicMock()
+        auth_manager.is_authenticated.return_value = False
+        auth_manager.authenticate_user = AsyncMock(return_value=False)
+        bot.deps["auth_manager"] = auth_manager
+        bot.deps["audit_logger"] = AsyncMock()
+
+        auth_mod._last_rejection_reply.clear()
+        # Seed entries that are already older than the window.
+        stale_now = time.monotonic()
+        for uid in range(1000, 1050):
+            auth_mod._last_rejection_reply[uid] = (
+                stale_now - auth_mod._REJECTION_REPLY_WINDOW - 10
+            )
+        # Force the throttled sweep to be due on the next rejection.
+        auth_mod._last_rejection_gc = 0.0
+
+        wrapper = bot._create_middleware_handler(auth_mod.auth_middleware)
+        with pytest.raises(ApplicationHandlerStop):
+            await wrapper(mock_update, mock_context)
+
+        # All 50 stale entries swept; only the current rejecting user remains.
+        assert set(auth_mod._last_rejection_reply) == {mock_update.effective_user.id}
+
+    async def test_rejection_reply_sweep_is_throttled(
+        self, bot, mock_update, mock_context
+    ):
+        """Back-to-back rejections must not re-scan the whole map each time."""
+        from src.bot.middleware import auth as auth_mod
+
+        auth_manager = MagicMock()
+        auth_manager.is_authenticated.return_value = False
+        auth_manager.authenticate_user = AsyncMock(return_value=False)
+        bot.deps["auth_manager"] = auth_manager
+        bot.deps["audit_logger"] = AsyncMock()
+
+        auth_mod._last_rejection_reply.clear()
+        wrapper = bot._create_middleware_handler(auth_mod.auth_middleware)
+
+        with pytest.raises(ApplicationHandlerStop):
+            await wrapper(mock_update, mock_context)
+        gc_after_first = auth_mod._last_rejection_gc
+
+        # A stale entry added after the sweep survives the next rejection,
+        # proving the second call did not run another sweep.
+        auth_mod._last_rejection_reply[4242] = 0.0
+        with pytest.raises(ApplicationHandlerStop):
+            await wrapper(mock_update, mock_context)
+
+        assert auth_mod._last_rejection_gc == gc_after_first
+        assert 4242 in auth_mod._last_rejection_reply
+
+    async def test_burst_tracker_state_persists_across_updates(self, bot):
+        """burst_protection stores state in bot_data, which persists per-app.
+
+        Guards the invariant that middleware ``data`` is the persistent
+        ``context.bot_data`` mapping, not a fresh per-update dict -- burst
+        protection would silently stop working if that changed.
+        """
+        from src.bot.middleware.rate_limit import burst_protection_middleware
+
+        event = MagicMock()
+        event.effective_user = MagicMock()
+        event.effective_user.id = 555
+        event.effective_message = MagicMock()
+        event.effective_message.reply_text = AsyncMock()
+
+        async def handler(ev, d):
+            return None
+
+        data: dict = {}
+        for _ in range(3):
+            await burst_protection_middleware(handler, event, data)
+
+        assert len(data["burst_tracker"][555]["recent_requests"]) == 3
+
     async def test_dependencies_injected_before_middleware_runs(
         self, bot, mock_update, mock_context
     ):

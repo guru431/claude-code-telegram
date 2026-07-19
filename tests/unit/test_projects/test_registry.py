@@ -4,7 +4,59 @@ from pathlib import Path
 
 import pytest
 
-from src.projects.registry import load_project_registry
+from src.projects.registry import load_project_registry, parse_enabled
+
+
+class TestParseEnabled:
+    @pytest.mark.parametrize("value", [True, "true", "True", "yes", "on", "1", 1])
+    def test_truthy(self, value: object) -> None:
+        assert parse_enabled(value, "ctx") is True
+
+    @pytest.mark.parametrize("value", [False, "false", "False", "no", "off", "0", 0])
+    def test_falsy(self, value: object) -> None:
+        assert parse_enabled(value, "ctx") is False
+
+    @pytest.mark.parametrize("value", ["maybe", "", "disabled", 2, None, []])
+    def test_unknown_raises(self, value: object) -> None:
+        with pytest.raises(ValueError, match="invalid 'enabled' value"):
+            parse_enabled(value, "ctx")
+
+
+def test_quoted_false_disables_project(tmp_path: Path) -> None:
+    """Regression: bool("false") is True, silently re-enabling the project."""
+    approved = tmp_path / "projects"
+    approved.mkdir()
+    (approved / "app_one").mkdir()
+
+    config_file = tmp_path / "projects.yaml"
+    config_file.write_text(
+        'projects:\n  - slug: app1\n    name: App One\n    path: app_one\n    enabled: "false"\n',
+        encoding="utf-8",
+    )
+
+    registry = load_project_registry(config_file, approved)
+
+    assert registry.projects[0].enabled is False
+    assert registry.list_enabled() == []
+
+
+def test_invalid_enabled_value_rejected(tmp_path: Path) -> None:
+    approved = tmp_path / "projects"
+    approved.mkdir()
+    (approved / "app_one").mkdir()
+
+    config_file = tmp_path / "projects.yaml"
+    config_file.write_text(
+        "projects:\n"
+        "  - slug: app1\n"
+        "    name: App One\n"
+        "    path: app_one\n"
+        "    enabled: sometimes\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid 'enabled' value"):
+        load_project_registry(config_file, approved)
 
 
 def test_load_project_registry_valid(tmp_path: Path) -> None:

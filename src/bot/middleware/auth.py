@@ -13,6 +13,11 @@ logger = structlog.get_logger()
 # we throttle here to avoid spamming a reply + audit row per inbound message.
 _REJECTION_REPLY_WINDOW = 60.0
 _last_rejection_reply: Dict[int, float] = {}
+# Timestamp of the last eviction sweep over ``_last_rejection_reply``. The sweep
+# is O(len(map)), so it is throttled to once per window: without throttling a
+# flood from many distinct unauthorized senders would scan the whole (growing)
+# map on every inbound message, making rejection handling quadratic.
+_last_rejection_gc: float = 0.0
 
 
 async def auth_middleware(handler: Callable, event: Any, data: Dict[str, Any]) -> Any:
@@ -109,14 +114,19 @@ async def auth_middleware(handler: Callable, event: Any, data: Dict[str, Any]) -
 
         # Throttle the rejection reply to at most once per window per user. The
         # audit attempt above is still recorded for every message.
+        global _last_rejection_gc
         now = time.monotonic()
         # Evict entries older than the throttle window so the map stays bounded
         # under a stream of distinct unauthorized senders (mirrors the GC in
         # burst_protection_middleware). Entries past the window are no longer
-        # throttling anything, so dropping them is safe.
-        stale_cutoff = now - _REJECTION_REPLY_WINDOW
-        for uid in [u for u, t in _last_rejection_reply.items() if t < stale_cutoff]:
-            _last_rejection_reply.pop(uid, None)
+        # throttling anything, so dropping them is safe. The sweep itself runs
+        # at most once per window to keep per-message cost O(1).
+        if now - _last_rejection_gc >= _REJECTION_REPLY_WINDOW:
+            _last_rejection_gc = now
+            stale_cutoff = now - _REJECTION_REPLY_WINDOW
+            stale = [u for u, t in _last_rejection_reply.items() if t < stale_cutoff]
+            for uid in stale:
+                _last_rejection_reply.pop(uid, None)
         last_reply = _last_rejection_reply.get(user_id, 0.0)
         if event.effective_message and now - last_reply >= _REJECTION_REPLY_WINDOW:
             _last_rejection_reply[user_id] = now

@@ -4,21 +4,138 @@ from pathlib import Path
 
 import yaml
 
-from src.projects.discovery import _make_display_name, _slugify, discover_new_projects
+from src.projects.discovery import (
+    _make_display_name,
+    discover_new_projects,
+    iter_project_dirs,
+    path_dedupe_key,
+    slugify,
+)
+from src.projects.registry import load_project_registry
 
 
 class TestSlugify:
     def test_simple_name(self) -> None:
-        assert _slugify("boss") == "boss"
+        assert slugify("boss") == "boss"
 
     def test_underscore_prefix(self) -> None:
-        assert _slugify("_boss") == "boss"
+        assert slugify("_boss") == "boss"
 
     def test_spaces_and_caps(self) -> None:
-        assert _slugify("My Project") == "my-project"
+        assert slugify("My Project") == "my-project"
 
     def test_special_chars(self) -> None:
-        assert _slugify("proj@2.0") == "proj-2-0"
+        assert slugify("proj@2.0") == "proj-2-0"
+
+    def test_path_separator(self) -> None:
+        assert slugify("site/univer") == "site-univer"
+
+    def test_shared_with_sync_script(self) -> None:
+        """scripts/sync_projects_yaml.py must use the same slug generator."""
+        from scripts.sync_projects_yaml import slug_from_path
+
+        assert slug_from_path is slugify
+
+
+class TestPathDedupeKey:
+    def test_spelling_variants_collapse(self, tmp_path: Path) -> None:
+        root = tmp_path.resolve()
+        (root / "alpha").mkdir()
+        base = path_dedupe_key(root, "alpha")
+
+        assert base is not None
+        for variant in ["./alpha", "ALPHA", "alpha/", "beta/../alpha"]:
+            assert path_dedupe_key(root, variant) == base
+
+    def test_nested_separator_variants(self, tmp_path: Path) -> None:
+        root = tmp_path.resolve()
+        (root / "site" / "lingva").mkdir(parents=True)
+
+        assert path_dedupe_key(root, "site/lingva") == path_dedupe_key(
+            root, "site\\lingva"
+        )
+
+    def test_distinct_dirs_differ(self, tmp_path: Path) -> None:
+        root = tmp_path.resolve()
+        assert path_dedupe_key(root, "alpha") != path_dedupe_key(root, "beta")
+
+    def test_rejects_absolute_root_and_outside(self, tmp_path: Path) -> None:
+        root = (tmp_path / "projects").resolve()
+        root.mkdir()
+
+        assert path_dedupe_key(root, str(root / "alpha")) is None
+        assert path_dedupe_key(root, "") is None
+        assert path_dedupe_key(root, ".") is None
+        assert path_dedupe_key(root, "..") is None
+        assert path_dedupe_key(root, "../outside") is None
+
+
+class TestIterProjectDirs:
+    def test_filters_and_sorts(self, tmp_path: Path) -> None:
+        root = tmp_path / "projects"
+        root.mkdir()
+        for name in ["beta", "alpha", "_boss", "__pycache__", ".git", "node_modules"]:
+            (root / name).mkdir()
+        (root / "readme.txt").write_text("hi", encoding="utf-8")
+
+        assert [d.name for d in iter_project_dirs(root)] == ["_boss", "alpha", "beta"]
+
+    def test_missing_root_yields_nothing(self, tmp_path: Path) -> None:
+        assert list(iter_project_dirs(tmp_path / "nope")) == []
+
+
+class TestDiscoveryPathNormalization:
+    """Regression: discovery compared raw strings, registry resolved paths."""
+
+    def _config(self, tmp_path: Path, registered: str) -> tuple[Path, Path]:
+        approved = tmp_path / "projects"
+        approved.mkdir()
+        (approved / "alpha").mkdir()
+        config = tmp_path / "projects.yaml"
+        config.write_text(
+            yaml.dump(
+                {
+                    "projects": [
+                        {
+                            "slug": "a",
+                            "name": "A",
+                            "path": registered,
+                            "enabled": True,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return approved, config
+
+    def test_dot_slash_prefix_is_not_duplicated(self, tmp_path: Path) -> None:
+        approved, config = self._config(tmp_path, "./alpha")
+
+        new, total = discover_new_projects(approved, config)
+
+        assert new == []
+        assert total == 1
+        # The registry must still load; a duplicate used to break startup.
+        assert len(load_project_registry(config, approved).projects) == 1
+
+    def test_case_variant_is_not_duplicated(self, tmp_path: Path) -> None:
+        approved, config = self._config(tmp_path, "Alpha")
+
+        new, _ = discover_new_projects(approved, config)
+
+        assert new == []
+        assert len(load_project_registry(config, approved).projects) == 1
+
+    def test_genuinely_new_dir_still_added(self, tmp_path: Path) -> None:
+        approved, config = self._config(tmp_path, "./alpha")
+        (approved / "beta").mkdir()
+
+        new, total = discover_new_projects(approved, config)
+
+        assert [p["path"] for p in new] == ["beta"]
+        assert total == 2
+        assert len(load_project_registry(config, approved).projects) == 2
 
 
 class TestDisplayName:

@@ -1,6 +1,7 @@
 """Configuration loading with environment detection."""
 
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
@@ -214,7 +215,7 @@ def create_test_config(**overrides: Any) -> Settings:
         {
             "telegram_bot_token": "test_token_123",
             "telegram_bot_username": "test_bot",
-            "approved_directory": "/tmp/test_projects",
+            "approved_directory": str(Path(tempfile.gettempdir()) / "test_projects"),
         }
     )
 

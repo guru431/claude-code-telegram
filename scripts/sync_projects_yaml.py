@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """Sync config/projects.yaml with actual directories in APPROVED_DIRECTORY.
 
-Adds new directories, removes entries for missing directories.
-Preserves manually set slug/name/enabled for existing entries.
+Additive by default: adds newly discovered directories and never drops an entry
+whose directory still exists on disk. Pass --prune to also drop entries whose
+directory is gone. Preserves manually set slug/name/enabled for existing entries.
 """
 
+import argparse
 import os
-import re
 import sys
 from pathlib import Path, PurePosixPath
 
 import yaml
 
-SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", ".mypy_cache"}
-SKIP_PREFIXES = (".", "_")
+# Run standalone (python scripts/sync_projects_yaml.py) but still share the
+# canonical slug generator and directory scanner with src/projects/discovery.py.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-
-def slug_from_path(rel_path: str) -> str:
-    """Convert relative path to slug: 'site/univer' -> 'site-univer', 'update_fix' -> 'update-fix'."""
-    return re.sub(r"[_/\\]+", "-", rel_path)
+from src.projects.discovery import iter_project_dirs  # noqa: E402
+from src.projects.discovery import slugify as slug_from_path  # noqa: E402
+from src.projects.registry import parse_enabled  # noqa: E402
 
 
 def name_from_path(rel_path: str) -> str:
@@ -28,19 +29,20 @@ def name_from_path(rel_path: str) -> str:
 
 
 def scan_directories(approved_dir: Path) -> list[str]:
-    """Find top-level project directories (those with .git)."""
-    results = []
-    for entry in sorted(approved_dir.iterdir()):
-        if not entry.is_dir():
-            continue
-        if entry.name in SKIP_DIRS or entry.name.startswith(SKIP_PREFIXES):
-            continue
-        if (entry / ".git").exists():
-            results.append(entry.name)
-    return results
+    """Find top-level project directories (those with .git).
+
+    Candidate directories come from the shared scanner in discovery.py so both
+    writers of projects.yaml agree on what exists; requiring .git is this
+    script's own extra filter for *registering new* projects.
+    """
+    return [
+        entry.name
+        for entry in iter_project_dirs(approved_dir)
+        if (entry / ".git").exists()
+    ]
 
 
-def sync(config_path: Path, approved_dir: Path) -> bool:
+def sync(config_path: Path, approved_dir: Path, prune: bool = False) -> bool:
     """Sync projects.yaml with filesystem. Returns True if changes were made."""
     # Load existing config
     if config_path.exists():
@@ -60,21 +62,30 @@ def sync(config_path: Path, approved_dir: Path) -> bool:
     # Scan top-level directories with .git
     actual_paths = set(scan_directories(approved_dir))
 
-    # Collect existing nested paths (like site/lingva) that still exist on disk
-    existing_nested = set()
-    for p in by_path:
-        if len(PurePosixPath(p).parts) > 1 and (approved_dir / p).is_dir():
-            existing_nested.add(p)
+    # Every existing entry whose directory is still on disk is preserved. The
+    # scanner deliberately does not see every valid entry (nested paths, dirs
+    # without .git), so dropping whatever it missed would silently delete live
+    # projects -- it previously removed _boss, _other_ai and site this way.
+    kept_paths = {p for p in by_path if (approved_dir / p).is_dir()}
+    stale_paths = set(by_path) - kept_paths
 
-    # Exclude top-level dirs that serve as parents for existing nested paths
-    parent_dirs = {PurePosixPath(p).parts[0] for p in existing_nested}
-    actual_paths -= parent_dirs
+    # Never re-add a top-level dir that a kept nested entry already covers
+    # (e.g. do not add 'site' when only 'site/lingva' is registered).
+    covered_parents = {
+        PurePosixPath(p).parts[0] for p in kept_paths if len(PurePosixPath(p).parts) > 1
+    }
+    discovered_paths = actual_paths - covered_parents - kept_paths
 
-    all_paths = actual_paths | existing_nested
+    all_paths = kept_paths | discovered_paths
+    if not prune:
+        all_paths |= stale_paths
 
-    # Build new list: keep existing entries for dirs that still exist, add new ones
+    # Preserve the order of existing entries, append newly found ones sorted.
+    ordered = [p for p in by_path if p in all_paths]
+    ordered += sorted(all_paths - set(ordered))
+
     new_projects = []
-    for rel_path in sorted(all_paths):
+    for rel_path in ordered:
         if rel_path in by_path:
             new_projects.append(by_path[rel_path])
         else:
@@ -90,11 +101,14 @@ def sync(config_path: Path, approved_dir: Path) -> bool:
     # Check for changes: compare full normalized content (fields + order + duplicates),
     # not just the set of paths.
     def _normalize(entry: dict) -> dict:
+        path = str(entry.get("path", ""))
         return {
             "slug": str(entry.get("slug", "")),
             "name": str(entry.get("name", "")),
-            "path": str(entry.get("path", "")),
-            "enabled": bool(entry.get("enabled", True)),
+            "path": path,
+            # Strict: bool("false") is True and would silently re-enable a
+            # project the user disabled, since this dict is written back.
+            "enabled": parse_enabled(entry.get("enabled", True), f"Project {path!r}"),
         }
 
     old_norm = [_normalize(e) for e in existing]
@@ -131,6 +145,15 @@ def sync(config_path: Path, approved_dir: Path) -> bool:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="Also remove entries whose directory no longer exists on disk "
+        "(off by default: projects.yaml is not tracked in git)",
+    )
+    args = parser.parse_args()
+
     # Resolve paths
     script_dir = Path(__file__).resolve().parent
     project_root = script_dir.parent
@@ -143,7 +166,9 @@ def main() -> None:
         if env_file.exists():
             for line in env_file.read_text(encoding="utf-8").splitlines():
                 if line.startswith("APPROVED_DIRECTORY="):
-                    approved_dir_env = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    approved_dir_env = (
+                        line.split("=", 1)[1].strip().strip('"').strip("'")
+                    )
                     break
 
     if not approved_dir_env:
@@ -152,11 +177,18 @@ def main() -> None:
 
     approved_dir = Path(approved_dir_env)
     if not approved_dir.exists():
-        print(f"ERROR: APPROVED_DIRECTORY does not exist: {approved_dir}", file=sys.stderr)
+        print(
+            f"ERROR: APPROVED_DIRECTORY does not exist: {approved_dir}", file=sys.stderr
+        )
         sys.exit(1)
 
     print(f"Scanning: {approved_dir}")
-    changed = sync(config_path, approved_dir)
+    try:
+        changed = sync(config_path, approved_dir, prune=args.prune)
+    except ValueError as e:
+        # Refuse to rewrite the file from a config we could not parse.
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
     sys.exit(2 if changed else 0)
 
 

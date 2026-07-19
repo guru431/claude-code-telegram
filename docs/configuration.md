@@ -234,7 +234,30 @@ WEBHOOK_PORT=8443
 
 # Webhook path
 WEBHOOK_PATH=/webhook
+
+# Bind address (defaults to loopback; use 0.0.0.0 only when the listener must
+# be reachable directly rather than through a reverse proxy)
+WEBHOOK_LISTEN=127.0.0.1
+
+# Secret token -- REQUIRED when WEBHOOK_URL is set
+TELEGRAM_WEBHOOK_SECRET=
 ```
+
+**Webhook mode is fail-closed.** If `WEBHOOK_URL` is set but
+`TELEGRAM_WEBHOOK_SECRET` is empty, the bot refuses to start. The secret is
+passed to Telegram's `setWebhook` and echoed back in the
+`X-Telegram-Bot-Api-Secret-Token` header of every delivery; updates whose
+header does not match are dropped before any handler runs. Without it, anyone
+who can reach the listening port can POST a forged `Update` carrying an allowed
+user's ID and pass the whitelist all the way to Claude tools or `/restart`.
+
+Generate a secret with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+The value must be 1-256 characters of `A-Z`, `a-z`, `0-9`, `_` or `-`.
 
 ## Environment-Specific Configuration
 
