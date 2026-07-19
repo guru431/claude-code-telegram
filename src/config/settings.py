@@ -66,13 +66,6 @@ class Settings(BaseSettings):
             "production — the bot exposes Claude Code with full tool access."
         ),
     )
-    enable_token_auth: bool = Field(
-        False, description="Enable token-based authentication"
-    )
-    auth_token_secret: Optional[SecretStr] = Field(
-        None, description="Secret for auth tokens"
-    )
-
     # Security relaxation (for trusted environments)
     disable_security_patterns: bool = Field(
         False,
@@ -268,6 +261,15 @@ class Settings(BaseSettings):
         ge=1,
         le=200,
     )
+    max_file_upload_size_mb: int = Field(
+        10,
+        description=(
+            "Maximum Telegram document upload size (MB) that will be downloaded "
+            "and passed to Claude"
+        ),
+        ge=1,
+        le=200,
+    )
     enable_quick_actions: bool = Field(True, description="Enable quick action buttons")
     agentic_mode: bool = Field(
         True,
@@ -409,10 +411,20 @@ class Settings(BaseSettings):
             return [int(uid) for uid in v]
         return v  # type: ignore[no-any-return]
 
-    @field_validator("claude_allowed_tools", mode="before")
+    @field_validator(
+        "claude_allowed_tools",
+        "claude_disallowed_tools",
+        "sandbox_excluded_commands",
+        mode="before",
+    )
     @classmethod
-    def parse_claude_allowed_tools(cls, v: Any) -> Optional[List[str]]:
-        """Parse comma-separated tool names."""
+    def parse_claude_tool_list(cls, v: Any) -> Optional[List[str]]:
+        """Parse a comma-separated list of tool or command names.
+
+        Without this, pydantic-settings rejects the comma-separated form these
+        variables are documented with and the bot fails to start outright --
+        a stricter failure than merely ignoring the value.
+        """
         if v is None:
             return None
         if isinstance(v, str):
@@ -546,12 +558,6 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_cross_field_dependencies(self) -> "Settings":
         """Validate dependencies between fields."""
-        # Check auth token requirements
-        if self.enable_token_auth and not self.auth_token_secret:
-            raise ValueError(
-                "auth_token_secret required when enable_token_auth is True"
-            )
-
         # Check MCP requirements
         if self.enable_mcp and not self.mcp_config_path:
             raise ValueError("mcp_config_path required when enable_mcp is True")
@@ -634,13 +640,6 @@ class Settings(BaseSettings):
         return self.telegram_bot_token.get_secret_value()
 
     @property
-    def auth_secret_str(self) -> Optional[str]:
-        """Get auth token secret as string."""
-        if self.auth_token_secret:
-            return self.auth_token_secret.get_secret_value()
-        return None
-
-    @property
     def anthropic_api_key_str(self) -> Optional[str]:
         """Get Anthropic API key as string."""
         return (
@@ -672,6 +671,11 @@ class Settings(BaseSettings):
     def voice_max_file_size_bytes(self) -> int:
         """Maximum allowed voice message size in bytes."""
         return self.voice_max_file_size_mb * 1024 * 1024
+
+    @property
+    def max_file_upload_size_bytes(self) -> int:
+        """Maximum allowed document upload size in bytes."""
+        return self.max_file_upload_size_mb * 1024 * 1024
 
     @property
     def voice_provider_api_key_env(self) -> str:

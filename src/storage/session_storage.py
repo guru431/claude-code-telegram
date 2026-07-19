@@ -133,10 +133,20 @@ class SQLiteSessionStorage(SessionStorage):
     async def load_session(
         self, session_id: str, user_id: int
     ) -> Optional[ClaudeSession]:
-        """Load session from database, filtered by user ownership."""
+        """Load session from database, filtered by user ownership.
+
+        Only active sessions are returned. ``delete_session`` is a soft delete
+        (``is_active = FALSE``), so without this filter an ended or evicted
+        session stayed fully loadable by its stale id — and ``save_session``
+        would then flip it back to active, resurrecting a session that
+        ``get_user_sessions``/``get_all_sessions`` had already stopped counting.
+        """
         async with self.db_manager.get_connection() as conn:
             cursor = await conn.execute(
-                "SELECT * FROM sessions WHERE session_id = ? AND user_id = ?",
+                """
+                SELECT * FROM sessions
+                WHERE session_id = ? AND user_id = ? AND is_active = TRUE
+            """,
                 (session_id, user_id),
             )
             row = await cursor.fetchone()

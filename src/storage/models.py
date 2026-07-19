@@ -237,6 +237,8 @@ class AuditLogModel:
     event_data: Optional[Dict[str, Any]] = None
     success: bool = True
     ip_address: Optional[str] = None
+    risk_level: str = "low"
+    session_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -266,6 +268,10 @@ class AuditLogModel:
 
         if "success" in data:
             data["success"] = bool(data["success"])
+
+        # Rows written before migration 9 have no recorded risk level.
+        if data.get("risk_level") is None:
+            data.pop("risk_level", None)
 
         return cls(**data)
 

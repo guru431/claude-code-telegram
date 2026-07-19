@@ -11,6 +11,8 @@ from src.bot.utils.image_extractor import (
     PHOTO_SIZE_LIMIT,
     TELEGRAM_PHOTO_EXTENSIONS,
     ImageAttachment,
+    ImageIdentityError,
+    open_validated,
     should_send_as_photo,
     validate_image_path,
 )
@@ -178,3 +180,90 @@ class TestValidateImagePath:
         assert isinstance(result, ImageAttachment)
         assert result.mime_type == "image/png"
         assert result.original_reference == str(img)
+
+    def test_records_file_identity(self, work_dir: Path, approved_dir: Path):
+        """Identity is recorded so delivery can prove the file didn't change."""
+        img = work_dir / "chart.png"
+        result = validate_image_path(str(img), approved_dir)
+        assert result is not None
+        stat_result = img.stat()
+        assert result.st_dev == stat_result.st_dev
+        assert result.st_ino == stat_result.st_ino
+        assert result.size == stat_result.st_size
+        assert result.approved_directory == approved_dir.resolve()
+
+
+# --- open_validated (TOCTOU protection between validation and delivery) ---
+
+
+class TestOpenValidated:
+    def test_reads_validated_bytes(self, work_dir: Path, approved_dir: Path):
+        img = work_dir / "chart.png"
+        img.write_bytes(b"\x01" * 64)
+        attachment = validate_image_path(str(img), approved_dir)
+        assert attachment is not None
+
+        with open_validated(attachment) as fh:
+            assert fh.read() == b"\x01" * 64
+
+    def test_rejects_content_swapped_after_validation(
+        self, work_dir: Path, approved_dir: Path
+    ):
+        """A file replaced between validation and send must not be delivered."""
+        img = work_dir / "chart.png"
+        img.write_bytes(b"\x01" * 64)
+        attachment = validate_image_path(str(img), approved_dir)
+        assert attachment is not None
+
+        # Same path, different contents -> different size (and inode on POSIX).
+        img.unlink()
+        img.write_bytes(b"\x02" * 128)
+
+        with pytest.raises(ImageIdentityError):
+            open_validated(attachment)
+
+    def test_rejects_symlink_swapped_outside_approved_dir(self, tmp_path: Path):
+        """The swap this guards against: path -> symlink escaping the root."""
+        approved = tmp_path / "approved"
+        approved.mkdir()
+        img = approved / "chart.png"
+        img.write_bytes(b"\x00" * 100)
+
+        attachment = validate_image_path(str(img), approved)
+        assert attachment is not None
+
+        outside = tmp_path / "secret"
+        outside.mkdir()
+        secret = outside / "secret.png"
+        secret.write_bytes(b"\x00" * 100)
+
+        img.unlink()
+        try:
+            img.symlink_to(secret)
+        except OSError as exc:
+            pytest.skip(f"Cannot create symlinks in this environment: {exc}")
+
+        with pytest.raises(ImageIdentityError):
+            open_validated(attachment)
+
+    def test_missing_file_raises_oserror(self, work_dir: Path, approved_dir: Path):
+        img = work_dir / "chart.png"
+        attachment = validate_image_path(str(img), approved_dir)
+        assert attachment is not None
+
+        img.unlink()
+        with pytest.raises(OSError):
+            open_validated(attachment)
+
+    def test_attachment_without_identity_only_checks_boundary(self, tmp_path: Path):
+        """Attachments built outside validate_image_path still open."""
+        img = tmp_path / "chart.png"
+        img.write_bytes(b"\x03" * 32)
+        attachment = ImageAttachment(
+            path=img,
+            mime_type="image/png",
+            original_reference=str(img),
+        )
+
+        with open_validated(attachment) as fh:
+            assert fh.read() == b"\x03" * 32

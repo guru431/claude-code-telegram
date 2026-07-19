@@ -47,13 +47,10 @@ Choose your preferred installation method:
 
 ```bash
 # Using uv (recommended — installs in an isolated environment)
-uv tool install git+https://github.com/RichardAtCT/claude-code-telegram@v1.3.0
+uv tool install git+https://github.com/guru431/claude-code-telegram@v1.5.0
 
 # Or using pip
-pip install git+https://github.com/RichardAtCT/claude-code-telegram@v1.3.0
-
-# Track the latest stable release
-pip install git+https://github.com/RichardAtCT/claude-code-telegram@latest
+pip install git+https://github.com/guru431/claude-code-telegram@v1.5.0
 ```
 
 > **Don't have uv?** Install it with `curl -LsSf https://astral.sh/uv/install.sh | sh`.
@@ -61,12 +58,12 @@ pip install git+https://github.com/RichardAtCT/claude-code-telegram@latest
 #### Option B: From source (for development)
 
 ```bash
-git clone https://github.com/RichardAtCT/claude-code-telegram.git
+git clone https://github.com/guru431/claude-code-telegram.git
 cd claude-code-telegram
 make dev
 ```
 
-> **Important:** Always install from a [tagged release](https://github.com/RichardAtCT/claude-code-telegram/releases), not `main`, for stability.
+> **Important:** Always install from a [tagged release](https://github.com/guru431/claude-code-telegram/releases), not `main`, for stability.
 
 ### 4. Configure Environment
 
@@ -232,12 +229,8 @@ APPROVED_DIRECTORY=/Users/yourname/projects
 
 #### User Access Control
 ```bash
-# Whitelist specific users (recommended)
+# Whitelist specific users (the only authentication method)
 ALLOWED_USERS=123456789,987654321
-
-# Optional: Token-based authentication
-ENABLE_TOKEN_AUTH=true
-AUTH_TOKEN_SECRET=your-secret-key-here
 ```
 
 ### Rate Limiting
@@ -306,8 +299,9 @@ Bypass the keychain entirely by using a direct API key (Option B in the authenti
 
 ### Bot doesn't respond
 ```bash
-# Check your bot token
-echo $TELEGRAM_BOT_TOKEN
+# Check the bot token is set, without printing it: a pasted token in a
+# terminal or issue report is a live credential and must then be rotated.
+[ -n "$TELEGRAM_BOT_TOKEN" ] && echo "token set (${#TELEGRAM_BOT_TOKEN} chars)" || echo "TOKEN MISSING"
 
 # Verify user ID (message @userinfobot)
 # Check bot logs
@@ -324,8 +318,12 @@ claude auth status
 
 **SDK + API Key:**
 ```bash
-# Verify key starts with: sk-ant-api03-
-echo $ANTHROPIC_API_KEY
+# Verify the key is present and has the expected prefix, without printing it
+case "$ANTHROPIC_API_KEY" in
+  sk-ant-api03-*) echo "key set, prefix ok (${#ANTHROPIC_API_KEY} chars)" ;;
+  "")             echo "ANTHROPIC_API_KEY MISSING" ;;
+  *)              echo "key set but prefix is not sk-ant-api03-" ;;
+esac
 ```
 
 ### Permission errors
@@ -351,4 +349,4 @@ ENABLE_TELEMETRY=true
 - **Documentation**: Check the main [README.md](../README.md)
 - **Configuration**: See [configuration.md](configuration.md) for all options
 - **Security**: See [SECURITY.md](../SECURITY.md) for security concerns
-- **Issues**: [Open an issue](https://github.com/RichardAtCT/claude-code-telegram/issues)
+- **Issues**: [Open an issue](https://github.com/guru431/claude-code-telegram/issues)

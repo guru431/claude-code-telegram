@@ -17,6 +17,8 @@ from typing import AsyncIterator, List, Optional, Tuple, Union
 import aiosqlite
 import structlog
 
+from ..exceptions import DatabaseConnectionError
+
 logger = structlog.get_logger()
 
 
@@ -150,6 +152,9 @@ class DatabaseManager:
         # with more live connections than the configured pool size, even on
         # a burst. Initialised lazily in initialize() once _pool_size is fixed.
         self._pool_semaphore: Optional[asyncio.Semaphore] = None
+        # Set by close(); makes close() idempotent and stops get_connection()
+        # from lazily reopening the database after shutdown.
+        self._closed = False
 
     def _parse_database_url(self, database_url: str) -> Union[str, Path]:
         """Parse database URL to a path or the literal in-memory marker.
@@ -445,6 +450,30 @@ class DatabaseManager:
                 COMMIT;
                 """,
             ),
+            (
+                9,
+                """
+                -- Persist the two AuditEvent fields the table never had.
+                --
+                -- ``AuditEvent`` carries ``risk_level`` and ``session_id``, but
+                -- audit_log had no columns for them, so SQLiteAuditStorage
+                -- silently dropped both on write and rebuilt every event with
+                -- risk_level="low" on read. The security dashboard and the
+                -- per-user activity summary therefore reported {"low": N} for
+                -- everything, including logged security violations.
+                --
+                -- Both columns are nullable with no default: rows written
+                -- before this migration have no recorded risk level, and the
+                -- read path maps NULL back to the "low" dataclass default.
+                --
+                -- Rollback: SQLite cannot DROP COLUMN before 3.35; rebuild
+                -- audit_log without the two columns (see migration 8 for the
+                -- new -> copy -> drop -> rename dance) and delete the version-9
+                -- row from schema_version.
+                ALTER TABLE audit_log ADD COLUMN risk_level TEXT;
+                ALTER TABLE audit_log ADD COLUMN session_id TEXT;
+                """,
+            ),
         ]
 
     async def _init_pool(self):
@@ -481,7 +510,16 @@ class DatabaseManager:
         Concurrent borrows are capped at ``_pool_size`` by an asyncio.Semaphore
         so we never have more live connections than the pool can hold even
         under burst load.
+
+        Raises ``DatabaseConnectionError`` once :meth:`close` has run: without
+        this guard the lazy-open branch below would silently open a brand new
+        connection and repopulate the pool after shutdown.
         """
+        if self._closed:
+            raise DatabaseConnectionError(
+                "Database manager is closed; no new connections can be acquired"
+            )
+
         if self._pool_semaphore is None:
             # Pool not yet initialised; emulate sequential behaviour by opening
             # a transient connection. Should only happen during early startup.
@@ -541,16 +579,33 @@ class DatabaseManager:
                 self._pool_semaphore.release()
 
     async def close(self):
-        """Close all connections in pool."""
+        """Close all pooled connections and mark the manager closed.
+
+        Idempotent: a second call is a no-op. NOTE: connections currently
+        borrowed by in-flight callers are *not* drained — such a borrower keeps
+        using its connection until it finishes and then hands it back to the
+        (already cleared) pool. Only the reopen-after-close path is closed here.
+        """
+        if self._closed:
+            return
+
         logger.info("Closing database connections")
 
         async with self._pool_lock:
+            self._closed = True
             for conn in self._connection_pool:
                 await conn.close()
             self._connection_pool.clear()
 
     async def health_check(self) -> bool:
-        """Check database health."""
+        """Check database health.
+
+        Reports False once the manager is closed rather than reopening the
+        database to answer the question.
+        """
+        if self._closed:
+            return False
+
         try:
             async with self.get_connection() as conn:
                 await conn.execute("SELECT 1")

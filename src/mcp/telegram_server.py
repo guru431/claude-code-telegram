@@ -22,15 +22,27 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 mcp = FastMCP("telegram")
 
 
+class _UnresolvableApprovedDirectory(Exception):
+    """``APPROVED_DIRECTORY`` is configured but cannot be resolved."""
+
+
 def _approved_directory() -> Path | None:
-    """Return the configured approved directory, if any."""
+    """Return the configured approved directory, or ``None`` if unset.
+
+    Raises:
+        _UnresolvableApprovedDirectory: when ``APPROVED_DIRECTORY`` is set but
+            cannot be resolved. This must not be collapsed into ``None``:
+            callers skip the containment check when no root is configured, so
+            reporting an unresolvable root as "unset" would silently disable
+            the boundary and accept any absolute path.
+    """
     value = os.environ.get("APPROVED_DIRECTORY")
     if not value:
         return None
     try:
         return Path(value).resolve()
-    except OSError:
-        return None
+    except OSError as e:
+        raise _UnresolvableApprovedDirectory(str(e)) from e
 
 
 @mcp.tool()
@@ -64,7 +76,16 @@ async def send_image_to_user(file_path: str, caption: str = "") -> str:
     except OSError as e:
         return f"Error: cannot resolve path '{file_path}': {e}"
 
-    approved = _approved_directory()
+    try:
+        approved = _approved_directory()
+    except _UnresolvableApprovedDirectory as e:
+        # Fail closed: a configured-but-broken root means we cannot prove the
+        # file is inside the boundary, so refuse rather than send.
+        return (
+            "Error: APPROVED_DIRECTORY is configured but cannot be resolved "
+            f"({e}); refusing to send."
+        )
+
     if approved is not None:
         try:
             resolved.relative_to(approved)

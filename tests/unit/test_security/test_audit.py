@@ -454,3 +454,100 @@ class TestAuditLogger:
         assert dashboard["active_users"] == 2
         assert "path_traversal" in dashboard["top_violation_types"]
         assert "injection" in dashboard["top_violation_types"]
+
+
+class TestSQLiteAuditStorage:
+    """Durable audit storage must round-trip every AuditEvent field."""
+
+    @pytest.fixture
+    async def sqlite_storage(self):
+        """Create SQLite-backed audit storage over a temporary database."""
+        import tempfile
+        from pathlib import Path
+
+        from src.security.audit import SQLiteAuditStorage
+        from src.storage.facade import Storage
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "audit.db"
+            storage = Storage(f"sqlite:///{db_path}")
+            await storage.initialize()
+            yield SQLiteAuditStorage(storage)
+            await storage.close()
+
+    async def test_risk_level_and_session_id_round_trip(self, sqlite_storage):
+        """Both fields survive a store -> load cycle through SQLite."""
+        await sqlite_storage.store_event(
+            AuditEvent(
+                timestamp=datetime.now(UTC),
+                user_id=555100,
+                event_type="security_violation",
+                success=False,
+                details={"violation_type": "path_traversal"},
+                session_id="session-abc",
+                risk_level="critical",
+            )
+        )
+
+        events = await sqlite_storage.get_events(user_id=555100)
+
+        assert len(events) == 1
+        assert events[0].risk_level == "critical"
+        assert events[0].session_id == "session-abc"
+
+    async def test_defaults_when_fields_absent(self, sqlite_storage):
+        """An event without the optional fields still reads back cleanly."""
+        await sqlite_storage.store_event(
+            AuditEvent(
+                timestamp=datetime.now(UTC),
+                user_id=555101,
+                event_type="auth_attempt",
+                success=True,
+                details={},
+            )
+        )
+
+        events = await sqlite_storage.get_events(user_id=555101)
+
+        assert len(events) == 1
+        assert events[0].risk_level == "low"
+        assert events[0].session_id is None
+
+    async def test_dashboard_reports_real_risk_levels(self, sqlite_storage):
+        """Risk distribution is no longer flattened to {"low": N}."""
+        audit_logger = AuditLogger(sqlite_storage)
+        await audit_logger.log_security_violation(
+            555102, "path_traversal", "test", "high"
+        )
+
+        dashboard = await audit_logger.get_security_dashboard()
+
+        assert dashboard["risk_distribution"] == {"critical": 1}
+
+    async def test_dashboard_violations_respect_24h_window(self, sqlite_storage):
+        """Violations older than 24h must not inflate the "24_hours" counts."""
+        await sqlite_storage.store_event(
+            AuditEvent(
+                timestamp=datetime.now(UTC) - timedelta(hours=48),
+                user_id=555103,
+                event_type="security_violation",
+                success=False,
+                details={"violation_type": "stale"},
+                risk_level="high",
+            )
+        )
+        await sqlite_storage.store_event(
+            AuditEvent(
+                timestamp=datetime.now(UTC),
+                user_id=555103,
+                event_type="security_violation",
+                success=False,
+                details={"violation_type": "fresh"},
+                risk_level="high",
+            )
+        )
+
+        dashboard = await AuditLogger(sqlite_storage).get_security_dashboard()
+
+        assert dashboard["security_violations"] == 1
+        assert dashboard["top_violation_types"] == {"fresh": 1}

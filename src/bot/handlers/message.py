@@ -26,6 +26,7 @@ from ..utils.image_extractor import (
     should_send_as_photo,
     validate_image_path,
 )
+from ..utils.upload_limits import exceeds_upload_limit
 
 logger = structlog.get_logger()
 
@@ -785,12 +786,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     )
                 return
 
-        # Check file size limits
-        max_size = 10 * 1024 * 1024  # 10MB
-        if document.file_size > max_size:
+        # Check file size limits. ``file_size`` is optional in Telegram, so an
+        # absent size is "not yet verified" (never an implicit 0 that passes);
+        # the real byte length is re-checked after download below.
+        max_size = settings.max_file_upload_size_bytes
+        max_mb = settings.max_file_upload_size_mb
+        if exceeds_upload_limit(document.file_size, max_size):
             await update.message.reply_text(
                 f"❌ <b>File Too Large</b>\n\n"
-                f"Maximum file size: {max_size // 1024 // 1024}MB\n"
+                f"Maximum file size: {max_mb}MB\n"
                 f"Your file: {document.file_size / 1024 / 1024:.1f}MB",
                 parse_mode="HTML",
             )
@@ -838,7 +842,26 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not file_handler:
             # Fall back to basic file handling
             file = await document.get_file()
+            # Re-check the resolved File metadata, then the bytes actually
+            # received: a missing or understated Document.file_size must not
+            # let an over-limit payload through.
+            if exceeds_upload_limit(getattr(file, "file_size", None), max_size):
+                await update.message.reply_text(
+                    f"❌ <b>File Too Large</b>\n\n"
+                    f"Maximum file size: {max_mb}MB\n"
+                    f"Your file: {getattr(file, 'file_size') / 1024 / 1024:.1f}MB",
+                    parse_mode="HTML",
+                )
+                return
             file_bytes = await file.download_as_bytearray()
+            if exceeds_upload_limit(len(file_bytes), max_size):
+                await update.message.reply_text(
+                    f"❌ <b>File Too Large</b>\n\n"
+                    f"Maximum file size: {max_mb}MB\n"
+                    f"Your file: {len(file_bytes) / 1024 / 1024:.1f}MB",
+                    parse_mode="HTML",
+                )
+                return
 
             # Try to decode as text
             try:

@@ -1,7 +1,7 @@
 """Security framework for Claude Code Telegram Bot.
 
 This module provides comprehensive security features including:
-- Multi-layer authentication (whitelist and token-based)
+- Telegram ID whitelist authentication
 - Rate limiting with token bucket algorithm
 - Path traversal and injection prevention
 - Input validation and sanitization
@@ -18,7 +18,6 @@ from .audit import AuditEvent, AuditLogger
 from .auth import (
     AuthenticationManager,
     AuthProvider,
-    TokenAuthProvider,
     UserSession,
     WhitelistAuthProvider,
 )
@@ -28,7 +27,6 @@ from .validators import SecurityValidator
 __all__ = [
     "AuthProvider",
     "WhitelistAuthProvider",
-    "TokenAuthProvider",
     "AuthenticationManager",
     "UserSession",
     "RateLimiter",

@@ -7,8 +7,6 @@ import pytest
 from src.exceptions import SecurityError
 from src.security.auth import (
     AuthenticationManager,
-    InMemoryTokenStorage,
-    TokenAuthProvider,
     UserSession,
     WhitelistAuthProvider,
 )
@@ -87,125 +85,12 @@ class TestWhitelistAuthProvider:
         assert info is None
 
 
-class TestInMemoryTokenStorage:
-    """Test in-memory token storage."""
-
-    @pytest.fixture
-    def storage(self):
-        return InMemoryTokenStorage()
-
-    async def test_store_and_retrieve_token(self, storage):
-        """Test storing and retrieving tokens."""
-        user_id = 123
-        token_hash = "test_hash"
-        expires_at = datetime.now(UTC) + timedelta(days=1)
-
-        await storage.store_token(user_id, token_hash, expires_at)
-
-        token_data = await storage.get_user_token(user_id)
-        assert token_data is not None
-        assert token_data["hash"] == token_hash
-        assert token_data["expires_at"] == expires_at
-
-    async def test_expired_token_cleanup(self, storage):
-        """Test that expired tokens are cleaned up."""
-        user_id = 123
-        token_hash = "test_hash"
-        expires_at = datetime.now(UTC) - timedelta(days=1)  # Expired
-
-        await storage.store_token(user_id, token_hash, expires_at)
-
-        token_data = await storage.get_user_token(user_id)
-        assert token_data is None  # Should be cleaned up
-
-    async def test_revoke_token(self, storage):
-        """Test token revocation."""
-        user_id = 123
-        token_hash = "test_hash"
-        expires_at = datetime.now(UTC) + timedelta(days=1)
-
-        await storage.store_token(user_id, token_hash, expires_at)
-        await storage.revoke_token(user_id)
-
-        token_data = await storage.get_user_token(user_id)
-        assert token_data is None
-
-
-class TestTokenAuthProvider:
-    """Test token authentication provider."""
-
-    @pytest.fixture
-    def provider(self):
-        storage = InMemoryTokenStorage()
-        return TokenAuthProvider("test-token-auth-secret-0123456789-abcdef",storage)
-
-    async def test_generate_and_verify_token(self, provider):
-        """Test token generation and verification."""
-        user_id = 123
-
-        # Generate token
-        token = await provider.generate_token(user_id)
-        assert token is not None
-        assert len(token) > 20  # Should be a substantial token
-
-        # Verify token
-        result = await provider.authenticate(user_id, {"token": token})
-        assert result is True
-
-        # Test wrong token
-        result = await provider.authenticate(user_id, {"token": "wrong_token"})
-        assert result is False
-
-    async def test_authentication_without_token(self, provider):
-        """Test authentication fails without token."""
-        result = await provider.authenticate(123, {})
-        assert result is False
-
-    async def test_get_user_info(self, provider):
-        """Test user info for token auth."""
-        user_id = 123
-
-        # No token yet
-        info = await provider.get_user_info(user_id)
-        assert info is None
-
-        # Generate token
-        await provider.generate_token(user_id)
-
-        # Should have info now
-        info = await provider.get_user_info(user_id)
-        assert info is not None
-        assert info["user_id"] == user_id
-        assert info["auth_type"] == "token"
-
-    async def test_token_revocation(self, provider):
-        """Test token revocation."""
-        user_id = 123
-
-        token = await provider.generate_token(user_id)
-
-        # Should work before revocation
-        result = await provider.authenticate(user_id, {"token": token})
-        assert result is True
-
-        # Revoke token
-        await provider.revoke_token(user_id)
-
-        # Should fail after revocation
-        result = await provider.authenticate(user_id, {"token": token})
-        assert result is False
-
-
 class TestAuthenticationManager:
     """Test authentication manager."""
 
     @pytest.fixture
     def auth_manager(self):
-        whitelist_provider = WhitelistAuthProvider([123, 456])
-        token_storage = InMemoryTokenStorage()
-        token_provider = TokenAuthProvider("test-token-auth-secret-0123456789-abcdef",token_storage)
-
-        return AuthenticationManager([whitelist_provider, token_provider])
+        return AuthenticationManager([WhitelistAuthProvider([123, 456])])
 
     def test_manager_requires_providers(self):
         """Test that manager requires at least one provider."""
@@ -223,19 +108,6 @@ class TestAuthenticationManager:
         result = await auth_manager.authenticate_user(999)
         assert result is False
         assert not auth_manager.is_authenticated(999)
-
-    async def test_token_authentication(self, auth_manager):
-        """Test authentication through token."""
-        user_id = 789  # Not in whitelist
-
-        # Get token provider
-        token_provider = auth_manager.providers[1]
-        token = await token_provider.generate_token(user_id)
-
-        # Should authenticate with token
-        result = await auth_manager.authenticate_user(user_id, {"token": token})
-        assert result is True
-        assert auth_manager.is_authenticated(user_id)
 
     async def test_session_management(self, auth_manager):
         """Test session creation and management."""

@@ -34,8 +34,6 @@ from src.security.audit import AuditLogger, SQLiteAuditStorage
 from src.security.auth import (
     AuthenticationManager,
     AuthProvider,
-    InMemoryTokenStorage,
-    TokenAuthProvider,
     WhitelistAuthProvider,
 )
 from src.security.rate_limiter import RateLimiter
@@ -54,6 +52,14 @@ def setup_logging(debug: bool = False) -> None:
         format="%(message)s",
         stream=sys.stdout,
     )
+
+    # httpx/PTB log every request as "HTTP Request: POST
+    # https://api.telegram.org/bot<TOKEN>/getUpdates" -- the bot token sits in
+    # the URL, so at INFO these lines write a live credential to the log on
+    # every polling cycle. These loggers bypass our own redaction (they are
+    # library loggers), so the only reliable fix is to not emit them at all.
+    for _noisy in ("httpx", "httpcore", "telegram.request", "telegram.ext.Updater"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
 
     # Configure structlog
     structlog.configure(
@@ -109,36 +115,6 @@ def _build_auth_providers(config: Settings) -> list[AuthProvider]:
     if config.allowed_users:
         providers.append(WhitelistAuthProvider(config.allowed_users))
 
-    # Add token provider if enabled. The only TokenStorage implementation is
-    # in-memory, so every issued token is invalidated on restart and audit
-    # events are non-persistent. Fail-closed in production (mirrors the
-    # ALLOW_ALL_USERS gate below); allow it only when DEVELOPMENT_MODE
-    # explicitly acknowledges the limitation.
-    if config.enable_token_auth:
-        if not config.development_mode:
-            raise ConfigurationError(
-                "ENABLE_TOKEN_AUTH currently uses in-memory token storage, which "
-                "loses all issued tokens on every restart and is not "
-                "production-safe. Persist tokens in SQLite before enabling token "
-                "auth in production, or set DEVELOPMENT_MODE=true to acknowledge "
-                "the limitation."
-            )
-        logger.warning(
-            "Token auth uses in-memory storage - all issued tokens are lost on "
-            "restart (development only)."
-        )
-        token_storage = InMemoryTokenStorage()
-        # TokenAuthProvider expects a plain str secret (it calls .encode());
-        # auth_secret_str unwraps the SecretStr, auth_token_secret would not.
-        # Settings validation already guarantees this, but assert would be
-        # stripped under ``python -O``; raise explicitly to keep fail-closed.
-        secret = config.auth_secret_str
-        if secret is None:
-            raise ConfigurationError(
-                "ENABLE_TOKEN_AUTH is set but AUTH_TOKEN_SECRET is missing."
-            )
-        providers.append(TokenAuthProvider(secret, token_storage))
-
     # Fall back to allowing all users ONLY when explicitly opted in via
     # ALLOW_ALL_USERS=true AND in development mode. The bot exposes Claude
     # Code with full tool access, so an empty allowlist is fail-closed by
@@ -153,11 +129,72 @@ def _build_auth_providers(config: Settings) -> list[AuthProvider]:
     elif not providers:
         raise ConfigurationError(
             "No authentication providers configured. Set ALLOWED_USERS to a "
-            "comma-separated list of Telegram IDs, enable ENABLE_TOKEN_AUTH, or "
-            "(development only) set ALLOW_ALL_USERS=true to allow any user."
+            "comma-separated list of Telegram IDs, or (development only) set "
+            "ALLOW_ALL_USERS=true to allow any user."
         )
 
     return providers
+
+
+async def _sync_discovered_project_topics(
+    config: Settings,
+    manager: Any,
+    telegram_bot: Any,
+    log: Any,
+) -> int:
+    """Sync project topics to every chat that should receive them.
+
+    In private mode each allowed user keeps their own set of topics, so all of
+    them are synced — syncing only the first would silently leave every other
+    user without topics for newly discovered projects.
+
+    One chat's failure is logged and counted rather than aborting the run, so a
+    single unreachable user cannot deprive the rest of their topics.
+
+    Returns:
+        The number of chats whose sync failed.
+    """
+    if config.project_threads_mode == "group":
+        group_chat_id = config.project_threads_chat_id
+        chat_ids = [group_chat_id] if group_chat_id else []
+    else:
+        chat_ids = list(config.allowed_users or [])
+
+    if not chat_ids:
+        log.warning(
+            "Nightly discovery: no chat id to sync topics to; skipping topic sync",
+            mode=config.project_threads_mode,
+        )
+        return 0
+
+    failed_chats = 0
+    for chat_id in chat_ids:
+        try:
+            sync_result = await manager.sync_topics(telegram_bot, chat_id=chat_id)
+        except Exception:
+            failed_chats += 1
+            log.exception(
+                "Nightly discovery: topic sync failed for chat",
+                chat_id=chat_id,
+            )
+            continue
+        log.info(
+            "Nightly discovery: topics synced",
+            chat_id=chat_id,
+            created=sync_result.created,
+            reused=sync_result.reused,
+            renamed=sync_result.renamed,
+            failed=sync_result.failed,
+        )
+
+    if failed_chats:
+        log.warning(
+            "Nightly discovery: some chats failed to sync",
+            failed_chats=failed_chats,
+            total_chats=len(chat_ids),
+        )
+
+    return failed_chats
 
 
 async def create_application(config: Settings) -> Dict[str, Any]:
@@ -534,23 +571,12 @@ async def run_application(app: Dict[str, Any]) -> int:
                     bot.deps["project_registry"] = fresh_registry
 
                     # Sync topics in Telegram
-                    if config.project_threads_mode == "group":
-                        chat_id = config.project_threads_chat_id
-                    else:
-                        chat_id = (
-                            config.allowed_users[0] if config.allowed_users else None
-                        )
-                    if chat_id:
-                        sync_result = await manager.sync_topics(
-                            telegram_bot, chat_id=chat_id
-                        )
-                        _log.info(
-                            "Nightly discovery: topics synced",
-                            created=sync_result.created,
-                            reused=sync_result.reused,
-                            renamed=sync_result.renamed,
-                            failed=sync_result.failed,
-                        )
+                    await _sync_discovered_project_topics(
+                        config=config,
+                        manager=manager,
+                        telegram_bot=telegram_bot,
+                        log=_log,
+                    )
 
                 except Exception:
                     _log.exception("Nightly project discovery failed")

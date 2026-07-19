@@ -132,9 +132,6 @@ def _validate_config(settings: Settings) -> None:
     if settings.enable_mcp and not settings.mcp_config_path:
         raise InvalidConfigError("MCP enabled but no config path provided")
 
-    if settings.enable_token_auth and not settings.auth_token_secret:
-        raise InvalidConfigError("Token auth enabled but no secret provided")
-
     if settings.enable_project_threads:
         if (
             settings.project_threads_mode == "group"
@@ -191,8 +188,6 @@ def _get_enabled_features_summary(settings: Settings) -> list[str]:
         features.append("file_uploads")
     if settings.enable_quick_actions:
         features.append("quick_actions")
-    if settings.enable_token_auth:
-        features.append("token_auth")
     if settings.webhook_url:
         features.append("webhook")
     return features

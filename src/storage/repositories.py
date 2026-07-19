@@ -723,8 +723,9 @@ class AuditLogRepository:
             cursor = await c.execute(
                 """
                 INSERT INTO audit_log
-                (user_id, event_type, event_data, success, timestamp, ip_address)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (user_id, event_type, event_data, success, timestamp, ip_address,
+                 risk_level, session_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     audit_log.user_id,
@@ -733,6 +734,8 @@ class AuditLogRepository:
                     audit_log.success,
                     audit_log.timestamp,
                     audit_log.ip_address,
+                    audit_log.risk_level,
+                    audit_log.session_id,
                 ),
             )
             return cursor.lastrowid

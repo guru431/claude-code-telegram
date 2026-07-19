@@ -5,9 +5,10 @@ validates each path via :func:`validate_image_path` and collects
 :class:`ImageAttachment` objects for later Telegram delivery.
 """
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import BinaryIO, Optional
 
 import structlog
 
@@ -39,11 +40,22 @@ PHOTO_SIZE_LIMIT = 10 * 1024 * 1024  # 10 MB — Telegram photo API limit
 
 @dataclass
 class ImageAttachment:
-    """An image file to attach to a Telegram response."""
+    """An image file to attach to a Telegram response.
+
+    ``st_dev``/``st_ino``/``size`` record the identity of the exact file that
+    passed validation, so :func:`open_validated` can prove at send time that
+    the bytes it is about to read are the bytes that were checked. They default
+    to ``None`` for attachments built outside :func:`validate_image_path`, in
+    which case :func:`open_validated` only re-checks the directory boundary.
+    """
 
     path: Path
     mime_type: str
     original_reference: str
+    st_dev: Optional[int] = None
+    st_ino: Optional[int] = None
+    size: Optional[int] = None
+    approved_directory: Optional[Path] = None
 
 
 def validate_image_path(
@@ -77,7 +89,8 @@ def validate_image_path(
         if not resolved.is_file():
             return None
 
-        file_size = resolved.stat().st_size
+        stat_result = resolved.stat()
+        file_size = stat_result.st_size
         if file_size > MAX_FILE_SIZE_BYTES:
             logger.debug("MCP image file too large", path=str(resolved), size=file_size)
             return None
@@ -91,10 +104,65 @@ def validate_image_path(
             path=resolved,
             mime_type=mime_type,
             original_reference=caption or file_path,
+            st_dev=stat_result.st_dev,
+            st_ino=stat_result.st_ino,
+            size=file_size,
+            approved_directory=approved_directory.resolve(),
         )
     except (OSError, ValueError) as e:
         logger.debug("MCP image path validation failed", path=file_path, error=str(e))
         return None
+
+
+class ImageIdentityError(Exception):
+    """The file at send time is not the file that passed validation."""
+
+
+def open_validated(attachment: ImageAttachment) -> BinaryIO:
+    """Open *attachment* for reading, proving it is still the validated file.
+
+    :func:`validate_image_path` runs long before delivery, so between the two
+    the path can be swapped for a symlink pointing outside the approved
+    directory — Claude can write inside that directory, so the agent that
+    proposed the path can also perform the swap.
+
+    This closes the window by opening the file first and then ``fstat``-ing the
+    *open handle*: the identity that is checked belongs to the very object the
+    caller will read from, so no further swap can affect it. The re-resolved
+    path is also re-checked against the recorded approved directory.
+
+    Raises:
+        ImageIdentityError: if the boundary or the recorded identity no longer
+            holds.
+        OSError: if the file cannot be opened.
+    """
+    resolved = attachment.path.resolve()
+
+    if attachment.approved_directory is not None:
+        try:
+            resolved.relative_to(attachment.approved_directory)
+        except ValueError:
+            raise ImageIdentityError(
+                f"image path now resolves outside the approved directory: "
+                f"{resolved}"
+            ) from None
+
+    handle: BinaryIO = open(resolved, "rb")
+    try:
+        current = os.fstat(handle.fileno())
+        expected = (attachment.st_dev, attachment.st_ino, attachment.size)
+        if expected != (None, None, None) and expected != (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+        ):
+            raise ImageIdentityError(
+                f"image file changed between validation and send: {resolved}"
+            )
+    except BaseException:
+        handle.close()
+        raise
+    return handle
 
 
 def should_send_as_photo(path: Path) -> bool:

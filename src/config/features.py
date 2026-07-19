@@ -39,14 +39,6 @@ class FeatureFlags:
         return self.settings.enable_telemetry
 
     @property
-    def token_auth_enabled(self) -> bool:
-        """Check if token-based authentication is enabled."""
-        return (
-            self.settings.enable_token_auth
-            and self.settings.auth_token_secret is not None
-        )
-
-    @property
     def webhook_enabled(self) -> bool:
         """Check if webhook mode is enabled."""
         return self.settings.webhook_url is not None
@@ -96,7 +88,6 @@ class FeatureFlags:
             "file_uploads": self.file_uploads_enabled,
             "quick_actions": self.quick_actions_enabled,
             "telemetry": self.telemetry_enabled,
-            "token_auth": self.token_auth_enabled,
             "webhook": self.webhook_enabled,
             "development": self.development_features_enabled,
             "api_server": self.api_server_enabled,
@@ -120,8 +111,6 @@ class FeatureFlags:
             features.append("quick_actions")
         if self.telemetry_enabled:
             features.append("telemetry")
-        if self.token_auth_enabled:
-            features.append("token_auth")
         if self.webhook_enabled:
             features.append("webhook")
         if self.development_features_enabled:

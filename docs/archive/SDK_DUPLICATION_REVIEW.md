@@ -1,5 +1,17 @@
 # SDK Duplication & Over-Complication Review
 
+> **ARCHIVED 2026-07-19 — historical decision record, not current guidance.**
+>
+> This review reflects the codebase as of 2026-02-20 and is no longer accurate:
+> it cites older SDK versions and line counts, calls `max_budget_usd` unused
+> (it is passed today), and computes its duplication percentages against the
+> since-deleted CLI subprocess backend. Its closing recommendation to slim the
+> persistent clients predates the concurrency, retry, cancellation and
+> security-hardening work in `src/claude/` and should not be acted on without a
+> fresh measurement against current HEAD.
+>
+> Kept for the change history in the table at the end, which is still correct.
+
 **Date:** 2026-02-19
 **Last Updated:** 2026-02-20 (post CLI backend removal)
 **SDK Version:** `claude-agent-sdk ^0.1.38`

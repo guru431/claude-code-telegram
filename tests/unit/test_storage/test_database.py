@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from src.exceptions import DatabaseConnectionError
 from src.storage.database import DatabaseManager
 
 
@@ -97,3 +98,42 @@ class TestDatabaseManager:
             cursor = await conn.execute("SELECT MAX(version) FROM schema_version")
             version = await cursor.fetchone()
             assert version[0] >= 1  # At least initial migration
+
+    async def test_audit_log_has_risk_and_session_columns(self, db_manager):
+        """Migration 9 adds risk_level/session_id to audit_log."""
+        async with db_manager.get_connection() as conn:
+            cursor = await conn.execute("PRAGMA table_info(audit_log)")
+            columns = {row[1] for row in await cursor.fetchall()}
+
+        assert "risk_level" in columns
+        assert "session_id" in columns
+
+
+class TestDatabaseClose:
+    """close() must be terminal: no silent reopen after shutdown."""
+
+    async def test_get_connection_raises_after_close(self, db_manager):
+        """A closed manager refuses to hand out (or lazily open) connections."""
+        await db_manager.close()
+
+        with pytest.raises(DatabaseConnectionError):
+            async with db_manager.get_connection():
+                pass  # pragma: no cover — must not be reached
+
+        # The pool must not have been repopulated by the attempt.
+        assert db_manager._connection_pool == []
+
+    async def test_health_check_false_after_close(self, db_manager):
+        """health_check reports False instead of reopening the database."""
+        assert await db_manager.health_check()
+
+        await db_manager.close()
+
+        assert await db_manager.health_check() is False
+
+    async def test_close_is_idempotent(self, db_manager):
+        """Closing twice is a no-op, not an error."""
+        await db_manager.close()
+        await db_manager.close()
+
+        assert db_manager._closed is True

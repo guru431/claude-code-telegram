@@ -43,10 +43,12 @@ from .utils.html_format import escape_html
 from .utils.image_extractor import (
     MAX_IMAGES_PER_RESPONSE,
     ImageAttachment,
+    open_validated,
     should_send_as_animation,
     should_send_as_photo,
     validate_image_path,
 )
+from .utils.upload_limits import exceeds_upload_limit
 
 if TYPE_CHECKING:
     from .utils.formatting import FormattedMessage
@@ -1009,7 +1011,7 @@ class MessageOrchestrator:
         # photo album.
         for img in animations:
             try:
-                with open(img.path, "rb") as f:
+                with open_validated(img) as f:
                     await update.message.reply_animation(
                         animation=f,
                         reply_to_message_id=reply_to_message_id,
@@ -1049,7 +1051,7 @@ class MessageOrchestrator:
                     else:
                         photo_caption = None
                         photo_parse_mode = None
-                    with open(single.path, "rb") as f:
+                    with open_validated(single) as f:
                         await update.message.reply_photo(
                             photo=f,
                             reply_to_message_id=reply_to_message_id,
@@ -1064,7 +1066,7 @@ class MessageOrchestrator:
                     with contextlib.ExitStack() as stack:
                         media = []
                         for idx, img in enumerate(photos[:10]):
-                            fh = stack.enter_context(open(img.path, "rb"))
+                            fh = stack.enter_context(open_validated(img))
                             media.append(
                                 InputMediaPhoto(
                                     media=fh,
@@ -1094,7 +1096,7 @@ class MessageOrchestrator:
         # Send SVGs / large files as documents (one by one — can't mix in album)
         for img in documents:
             try:
-                with open(img.path, "rb") as f:
+                with open_validated(img) as f:
                     await update.message.reply_document(
                         document=f,
                         filename=img.path.name,
@@ -1458,17 +1460,26 @@ class MessageOrchestrator:
         # Security validation
         security_validator = context.bot_data.get("security_validator")
         if security_validator:
-            valid, error = security_validator.validate_filename(document.file_name)
+            # ``file_name`` is optional in Telegram and may be None for nameless
+            # uploads — fall back to a placeholder so the typed validator never
+            # receives None (matches the classic path in handlers/message.py).
+            valid, error = security_validator.validate_filename(
+                document.file_name or "document"
+            )
             if not valid:
                 await update.message.reply_text(f"File rejected: {error}")
                 return
 
-        # Size check (file_size is Optional — Telegram may omit it)
-        max_size = 10 * 1024 * 1024
-        file_size = document.file_size or 0
-        if file_size > max_size:
+        # Size check against the declared metadata size. ``file_size`` is
+        # Optional — Telegram may omit it — so an unknown size is treated as
+        # "not yet verified" rather than 0, and the real byte length is
+        # re-checked after download below.
+        max_size = self.settings.max_file_upload_size_bytes
+        max_mb = self.settings.max_file_upload_size_mb
+        if exceeds_upload_limit(document.file_size, max_size):
             await update.message.reply_text(
-                f"File too large ({file_size / 1024 / 1024:.1f}MB). Max: 10MB."
+                f"File too large ({document.file_size / 1024 / 1024:.1f}MB). "
+                f"Max: {max_mb}MB."
             )
             return
 
@@ -1499,7 +1510,25 @@ class MessageOrchestrator:
 
         if not file_handler:
             file = await document.get_file()
+            # Re-check the resolved Telegram File metadata: the Document's
+            # declared size may be absent or understated.
+            if exceeds_upload_limit(getattr(file, "file_size", None), max_size):
+                await progress_msg.edit_text(
+                    f"File too large "
+                    f"({getattr(file, 'file_size') / 1024 / 1024:.1f}MB). "
+                    f"Max: {max_mb}MB."
+                )
+                return
             file_bytes = await file.download_as_bytearray()
+            # Final hard cap on the bytes actually received, so a metadata size
+            # that lied (or was missing) cannot push an over-limit payload
+            # through to Claude.
+            if exceeds_upload_limit(len(file_bytes), max_size):
+                await progress_msg.edit_text(
+                    f"File too large ({len(file_bytes) / 1024 / 1024:.1f}MB). "
+                    f"Max: {max_mb}MB."
+                )
+                return
             try:
                 content = file_bytes.decode("utf-8")
                 if len(content) > 50000:

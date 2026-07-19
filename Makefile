@@ -1,11 +1,12 @@
-.PHONY: install dev test lint format clean help run run-remote remote-attach remote-stop \
+.PHONY: install dev hooks test lint format clean help run run-debug run-remote remote-attach remote-stop \
        bump-patch bump-minor bump-major release version
 
 # Default target
 help:
 	@echo "Available commands:"
 	@echo "  install       - Install production dependencies"
-	@echo "  dev           - Install development dependencies"
+	@echo "  dev           - Install development dependencies + activate git hooks"
+	@echo "  hooks         - Activate the .githooks secret-guard for this clone"
 	@echo "  test          - Run tests"
 	@echo "  lint          - Run linting checks"
 	@echo "  format        - Format code"
@@ -23,9 +24,17 @@ help:
 install:
 	poetry install --no-dev
 
-dev:
+dev: hooks
 	poetry install
-	poetry run pre-commit install --install-hooks || echo "pre-commit not configured yet"
+
+# Activate the in-repo secret-guard. This is NOT the pre-commit framework:
+# the hook lives in .githooks/ and core.hooksPath overrides .git/hooks
+# entirely, so the two mechanisms are mutually exclusive. Fail loudly --
+# a clone that silently ends up without the leak scanner is the whole risk.
+hooks:
+	git config core.hooksPath .githooks
+	@test -x .githooks/pre-commit || (echo "ERROR: .githooks/pre-commit missing or not executable" && exit 1)
+	@echo "secret-guard active (core.hooksPath=.githooks)"
 
 test:
 	poetry run pytest

@@ -183,33 +183,6 @@ def test_approved_directory_validation_not_directory(tmp_path):
     assert "not a directory" in str(exc_info.value)
 
 
-def test_auth_token_validation():
-    """Test auth token secret validation."""
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        # Should fail when token auth enabled but no secret
-        with pytest.raises(ValidationError) as exc_info:
-            Settings(
-                telegram_bot_token="test_token",
-                telegram_bot_username="test_bot",
-                approved_directory=tmp_dir,
-                enable_token_auth=True,
-            )
-
-        assert "auth_token_secret required" in str(exc_info.value)
-
-        # Should succeed when both enabled and secret provided
-        settings = Settings(
-            telegram_bot_token="test_token",
-            telegram_bot_username="test_bot",
-            approved_directory=tmp_dir,
-            enable_token_auth=True,
-            auth_token_secret="secret123",
-        )
-
-        assert settings.enable_token_auth is True
-        assert settings.auth_secret_str == "secret123"
-
-
 def test_mcp_config_validation(tmp_path, monkeypatch):
     """Test MCP configuration validation."""
     test_dir = tmp_path / "projects"
@@ -723,8 +696,6 @@ def test_feature_flags():
         mcp_config_path="/tmp/test_mcp.json",
         enable_git_integration=True,
         enable_file_uploads=False,
-        enable_token_auth=True,
-        auth_token_secret="secret",
     )
 
     features = FeatureFlags(settings)
@@ -732,13 +703,11 @@ def test_feature_flags():
     assert features.mcp_enabled is True
     assert features.git_enabled is True
     assert features.file_uploads_enabled is False
-    assert features.token_auth_enabled is True
 
     enabled_features = features.get_enabled_features()
     assert "mcp" in enabled_features
     assert "git" in enabled_features
     assert "file_uploads" not in enabled_features
-    assert "token_auth" in enabled_features
 
     # Test generic feature check
     assert features.is_feature_enabled("git") is True

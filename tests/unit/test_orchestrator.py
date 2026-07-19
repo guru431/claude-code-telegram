@@ -476,6 +476,125 @@ async def test_agentic_document_rejects_large_files(agentic_settings, deps):
     assert "too large" in call_args.args[0].lower()
 
 
+def _document_update(file_name="notes.txt", file_size=1024):
+    """A Telegram document update whose reply_text returns a progress msg."""
+    progress_msg = MagicMock()
+    progress_msg.edit_text = AsyncMock()
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.document.file_name = file_name
+    update.message.document.file_size = file_size
+    update.message.caption = None
+    update.message.reply_text = AsyncMock(return_value=progress_msg)
+    update.message.chat.send_action = AsyncMock()
+    return update, progress_msg
+
+
+def _document_context(downloaded: bytes, resolved_file_size=None):
+    """Context with no file_handler, so the basic download path is exercised."""
+    mock_file = AsyncMock()
+    mock_file.file_size = resolved_file_size
+    mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(downloaded))
+
+    context = MagicMock()
+    context.bot_data = {
+        "security_validator": None,
+        "features": None,
+        "claude_integration": MagicMock(),
+    }
+    return context, mock_file
+
+
+async def test_agentic_document_missing_file_size_does_not_bypass_limit(
+    agentic_settings, deps
+):
+    """A missing Telegram file_size is unknown, not 0 — the real byte length
+    is what decides, so an oversized payload is still rejected."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    update, progress_msg = _document_update(file_size=None)
+    oversized = b"x" * (agentic_settings.max_file_upload_size_bytes + 1)
+    context, mock_file = _document_context(oversized)
+    update.message.document.get_file = AsyncMock(return_value=mock_file)
+
+    await orchestrator.agentic_document(update, context)
+
+    assert "too large" in progress_msg.edit_text.call_args.args[0].lower()
+
+
+async def test_agentic_document_rejects_understated_metadata_size(
+    agentic_settings, deps
+):
+    """Metadata claiming a small file cannot smuggle oversized bytes through."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    update, progress_msg = _document_update(file_size=1024)
+    oversized = b"x" * (agentic_settings.max_file_upload_size_bytes + 1)
+    context, mock_file = _document_context(oversized)
+    update.message.document.get_file = AsyncMock(return_value=mock_file)
+
+    await orchestrator.agentic_document(update, context)
+
+    assert "too large" in progress_msg.edit_text.call_args.args[0].lower()
+
+
+async def test_agentic_document_accepts_file_without_size_metadata(
+    agentic_settings, deps
+):
+    """An unknown metadata size is not itself a rejection — a small file
+    still goes through to Claude."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    update, progress_msg = _document_update(file_size=None)
+    context, mock_file = _document_context(b"hello world")
+    update.message.document.get_file = AsyncMock(return_value=mock_file)
+    orchestrator._handle_agentic_media_message = AsyncMock()
+
+    await orchestrator.agentic_document(update, context)
+
+    progress_msg.edit_text.assert_not_called()
+    orchestrator._handle_agentic_media_message.assert_awaited_once()
+
+
+async def test_agentic_document_uses_configured_size_limit(tmp_dir, deps):
+    """The limit comes from MAX_FILE_UPLOAD_SIZE_MB, not a hardcoded 10MB."""
+    settings = create_test_config(
+        approved_directory=str(tmp_dir),
+        agentic_mode=True,
+        max_file_upload_size_mb=1,
+    )
+    orchestrator = MessageOrchestrator(settings, deps)
+
+    update, _ = _document_update(file_size=2 * 1024 * 1024)  # 2MB
+    context = MagicMock()
+    context.bot_data = {"security_validator": None}
+
+    await orchestrator.agentic_document(update, context)
+
+    message = update.message.reply_text.call_args.args[0]
+    assert "too large" in message.lower()
+    assert "1MB" in message
+
+
+async def test_agentic_document_handles_missing_filename(agentic_settings, deps):
+    """A nameless upload must not pass None into validate_filename."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    update, _ = _document_update(file_name=None)
+    context, mock_file = _document_context(b"hello")
+    update.message.document.get_file = AsyncMock(return_value=mock_file)
+
+    security_validator = MagicMock()
+    security_validator.validate_filename = MagicMock(return_value=(True, ""))
+    context.bot_data["security_validator"] = security_validator
+    orchestrator._handle_agentic_media_message = AsyncMock()
+
+    await orchestrator.agentic_document(update, context)
+
+    security_validator.validate_filename.assert_called_once_with("document")
+
+
 async def test_agentic_voice_calls_claude(agentic_settings, deps):
     """Agentic voice handler transcribes and routes prompt to Claude."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)

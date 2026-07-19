@@ -40,11 +40,10 @@ APPROVED_DIRECTORY=/path/to/your/projects
 ```bash
 # Comma-separated list of allowed Telegram user IDs
 ALLOWED_USERS=123456789,987654321
-
-# Enable token-based authentication (requires AUTH_TOKEN_SECRET)
-ENABLE_TOKEN_AUTH=false
-AUTH_TOKEN_SECRET=your-secret-key-here
 ```
+
+The Telegram ID whitelist is the only authentication method. There is no
+token-login flow.
 
 #### Security Relaxation (Trusted Environments Only)
 
@@ -325,7 +324,6 @@ Available feature flags:
 - `file_uploads_enabled`: File upload handling
 - `quick_actions_enabled`: Quick action buttons
 - `telemetry_enabled`: Anonymous usage telemetry
-- `token_auth_enabled`: Token-based authentication
 - `webhook_enabled`: Telegram webhook mode (vs polling)
 - `voice_messages_enabled`: Voice message transcription (default: true)
 - `development_features_enabled`: Development-only features
@@ -341,7 +339,6 @@ The configuration system performs extensive validation:
 
 ### Cross-Field Validation
 
-- `AUTH_TOKEN_SECRET` is required when `ENABLE_TOKEN_AUTH=true`
 - `MCP_CONFIG_PATH` is required when `ENABLE_MCP=true`
 - `MISTRAL_API_KEY` is required when `VOICE_PROVIDER=mistral`
 - `OPENAI_API_KEY` is required when `VOICE_PROVIDER=openai`
@@ -376,11 +373,7 @@ ANTHROPIC_API_KEY=sk-ant-api03-your-key-here
    - Use absolute paths, not relative paths
    - Check file permissions
 
-2. **"auth_token_secret required"**
-   - Set `AUTH_TOKEN_SECRET` when using `ENABLE_TOKEN_AUTH=true`
-   - Generate a secure secret: `openssl rand -hex 32`
-
-3. **"MCP config file does not exist"**
+2. **"MCP config file does not exist"**
    - Ensure `MCP_CONFIG_PATH` points to an existing file
    - Or disable MCP with `ENABLE_MCP=false`
 
@@ -388,6 +381,5 @@ ANTHROPIC_API_KEY=sk-ant-api03-your-key-here
 
 - **Never commit secrets** to version control
 - **Use environment variables** for sensitive data
-- **Rotate tokens regularly** if using token-based auth
 - **Restrict `APPROVED_DIRECTORY`** to only necessary paths
 - **Monitor logs** for configuration errors and security events

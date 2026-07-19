@@ -62,7 +62,10 @@ class AuditStorage:
         raise NotImplementedError
 
     async def get_security_violations(
-        self, user_id: Optional[int] = None, limit: int = 100
+        self,
+        user_id: Optional[int] = None,
+        limit: int = 100,
+        start_time: Optional[datetime] = None,
     ) -> List[AuditEvent]:
         """Get security violations."""
         raise NotImplementedError
@@ -122,11 +125,17 @@ class InMemoryAuditStorage(AuditStorage):
         return filtered_events[:limit]
 
     async def get_security_violations(
-        self, user_id: Optional[int] = None, limit: int = 100
+        self,
+        user_id: Optional[int] = None,
+        limit: int = 100,
+        start_time: Optional[datetime] = None,
     ) -> List[AuditEvent]:
-        """Get security violations."""
+        """Get security violations, optionally restricted to a time window."""
         return await self.get_events(
-            user_id=user_id, event_type="security_violation", limit=limit
+            user_id=user_id,
+            event_type="security_violation",
+            start_time=start_time,
+            limit=limit,
         )
 
 
@@ -134,9 +143,9 @@ class SQLiteAuditStorage(AuditStorage):
     """Durable audit storage backed by the SQLite ``audit_log`` table.
 
     Persists events through the existing ``AuditLogRepository`` so audit history
-    survives restarts (unlike :class:`InMemoryAuditStorage`). The table does not
-    carry ``session_id`` or ``risk_level``, so reconstructed events default those
-    fields; the high-risk warning behavior of the in-memory store is preserved.
+    survives restarts (unlike :class:`InMemoryAuditStorage`). ``session_id`` and
+    ``risk_level`` round-trip through the columns added by migration 9; the
+    high-risk warning behavior of the in-memory store is preserved.
     """
 
     def __init__(self, storage: Any) -> None:
@@ -159,6 +168,8 @@ class SQLiteAuditStorage(AuditStorage):
             success=event.success,
             timestamp=event.timestamp,
             ip_address=event.ip_address,
+            risk_level=event.risk_level,
+            session_id=event.session_id,
         )
         try:
             await self.storage.audit.log_event(model)
@@ -220,11 +231,17 @@ class SQLiteAuditStorage(AuditStorage):
         return [self._row_to_event(row) for row in rows]
 
     async def get_security_violations(
-        self, user_id: Optional[int] = None, limit: int = 100
+        self,
+        user_id: Optional[int] = None,
+        limit: int = 100,
+        start_time: Optional[datetime] = None,
     ) -> List[AuditEvent]:
-        """Get security violations from the audit_log table."""
+        """Get security violations, optionally restricted to a time window."""
         return await self.get_events(
-            user_id=user_id, event_type="security_violation", limit=limit
+            user_id=user_id,
+            event_type="security_violation",
+            start_time=start_time,
+            limit=limit,
         )
 
     @staticmethod
@@ -240,6 +257,8 @@ class SQLiteAuditStorage(AuditStorage):
             success=model.success,
             details=model.event_data or {},
             ip_address=model.ip_address,
+            session_id=model.session_id,
+            risk_level=model.risk_level,
         )
 
 
@@ -559,8 +578,11 @@ class AuditLogger:
         start_time = datetime.now(UTC) - timedelta(hours=24)
         recent_events = await self.storage.get_events(start_time=start_time, limit=1000)
 
-        # Get security violations
-        violations = await self.storage.get_security_violations(limit=100)
+        # Get security violations from the SAME 24h window. Without start_time
+        # these were counted all-time and inflated every "24_hours" number.
+        violations = await self.storage.get_security_violations(
+            limit=100, start_time=start_time
+        )
 
         dashboard: Dict[str, Any] = {
             "period": "24_hours",

@@ -5,7 +5,7 @@ description = "Telegram bot for remote Claude Code access with comprehensive con
 readme = "README.md"
 license = "MIT"
 authors = [
-    {name = "Richard Atkinson", email = "richardatk01@gmail.com"},
+    {name = "guru431"},
 ]
 keywords = ["telegram", "bot", "claude", "ai", "development", "remote", "coding"]
 classifiers = [

@@ -293,13 +293,52 @@ class ProjectThreadManager:
             ),
         )
 
-        await self.repository.upsert_mapping(
-            project_slug=project.slug,
-            chat_id=chat_id,
-            message_thread_id=topic.message_thread_id,
-            topic_name=project.name,
-            is_active=True,
-        )
+        try:
+            await self.repository.upsert_mapping(
+                project_slug=project.slug,
+                chat_id=chat_id,
+                message_thread_id=topic.message_thread_id,
+                topic_name=project.name,
+                is_active=True,
+            )
+        except Exception as e:
+            # Without a mapping the topic is invisible to both the router and
+            # the stale-mapping reaper, and the next sync would create a second
+            # topic with the same name — duplicates would pile up every run.
+            # Compensate by removing the topic we just created.
+            logger.error(
+                "Failed to persist topic mapping; deleting the created topic",
+                project_slug=project.slug,
+                chat_id=chat_id,
+                message_thread_id=topic.message_thread_id,
+                error=str(e),
+            )
+            try:
+                await self._call_sync_api(
+                    lambda: bot.delete_forum_topic(
+                        chat_id=chat_id,
+                        message_thread_id=topic.message_thread_id,
+                    ),
+                )
+            except Exception as cleanup_error:
+                logger.error(
+                    "Orphaned forum topic left behind; manual cleanup required",
+                    project_slug=project.slug,
+                    chat_id=chat_id,
+                    message_thread_id=topic.message_thread_id,
+                    topic_name=project.name,
+                    cleanup_error=str(cleanup_error),
+                    mapping_error=str(e),
+                )
+            else:
+                logger.info(
+                    "Deleted unmapped topic after mapping failure",
+                    project_slug=project.slug,
+                    chat_id=chat_id,
+                    message_thread_id=topic.message_thread_id,
+                )
+            raise
+
         await self._send_topic_bootstrap_message(
             bot=bot,
             chat_id=chat_id,

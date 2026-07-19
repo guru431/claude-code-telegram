@@ -12,7 +12,6 @@ The Claude Code Telegram Bot implements a defense-in-depth security model with m
 
 ### 1. Authentication & Authorization
 - **User Whitelist**: Only pre-approved Telegram user IDs can access the bot
-- **Token-Based Auth**: Optional token-based authentication for additional security
 - **Session Management**: Secure session handling with timeout and cleanup
 
 ### 2. Directory Boundaries
@@ -76,12 +75,8 @@ All planned security features are implemented and active:
 # Base directory for all operations (CRITICAL)
 APPROVED_DIRECTORY=/path/to/approved/projects
 
-# User access control
+# User access control (the only authentication method)
 ALLOWED_USERS=123456789,987654321  # Telegram user IDs
-
-# Optional: Token-based authentication
-ENABLE_TOKEN_AUTH=true
-AUTH_TOKEN_SECRET=your-secret-here  # Generate with: openssl rand -hex 32
 ```
 
 ### Webhook Security Settings
@@ -137,7 +132,6 @@ ENVIRONMENT=production  # Enables strict security defaults
    openssl rand -hex 32
 
    # Store in environment, never in code
-   export AUTH_TOKEN_SECRET="generated-secret"
    export GITHUB_WEBHOOK_SECRET="generated-secret"
    export WEBHOOK_API_SECRET="generated-secret"
    ```

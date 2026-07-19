@@ -1,62 +1,128 @@
 """Tests for application wiring in ``src.main``."""
 
-import pytest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
-from src.config.settings import Settings
-from src.exceptions import ConfigurationError
-from src.main import _build_auth_providers
-from src.security.auth import TokenAuthProvider
+from src.main import _sync_discovered_project_topics
 
 
-def test_token_provider_secret_is_hashable(tmp_path):
-    """The token provider must receive a plain str secret, not a SecretStr.
+class _FakeLog:
+    """Collects structlog-style calls for assertions."""
 
-    Regression: ``create_application`` passed ``config.auth_token_secret``
-    (a ``SecretStr``) into ``TokenAuthProvider``, whose ``_hash_token`` calls
-    ``self.secret.encode()`` -> ``AttributeError`` at runtime. The wiring must
-    use ``config.auth_secret_str``.
-    """
-    test_dir = tmp_path / "projects"
-    test_dir.mkdir()
+    def __init__(self):
+        self.warnings = []
+        self.infos = []
+        self.exceptions = []
 
-    config = Settings(
-        telegram_bot_token="test_token",
-        telegram_bot_username="test_bot",
-        approved_directory=str(test_dir),
-        allowed_users="123",
-        enable_token_auth=True,
-        development_mode=True,
-        auth_token_secret="test-token-auth-secret-0123456789-abcdef",
-    )
+    def warning(self, event, **kwargs):
+        self.warnings.append((event, kwargs))
 
-    providers = _build_auth_providers(config)
-    token_providers = [p for p in providers if isinstance(p, TokenAuthProvider)]
-    assert token_providers, "expected a TokenAuthProvider when token auth is enabled"
+    def info(self, event, **kwargs):
+        self.infos.append((event, kwargs))
 
-    provider = token_providers[0]
-    assert isinstance(provider.secret, str)
-    # Must not raise AttributeError (the original bug).
-    assert isinstance(provider._hash_token("a-token"), str)
+    def exception(self, event, **kwargs):
+        self.exceptions.append((event, kwargs))
 
 
-def test_token_auth_is_fail_closed_in_production(tmp_path):
-    """ENABLE_TOKEN_AUTH without DEVELOPMENT_MODE must refuse to start.
+def _sync_result(created=1):
+    return SimpleNamespace(created=created, reused=0, renamed=0, failed=0)
 
-    In-memory token storage loses tokens on restart; enabling it in production
-    is rejected so the fail-closed posture isn't silently weakened.
-    """
-    test_dir = tmp_path / "projects"
-    test_dir.mkdir()
 
-    config = Settings(
-        telegram_bot_token="test_token",
-        telegram_bot_username="test_bot",
-        approved_directory=str(test_dir),
-        allowed_users="123",
-        enable_token_auth=True,
-        development_mode=False,
-        auth_token_secret="test-token-auth-secret-0123456789-abcdef",
-    )
+class TestSyncDiscoveredProjectTopics:
+    """Nightly discovery must sync topics for every configured chat."""
 
-    with pytest.raises(ConfigurationError):
-        _build_auth_providers(config)
+    async def test_private_mode_syncs_all_allowed_users(self):
+        """Regression: only allowed_users[0] was synced, silently starving the rest."""
+        config = SimpleNamespace(
+            project_threads_mode="private",
+            project_threads_chat_id=None,
+            allowed_users=[111, 222, 333],
+        )
+        manager = SimpleNamespace(sync_topics=AsyncMock(return_value=_sync_result()))
+        log = _FakeLog()
+
+        failed = await _sync_discovered_project_topics(
+            config=config, manager=manager, telegram_bot=object(), log=log
+        )
+
+        assert failed == 0
+        synced = [c.kwargs["chat_id"] for c in manager.sync_topics.call_args_list]
+        assert synced == [111, 222, 333]
+        assert len(log.infos) == 3
+
+    async def test_one_user_failure_does_not_abort_the_rest(self):
+        config = SimpleNamespace(
+            project_threads_mode="private",
+            project_threads_chat_id=None,
+            allowed_users=[111, 222, 333],
+        )
+
+        async def _sync(_bot, chat_id):
+            if chat_id == 222:
+                raise RuntimeError("user blocked the bot")
+            return _sync_result()
+
+        manager = SimpleNamespace(sync_topics=AsyncMock(side_effect=_sync))
+        log = _FakeLog()
+
+        failed = await _sync_discovered_project_topics(
+            config=config, manager=manager, telegram_bot=object(), log=log
+        )
+
+        assert failed == 1
+        synced = [c.kwargs["chat_id"] for c in manager.sync_topics.call_args_list]
+        assert synced == [111, 222, 333]
+        assert len(log.infos) == 2
+        assert log.exceptions, "the failing chat must be logged"
+        assert any("some chats failed" in event for event, _ in log.warnings)
+
+    async def test_group_mode_uses_group_chat_id(self):
+        config = SimpleNamespace(
+            project_threads_mode="group",
+            project_threads_chat_id=-1001234567890,
+            allowed_users=[111, 222],
+        )
+        manager = SimpleNamespace(sync_topics=AsyncMock(return_value=_sync_result()))
+        log = _FakeLog()
+
+        failed = await _sync_discovered_project_topics(
+            config=config, manager=manager, telegram_bot=object(), log=log
+        )
+
+        assert failed == 0
+        manager.sync_topics.assert_awaited_once()
+        assert manager.sync_topics.call_args.kwargs["chat_id"] == -1001234567890
+
+    async def test_no_chat_ids_warns_instead_of_silent_skip(self):
+        """Empty allowed_users used to skip the sync with no log line at all."""
+        config = SimpleNamespace(
+            project_threads_mode="private",
+            project_threads_chat_id=None,
+            allowed_users=[],
+        )
+        manager = SimpleNamespace(sync_topics=AsyncMock())
+        log = _FakeLog()
+
+        failed = await _sync_discovered_project_topics(
+            config=config, manager=manager, telegram_bot=object(), log=log
+        )
+
+        assert failed == 0
+        manager.sync_topics.assert_not_awaited()
+        assert any("no chat id to sync" in event for event, _ in log.warnings)
+
+    async def test_group_mode_without_chat_id_warns(self):
+        config = SimpleNamespace(
+            project_threads_mode="group",
+            project_threads_chat_id=None,
+            allowed_users=[111],
+        )
+        manager = SimpleNamespace(sync_topics=AsyncMock())
+        log = _FakeLog()
+
+        await _sync_discovered_project_topics(
+            config=config, manager=manager, telegram_bot=object(), log=log
+        )
+
+        manager.sync_topics.assert_not_awaited()
+        assert any("no chat id to sync" in event for event, _ in log.warnings)

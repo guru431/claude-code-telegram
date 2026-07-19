@@ -17,7 +17,7 @@ Quick links to every doc in this project. Start with the [README](../README.md) 
 | Document | Description |
 |----------|-------------|
 | [Project Overview](project-overview.md) | Architecture, core objectives, request flow diagrams, and design decisions |
-| [SDK Duplication Review](SDK_DUPLICATION_REVIEW.md) | Audit of `src/claude/` against the Claude Agent SDK — what to simplify or remove |
+| [SDK Duplication Review](archive/SDK_DUPLICATION_REVIEW.md) | Archived (2026-02-20) audit of `src/claude/` against the Claude Agent SDK — historical record, superseded by later work |
 
 ## Repository-Level
 

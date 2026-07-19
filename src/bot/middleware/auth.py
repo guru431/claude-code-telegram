@@ -73,11 +73,9 @@ async def auth_middleware(handler: Callable, event: Any, data: Dict[str, Any]) -
         "Attempting authentication for user", user_id=user_id, username=username
     )
 
-    # Try to authenticate. No credentials are collected on the message path
-    # (there is no token-login command), so this always passes empty
-    # credentials: whitelist auth works, but TokenAuthProvider always sees
-    # token=None and returns False. Token auth is therefore non-functional as
-    # the sole provider -- see FINDINGS.md 2026-07-09 "TokenAuthProvider".
+    # Try to authenticate. No credentials are collected on the message path,
+    # so this always passes empty credentials -- whitelist auth (the only
+    # provider today) does not need any.
     authentication_successful = await auth_manager.authenticate_user(user_id)
 
     # Log authentication attempt

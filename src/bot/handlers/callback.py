@@ -12,13 +12,29 @@ from ...claude.facade import ClaudeIntegration
 from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
-from ..utils.html_format import escape_html
+from ...utils.constants import TELEGRAM_MAX_MESSAGE_LENGTH
+from ..utils.html_format import escape_html, split_telegram_html, tg_len
 
 # session_export is imported lazily inside the export callback to keep the
 # command/callback dispatch path lightweight — this module is the largest
 # handler file and is imported on every bot startup.
 
 logger = structlog.get_logger()
+
+
+def _first_chunk(text: str, notice: str = "\n\n<i>(Response truncated)</i>") -> str:
+    """Return *text* trimmed to one Telegram message without breaking markup.
+
+    Slicing HTML by character position can cut inside a tag or an entity and
+    leave the message unbalanced, which Telegram rejects with a 400. Splitting
+    on the tag structure instead gives a first chunk that is well-formed on its
+    own; the notice is appended only when something was actually dropped, and
+    is included in the budget so the result still fits.
+    """
+    chunks = split_telegram_html(text, TELEGRAM_MAX_MESSAGE_LENGTH - tg_len(notice))
+    if len(chunks) <= 1:
+        return text
+    return chunks[0] + notice
 
 
 def _is_within_root(path: Path, root: Path) -> bool:
@@ -1028,16 +1044,11 @@ async def handle_quick_action_callback(
         )
 
         if claude_response:
-            # Format and send the response
-            response_text = escape_html(claude_response.content)
-            if len(response_text) > 4000:
-                response_text = (
-                    response_text[:4000] + "...\n\n<i>(Response truncated)</i>"
-                )
-
-            done_text = (
+            # Format and send the response. Truncate the composed message, not
+            # just the body -- the header also counts against Telegram's limit.
+            done_text = _first_chunk(
                 f"✅ <b>{action.icon} {escape_html(action.name)} Complete</b>\n\n"
-                f"{response_text}"
+                f"{escape_html(claude_response.content)}"
             )
             if isinstance(query.message, Message):
                 await query.message.reply_text(done_text, parse_mode="HTML")
@@ -1116,11 +1127,7 @@ async def handle_followup_callback(
         if claude_response:
             context.user_data["claude_session_id"] = claude_response.session_id
 
-            response_text = escape_html(claude_response.content)
-            if len(response_text) > 4000:
-                response_text = (
-                    response_text[:4000] + "...\n\n<i>(Response truncated)</i>"
-                )
+            response_text = _first_chunk(escape_html(claude_response.content))
             if isinstance(query.message, Message):
                 await query.message.reply_text(response_text, parse_mode="HTML")
             else:
@@ -1297,17 +1304,13 @@ async def handle_git_callback(
                     diff_output.replace("➕", "+").replace("➖", "-").replace("📍", "@")
                 )
 
-                # Limit diff output (leave room for header + HTML tags within
-                # Telegram's 4096-char message limit)
-                max_length = 3500
-                if len(clean_diff) > max_length:
-                    clean_diff = (
-                        clean_diff[:max_length] + "\n\n... output truncated ..."
-                    )
-
+                # Escape first, then truncate the composed message: escaping
+                # expands &, < and > to 4-5 chars each, so a budget measured on
+                # the raw diff can still overflow once escaped.
                 escaped_diff = escape_html(clean_diff)
-                diff_message = (
-                    f"📊 <b>Git Diff</b>\n\n<pre><code>{escaped_diff}</code></pre>"
+                diff_message = _first_chunk(
+                    f"📊 <b>Git Diff</b>\n\n<pre><code>{escaped_diff}</code></pre>",
+                    notice="\n\n<i>(output truncated)</i>",
                 )
 
             keyboard = [

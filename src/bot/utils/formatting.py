@@ -252,7 +252,15 @@ class ResponseFormatter:
         ]
 
     def _get_quick_actions_keyboard(self) -> InlineKeyboardMarkup:
-        """Get quick actions inline keyboard."""
+        """Get quick actions inline keyboard.
+
+        Every ``quick:<id>`` here must exist in ``QuickActionManager``: the
+        callback handler looks the id up in that registry and fails when it is
+        missing. This board previously advertised ``find_todos``, ``build`` and
+        ``git_status``, none of which were ever registered -- the buttons were
+        dead on arrival. ``tests/unit/test_bot/test_quick_action_contract.py``
+        pins the two sides together.
+        """
         keyboard = [
             [
                 InlineKeyboardButton("🧪 Test", callback_data="quick:test"),
@@ -260,9 +268,9 @@ class ResponseFormatter:
                 InlineKeyboardButton("🎨 Format", callback_data="quick:format"),
             ],
             [
-                InlineKeyboardButton("🔍 Find TODOs", callback_data="quick:find_todos"),
-                InlineKeyboardButton("🔨 Build", callback_data="quick:build"),
-                InlineKeyboardButton("📊 Git Status", callback_data="quick:git_status"),
+                InlineKeyboardButton("🔍 Lint", callback_data="quick:lint"),
+                InlineKeyboardButton("🔒 Security", callback_data="quick:security"),
+                InlineKeyboardButton("🔧 Refactor", callback_data="quick:refactor"),
             ],
         ]
 

@@ -7,7 +7,7 @@ from typing import List, Optional
 import structlog
 import telegram
 
-from src.bot.utils.html_format import tg_len
+from src.bot.utils.html_format import tg_len, utf16_cut
 from src.utils.constants import TELEGRAM_MAX_MESSAGE_LENGTH
 
 logger = structlog.get_logger()
@@ -119,12 +119,13 @@ class DraftStreamer:
         if not draft_text.strip():
             return
 
-        # Tail-truncate if over Telegram limit (measured in UTF-16 units)
+        # Tail-truncate if over Telegram limit (measured in UTF-16 units).
+        # Budget is computed on the reversed text so the cut lands on a code
+        # point boundary in one pass: slicing by code point and then shaving a
+        # character at a time cost ~one iteration per astral char in the draft.
         if tg_len(draft_text) > TELEGRAM_MAX_MESSAGE_LENGTH:
-            draft_text = "\u2026" + draft_text[-(TELEGRAM_MAX_MESSAGE_LENGTH - 1) :]
-            # Trim further if astral chars still push UTF-16 length over the limit
-            while tg_len(draft_text) > TELEGRAM_MAX_MESSAGE_LENGTH:
-                draft_text = "\u2026" + draft_text[2:]
+            keep = utf16_cut(draft_text[::-1], TELEGRAM_MAX_MESSAGE_LENGTH - 1)
+            draft_text = "\u2026" + draft_text[len(draft_text) - keep :]
 
         try:
             kwargs = {

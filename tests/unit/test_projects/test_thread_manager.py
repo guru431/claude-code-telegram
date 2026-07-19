@@ -583,3 +583,121 @@ async def test_sync_topics_does_not_retry_retry_after(
     assert result.failed == 1
     assert bot.create_forum_topic.await_count == 1
     sleep_mock.assert_not_awaited()
+
+
+async def test_mapping_failure_deletes_orphaned_topic(
+    tmp_path: Path, db_manager, monkeypatch
+) -> None:
+    """A failed mapping write must not leave an unmapped topic behind.
+
+    Regression: the topic was created in Telegram first, so a failing
+    upsert_mapping left an orphan with no DB row. The next sync found no
+    mapping and created a *second* topic with the same name, and the stale
+    reaper could never see it (it only walks topics that have DB rows).
+    """
+    approved = tmp_path / "projects"
+    approved.mkdir()
+
+    config_file = _write_registry(tmp_path, approved, "app1")
+    registry = load_project_registry(config_file, approved)
+
+    repo = ProjectThreadRepository(db_manager)
+    monkeypatch.setattr(
+        repo,
+        "upsert_mapping",
+        AsyncMock(side_effect=RuntimeError("db is down")),
+    )
+    manager = ProjectThreadManager(registry, repo, sync_action_interval_seconds=0.0)
+
+    bot = AsyncMock()
+    bot.create_forum_topic = AsyncMock(
+        return_value=SimpleNamespace(message_thread_id=101)
+    )
+    bot.send_message = AsyncMock()
+    bot.delete_forum_topic = AsyncMock()
+
+    result = await manager.sync_topics(bot, chat_id=42)
+
+    assert result.created == 0
+    assert result.failed == 1
+    # The compensating delete removed the topic we had just created.
+    bot.delete_forum_topic.assert_awaited_once_with(
+        chat_id=42,
+        message_thread_id=101,
+    )
+    # No bootstrap message for a topic that no longer exists.
+    bot.send_message.assert_not_awaited()
+
+
+async def test_mapping_failure_does_not_duplicate_topic_on_next_sync(
+    tmp_path: Path, db_manager, monkeypatch
+) -> None:
+    """After compensation, a later successful sync creates exactly one topic."""
+    approved = tmp_path / "projects"
+    approved.mkdir()
+
+    config_file = _write_registry(tmp_path, approved, "app1")
+    registry = load_project_registry(config_file, approved)
+
+    repo = ProjectThreadRepository(db_manager)
+    real_upsert = repo.upsert_mapping
+    failing = AsyncMock(side_effect=RuntimeError("db is down"))
+    monkeypatch.setattr(repo, "upsert_mapping", failing)
+    manager = ProjectThreadManager(registry, repo, sync_action_interval_seconds=0.0)
+
+    bot = AsyncMock()
+    bot.create_forum_topic = AsyncMock(
+        side_effect=[
+            SimpleNamespace(message_thread_id=101),
+            SimpleNamespace(message_thread_id=102),
+        ]
+    )
+    bot.send_message = AsyncMock()
+    bot.delete_forum_topic = AsyncMock()
+    bot.reopen_forum_topic = AsyncMock()
+    bot.edit_forum_topic = AsyncMock()
+
+    first = await manager.sync_topics(bot, chat_id=42)
+    assert first.failed == 1
+    bot.delete_forum_topic.assert_awaited_once()
+
+    # DB recovers; the retry maps the new topic and leaves no duplicate.
+    monkeypatch.setattr(repo, "upsert_mapping", real_upsert)
+    second = await manager.sync_topics(bot, chat_id=42)
+
+    assert second.created == 1
+    mappings = await repo.list_by_chat(42, active_only=False)
+    assert len(mappings) == 1
+    assert mappings[0].message_thread_id == 102
+
+
+async def test_mapping_failure_with_failed_cleanup_still_propagates(
+    tmp_path: Path, db_manager, monkeypatch
+) -> None:
+    """If the compensating delete also fails, the sync still counts a failure."""
+    approved = tmp_path / "projects"
+    approved.mkdir()
+
+    config_file = _write_registry(tmp_path, approved, "app1")
+    registry = load_project_registry(config_file, approved)
+
+    repo = ProjectThreadRepository(db_manager)
+    monkeypatch.setattr(
+        repo,
+        "upsert_mapping",
+        AsyncMock(side_effect=RuntimeError("db is down")),
+    )
+    manager = ProjectThreadManager(registry, repo, sync_action_interval_seconds=0.0)
+
+    bot = AsyncMock()
+    bot.create_forum_topic = AsyncMock(
+        return_value=SimpleNamespace(message_thread_id=101)
+    )
+    bot.send_message = AsyncMock()
+    bot.delete_forum_topic = AsyncMock(side_effect=TelegramError("cannot delete"))
+
+    result = await manager.sync_topics(bot, chat_id=42)
+
+    assert result.created == 0
+    assert result.failed == 1
+    bot.delete_forum_topic.assert_awaited_once()

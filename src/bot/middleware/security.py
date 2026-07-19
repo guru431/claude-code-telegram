@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict
 import structlog
 
 from ..utils.html_format import escape_html
+from ..utils.upload_limits import exceeds_upload_limit
 
 logger = structlog.get_logger()
 
@@ -139,7 +140,7 @@ async def security_middleware(
     # Validate file uploads if present
     if message and message.document:
         is_safe, error_message = await validate_file_upload(
-            message.document, security_validator, user_id, audit_logger
+            message.document, security_validator, user_id, audit_logger, settings
         )
         if not is_safe:
             await message.reply_text(
@@ -250,12 +251,18 @@ async def validate_message_content(
 
 
 async def validate_file_upload(
-    document: Any, security_validator: Any, user_id: int, audit_logger: Any
+    document: Any,
+    security_validator: Any,
+    user_id: int,
+    audit_logger: Any,
+    settings: Any = None,
 ) -> tuple[bool, str]:
     """Validate file uploads for security."""
 
     filename = getattr(document, "file_name", "unknown")
-    file_size = document.file_size or 0
+    # Keep the declared size as-is (possibly None): an absent size is unknown,
+    # not zero. The handlers re-check the real byte length after download.
+    file_size = getattr(document, "file_size", None)
     mime_type = getattr(document, "mime_type", "unknown")
 
     # Validate filename
@@ -278,9 +285,13 @@ async def validate_file_upload(
         )
         return False, error_message
 
-    # Check file size limits
-    max_file_size = 10 * 1024 * 1024  # 10MB
-    if file_size > max_file_size:
+    # Check file size limits. Single source of truth is
+    # Settings.max_file_upload_size_bytes (MAX_FILE_UPLOAD_SIZE_MB); the literal
+    # is only a fallback for callers that have no Settings available.
+    max_file_size = getattr(
+        settings, "max_file_upload_size_bytes", 10 * 1024 * 1024  # 10MB
+    )
+    if exceeds_upload_limit(file_size, max_file_size):
         if audit_logger:
             await audit_logger.log_security_violation(
                 user_id=user_id,
@@ -340,103 +351,3 @@ async def validate_file_upload(
     )
 
     return True, ""
-
-
-async def threat_detection_middleware(
-    handler: Callable, event: Any, data: Dict[str, Any]
-) -> Any:
-    """Advanced threat detection middleware.
-
-    This middleware looks for patterns that might indicate
-    sophisticated attacks or reconnaissance attempts.
-    """
-    user_id = event.effective_user.id if event.effective_user else None
-    if not user_id:
-        return await handler(event, data)
-
-    audit_logger = data.get("audit_logger")
-
-    # Track user behavior patterns
-    user_behavior = data.setdefault("user_behavior", {})
-    user_data = user_behavior.setdefault(
-        user_id,
-        {
-            "message_count": 0,
-            "failed_commands": 0,
-            "path_requests": 0,
-            "file_requests": 0,
-            "first_seen": None,
-        },
-    )
-
-    import time
-
-    current_time = time.time()
-
-    if user_data["first_seen"] is None:
-        user_data["first_seen"] = current_time
-
-    user_data["message_count"] += 1
-
-    # Check for reconnaissance patterns
-    message = event.effective_message
-    text = message.text if message else ""
-
-    # Suspicious commands that might indicate reconnaissance
-    recon_patterns = [
-        r"ls\s+/",
-        r"find\s+/",
-        r"locate\s+",
-        r"which\s+",
-        r"whereis\s+",
-        r"ps\s+",
-        r"netstat\s+",
-        r"lsof\s+",
-        r"env\s*$",
-        r"printenv\s*$",
-        r"whoami\s*$",
-        r"id\s*$",
-        r"uname\s+",
-        r"cat\s+/etc/",
-        r"cat\s+/proc/",
-    ]
-
-    import re
-
-    recon_attempts = sum(
-        1 for pattern in recon_patterns if re.search(pattern, text, re.IGNORECASE)
-    )
-
-    if recon_attempts > 0:
-        user_data["recon_attempts"] = (
-            user_data.get("recon_attempts", 0) + recon_attempts
-        )
-
-        # Alert if too many reconnaissance attempts
-        if user_data["recon_attempts"] > 5:
-            if audit_logger:
-                await audit_logger.log_security_violation(
-                    user_id=user_id,
-                    violation_type="reconnaissance_attempt",
-                    details=f"Multiple reconnaissance patterns detected: {user_data['recon_attempts']}",
-                    severity="high",
-                    attempted_action="reconnaissance",
-                )
-
-            logger.warning(
-                "Reconnaissance attempt pattern detected",
-                user_id=user_id,
-                total_attempts=user_data["recon_attempts"],
-                current_message=text[:100],
-            )
-
-            if event.effective_message:
-                await event.effective_message.reply_text(
-                    "🔍 <b>Suspicious Activity Detected</b>\n\n"
-                    "Multiple reconnaissance-style commands detected. "
-                    "This activity has been logged.\n\n"
-                    "If you have legitimate needs, please contact the administrator.",
-                    parse_mode="HTML",
-                )
-
-    return await handler(event, data)
