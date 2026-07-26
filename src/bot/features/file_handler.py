@@ -25,8 +25,19 @@ from typing import Any, Dict, List
 
 from telegram import Document
 
+from src.bot.utils.upload_limits import exceeds_upload_limit
 from src.config import Settings
 from src.security.validators import SecurityValidator
+
+
+class FileTooLargeError(ValueError):
+    """Upload exceeded ``MAX_FILE_UPLOAD_SIZE_MB``.
+
+    Distinct from the generic failures callers fall back to the basic handler
+    on: falling back here would download the same over-limit file a second
+    time, so the caller reports this one to the user directly.
+    """
+
 
 # Hard limit on number of files in an archive (zip-bomb mitigation).
 MAX_ARCHIVE_FILES = 10000
@@ -178,9 +189,24 @@ class FileHandler:
         concurrent uploads of an identically named file (PTB dispatches updates
         concurrently) cannot collide on the same path or unlink each other's
         bytes mid-flight. The sanitized filename is joined inside that subdir.
+
+        Enforces ``MAX_FILE_UPLOAD_SIZE_MB`` on both the resolved Telegram
+        metadata and the bytes actually written. ``Document.file_size`` is
+        optional and attacker-influenced, so a missing or understated value
+        must not let an over-limit payload reach the analysis path — this
+        handler processes the file straight off disk and used to check no size
+        at all (archives were bounded only by their own 100MB decompressed cap).
         """
+        max_bytes = self.config.max_file_upload_size_bytes
+        max_mb = self.config.max_file_upload_size_mb
+
         # Get file
         file = await document.get_file()
+        if exceeds_upload_limit(getattr(file, "file_size", None), max_bytes):
+            raise FileTooLargeError(
+                f"File too large ({getattr(file, 'file_size') / 1024 / 1024:.1f}MB). "
+                f"Max: {max_mb}MB."
+            )
 
         # Per-request directory isolates this download from every other
         download_dir = self.temp_dir / str(uuid.uuid4())
@@ -193,6 +219,14 @@ class FileHandler:
 
         # Download to path
         await file.download_to_drive(str(file_path))
+
+        actual_size = file_path.stat().st_size
+        if actual_size > max_bytes:
+            shutil.rmtree(download_dir, ignore_errors=True)
+            raise FileTooLargeError(
+                f"File too large ({actual_size / 1024 / 1024:.1f}MB). "
+                f"Max: {max_mb}MB."
+            )
 
         return file_path
 

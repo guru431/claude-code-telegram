@@ -132,18 +132,27 @@ def estimate_message_cost(event: Any) -> float:
     message = event.effective_message
     message_text = (message.text or "") if message else ""
 
+    # Higher cost for file uploads, whose real work is not in the caption text.
+    if (message and message.document) or (message and message.photo):
+        return 0.01 + len(message_text) * 0.0001 + 0.05
+
+    return estimate_prompt_cost(message_text)
+
+
+def estimate_prompt_cost(prompt: str) -> float:
+    """Estimate the cost of one Claude run over *prompt*.
+
+    Split out of ``estimate_message_cost`` so entry points that have a prompt
+    but no Update (inline-button callbacks: continue, quick action, follow-up)
+    size their budget hold the same way a typed message does.
+    """
     # Base cost for any message
     base_cost = 0.01
 
     # Additional cost based on message length
-    length_cost = len(message_text) * 0.0001
+    length_cost = len(prompt) * 0.0001
 
-    # Higher cost for certain types of messages
-    if (message and message.document) or (message and message.photo):
-        # File uploads cost more
-        return base_cost + length_cost + 0.05
-
-    if message_text.startswith("/"):
+    if prompt.startswith("/"):
         # Commands cost more
         return base_cost + length_cost + 0.02
 
@@ -161,7 +170,7 @@ def estimate_message_cost(event: Any) -> float:
         "explain",
     ]
 
-    if any(keyword in message_text.lower() for keyword in complex_keywords):
+    if any(keyword in prompt.lower() for keyword in complex_keywords):
         return base_cost + length_cost + 0.03
 
     return base_cost + length_cost

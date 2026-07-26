@@ -11,6 +11,7 @@ import pytest
 import yaml
 
 from scripts.sync_projects_yaml import scan_directories, sync
+from src.projects.registry import load_project_registry
 
 
 def _write(config: Path, projects: List[Dict[str, Any]]) -> None:
@@ -203,3 +204,71 @@ class TestSyncIsAdditive:
         sync(config, approved)
 
         assert sync(config, approved) is False
+
+
+class TestSyncWritesLoadableConfig:
+    """The script must never write a projects.yaml the bot refuses to load."""
+
+    def test_duplicate_path_spellings_collapse(
+        self, approved: Path, tmp_path: Path
+    ) -> None:
+        """Regression: './alpha' and 'alpha' were both kept, and the next
+        load_project_registry() died with "Duplicate project path"."""
+        config = tmp_path / "projects.yaml"
+        _write(
+            config,
+            [
+                {"slug": "alpha", "name": "Alpha", "path": "alpha", "enabled": True},
+                {
+                    "slug": "alpha-dot",
+                    "name": "Alpha Dot",
+                    "path": "./alpha",
+                    "enabled": True,
+                },
+            ],
+        )
+
+        sync(config, approved)
+
+        assert _paths(config).count("alpha") == 1
+        assert "./alpha" not in _paths(config)
+        # The written file is loadable, which is the point of the dedupe.
+        load_project_registry(config, approved)
+
+    def test_discovered_slug_collision_is_made_unique(
+        self, approved: Path, tmp_path: Path
+    ) -> None:
+        """A new directory whose slug is already taken must not clash."""
+        config = tmp_path / "projects.yaml"
+        _write(
+            config,
+            [{"slug": "beta", "name": "Beta", "path": "alpha", "enabled": True}],
+        )
+
+        sync(config, approved)
+
+        data = yaml.safe_load(config.read_text(encoding="utf-8"))["projects"]
+        slugs = [e["slug"] for e in data]
+        assert len(slugs) == len(set(slugs))
+        load_project_registry(config, approved)
+
+    def test_absolute_path_entry_is_dropped(
+        self, approved: Path, tmp_path: Path
+    ) -> None:
+        config = tmp_path / "projects.yaml"
+        _write(
+            config,
+            [
+                {
+                    "slug": "abs",
+                    "name": "Abs",
+                    "path": str(approved / "alpha"),
+                    "enabled": True,
+                }
+            ],
+        )
+
+        sync(config, approved)
+
+        assert not any(Path(p).is_absolute() for p in _paths(config))
+        load_project_registry(config, approved)

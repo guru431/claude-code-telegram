@@ -137,3 +137,59 @@ class TestDatabaseClose:
         await db_manager.close()
 
         assert db_manager._closed is True
+
+
+class TestMigrationAtomicity:
+    """A migration's DDL and its schema_version row must land together.
+
+    Regression: executescript() performs no transaction control, so committing
+    the version row separately let a crash in between persist the schema without
+    its version. The next start reran migration 1 (bare CREATE TABLE) and died
+    with "table users already exists".
+    """
+
+    async def test_failing_migration_leaves_no_partial_schema(self, tmp_path):
+        db_path = tmp_path / "atomic.db"
+        manager = DatabaseManager(f"sqlite:///{db_path}")
+
+        real_migrations = manager._get_migrations()
+        broken = [
+            real_migrations[0],
+            (2, "CREATE TABLE marker (id INTEGER);\nSELECT this_is_not_valid_sql();"),
+        ]
+        manager._get_migrations = lambda: broken  # type: ignore[method-assign]
+
+        with pytest.raises(Exception):
+            await manager.initialize()
+
+        # Migration 1 committed with its version row; migration 2 rolled back
+        # whole, so its table is absent and its version was never recorded.
+        import aiosqlite
+
+        async with aiosqlite.connect(db_path) as conn:
+            cursor = await conn.execute("SELECT MAX(version) FROM schema_version")
+            assert (await cursor.fetchone())[0] == 1
+            cursor = await conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='marker'"
+            )
+            assert await cursor.fetchone() is None
+
+    async def test_rerun_after_failure_completes(self, tmp_path):
+        """The half-migrated database must still be startable once fixed."""
+        db_path = tmp_path / "recover.db"
+
+        manager = DatabaseManager(f"sqlite:///{db_path}")
+        real_migrations = manager._get_migrations()
+        manager._get_migrations = lambda: [  # type: ignore[method-assign]
+            real_migrations[0],
+            (2, "SELECT this_is_not_valid_sql();"),
+        ]
+        with pytest.raises(Exception):
+            await manager.initialize()
+        await manager.close()
+
+        # Same database, real migration list: no "table users already exists".
+        recovered = DatabaseManager(f"sqlite:///{db_path}")
+        await recovered.initialize()
+        assert await recovered.health_check()
+        await recovered.close()

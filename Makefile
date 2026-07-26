@@ -21,8 +21,11 @@ help:
 	@echo "  remote-attach - Attach to running bot tmux session"
 	@echo "  remote-stop   - Stop the bot tmux session"
 
+# --no-dev was removed from Poetry; current releases express the same thing as
+# a dependency-group selector. Using the removed flag makes the documented
+# production entry point fail outright on a modern Poetry.
 install:
-	poetry install --no-dev
+	poetry install --only main
 
 dev: hooks
 	poetry install

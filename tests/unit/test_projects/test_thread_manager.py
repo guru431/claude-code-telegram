@@ -701,3 +701,79 @@ async def test_mapping_failure_with_failed_cleanup_still_propagates(
     assert result.created == 0
     assert result.failed == 1
     bot.delete_forum_topic.assert_awaited_once()
+
+
+async def test_stale_mapping_stays_active_when_delete_and_close_both_fail(
+    tmp_path: Path, db_manager
+) -> None:
+    """A failed cleanup must remain retryable.
+
+    Regression: the mapping was deactivated in a ``finally`` even when both
+    delete and close failed. list_stale_active_mappings only returns active
+    rows, so the orphaned topic was never picked up again by any later sync.
+    """
+    approved = tmp_path / "projects"
+    approved.mkdir()
+
+    initial_file = _write_registry(tmp_path, approved, "app1,app2")
+    repo = ProjectThreadRepository(db_manager)
+    manager = ProjectThreadManager(
+        load_project_registry(initial_file, approved),
+        repo,
+        sync_action_interval_seconds=0.0,
+    )
+
+    bot = AsyncMock()
+    bot.create_forum_topic = AsyncMock(
+        side_effect=[
+            SimpleNamespace(message_thread_id=101),
+            SimpleNamespace(message_thread_id=102),
+        ]
+    )
+    bot.send_message = AsyncMock()
+    bot.reopen_forum_topic = AsyncMock()
+    bot.edit_forum_topic = AsyncMock()
+    bot.delete_forum_topic = AsyncMock()
+    bot.close_forum_topic = AsyncMock()
+
+    await manager.sync_topics(bot, chat_id=-100777)
+
+    reduced_file = tmp_path / "projects_reduced_retry.yaml"
+    reduced_file.write_text(
+        "projects:\n  - slug: app1\n    name: App1\n    path: app1\n",
+        encoding="utf-8",
+    )
+    reduced_manager = ProjectThreadManager(
+        load_project_registry(reduced_file, approved),
+        repo,
+        sync_action_interval_seconds=0.0,
+    )
+
+    # Both cleanup calls fail transiently (e.g. Telegram 500).
+    bot.delete_forum_topic = AsyncMock(side_effect=TelegramError("delete boom"))
+    bot.close_forum_topic = AsyncMock(side_effect=TelegramError("close boom"))
+
+    result = await reduced_manager.sync_topics(bot, chat_id=-100777)
+
+    assert result.failed == 1
+    assert result.deactivated == 0
+    assert result.closed == 0
+    app2 = [
+        m
+        for m in await repo.list_by_chat(-100777, active_only=False)
+        if m.project_slug == "app2"
+    ]
+    assert app2[0].is_active is True
+
+    # Next run, Telegram is healthy again -> the orphan is finally retired.
+    bot.delete_forum_topic = AsyncMock()
+    retry = await reduced_manager.sync_topics(bot, chat_id=-100777)
+
+    assert retry.closed == 1
+    assert retry.deactivated == 1
+    app2 = [
+        m
+        for m in await repo.list_by_chat(-100777, active_only=False)
+        if m.project_slug == "app2"
+    ]
+    assert app2[0].is_active is False

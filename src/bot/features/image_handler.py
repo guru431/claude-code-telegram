@@ -1,11 +1,11 @@
 """
 Handle image uploads for UI/screenshot analysis
 
-Features:
-- OCR for text extraction
-- UI element detection
-- Image description
-- Diagram analysis
+The analysis prompt is chosen from the caption the user sent with the photo
+(see :meth:`ImageHandler._detect_image_type`): "here is the architecture
+diagram" gets a diagram prompt, "review this mockup" gets a UI prompt, and
+anything else falls back to the screenshot prompt. Nothing is inferred from the
+pixels — an image-content classifier would be guesswork we cannot verify.
 """
 
 import base64
@@ -14,7 +14,16 @@ from typing import Any, Dict, Optional
 
 from telegram import PhotoSize
 
+from src.bot.utils.upload_limits import exceeds_upload_limit
 from src.config import Settings
+
+# Caption keywords selecting a non-default analysis prompt. Checked in order,
+# so an ambiguous caption resolves deterministically.
+_CAPTION_TYPE_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("diagram", ("diagram", "chart", "flowchart", "schema", "architecture", "uml")),
+    ("ui_mockup", ("mockup", "wireframe", "ui design", "figma", "layout")),
+    ("screenshot", ("screenshot", "screen shot", "screen capture")),
+)
 
 
 @dataclass
@@ -40,8 +49,22 @@ class ImageHandler:
     ) -> ProcessedImage:
         """Process uploaded image"""
 
+        # Reject an oversized photo from its metadata *before* pulling the bytes
+        # into memory. Telegram's file_size is optional and understatable, so
+        # this is only a cheap first pass — validate_image re-checks the real
+        # byte length after the download.
+        max_bytes = self.config.max_file_upload_size_bytes
+        if exceeds_upload_limit(getattr(photo, "file_size", None), max_bytes):
+            raise ValueError(
+                f"Image too large (max {self.config.max_file_upload_size_mb}MB)"
+            )
+
         # Download image
         file = await photo.get_file()
+        if exceeds_upload_limit(getattr(file, "file_size", None), max_bytes):
+            raise ValueError(
+                f"Image too large (max {self.config.max_file_upload_size_mb}MB)"
+            )
         image_bytes = await file.download_as_bytearray()
 
         # Validate size and format before processing
@@ -50,7 +73,7 @@ class ImageHandler:
             raise ValueError(error or "Invalid image")
 
         # Detect image type
-        image_type = self._detect_image_type(image_bytes)
+        image_type = self._detect_image_type(caption)
 
         # Create appropriate prompt
         if image_type == "screenshot":
@@ -75,12 +98,18 @@ class ImageHandler:
             },
         )
 
-    def _detect_image_type(self, image_bytes: bytes) -> str:
-        """Detect type of image"""
-        # Simple heuristic based on image characteristics
-        # In practice, could use ML model for better detection
+    def _detect_image_type(self, caption: Optional[str]) -> str:
+        """Pick the analysis prompt from what the user said about the image.
 
-        # For now, return generic type
+        The caption is the only signal we can actually check; classifying the
+        pixels would need a model we do not run here. Without a matching
+        keyword the screenshot prompt is used — screenshots are by far the most
+        common upload and its questions fit an arbitrary image well enough.
+        """
+        text = (caption or "").casefold()
+        for image_type, keywords in _CAPTION_TYPE_KEYWORDS:
+            if any(keyword in text for keyword in keywords):
+                return image_type
         return "screenshot"
 
     def _detect_format(self, image_bytes: bytes) -> str:
@@ -168,10 +197,14 @@ class ImageHandler:
 
     async def validate_image(self, image_bytes: bytes) -> tuple[bool, Optional[str]]:
         """Validate image data"""
-        # Check size
-        max_size = 10 * 1024 * 1024  # 10MB
+        # Check the real byte count against the one configured upload limit
+        # (MAX_FILE_UPLOAD_SIZE_MB), not a second hard-coded 10MB rule.
+        max_size = self.config.max_file_upload_size_bytes
         if len(image_bytes) > max_size:
-            return False, "Image too large (max 10MB)"
+            return (
+                False,
+                f"Image too large (max {self.config.max_file_upload_size_mb}MB)",
+            )
 
         # Check format
         format_type = self._detect_format(image_bytes)

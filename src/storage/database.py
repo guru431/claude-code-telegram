@@ -206,20 +206,26 @@ class DatabaseManager:
             current_version = await self._get_schema_version(conn)
             logger.info("Current schema version", version=current_version)
 
-            # Run migrations. Commit the version bump immediately after each
-            # migration's DDL: executescript() implicitly COMMITs the DDL, so a
-            # crash before a trailing commit would persist the schema change
-            # but not the version row. On the next start migration 1
-            # (INITIAL_SCHEMA, bare CREATE TABLE) would rerun and fail with
-            # "table users already exists". One commit per migration keeps the
-            # DDL and its version row atomic relative to later migrations.
+            # Run migrations. executescript() performs NO implicit transaction
+            # control of its own, so each migration's DDL and its schema_version
+            # row are wrapped in one explicit transaction here: either both land
+            # or neither does. Committing them separately is not atomic — the
+            # DDL commits on its own and a crash before the version row leaves
+            # migration 1 (INITIAL_SCHEMA, bare CREATE TABLE) to rerun on the
+            # next start and fail with "table users already exists".
+            # Consequence for migration scripts: they must NOT contain their own
+            # BEGIN/COMMIT (it would nest) and must not run statements that
+            # cannot execute inside a transaction (e.g. PRAGMA journal_mode).
             migrations = self._get_migrations()
             for version, migration in migrations:
                 if version > current_version:
                     logger.info("Running migration", version=version)
-                    await conn.executescript(migration)
-                    await self._set_schema_version(conn, version)
-                    await conn.commit()
+                    await conn.executescript(
+                        "BEGIN;\n"
+                        f"{migration}\n"
+                        f"INSERT INTO schema_version (version) VALUES ({version});\n"
+                        "COMMIT;"
+                    )
 
     async def _get_schema_version(self, conn: aiosqlite.Connection) -> int:
         """Get current schema version."""
@@ -232,12 +238,6 @@ class DatabaseManager:
         cursor = await conn.execute("SELECT MAX(version) FROM schema_version")
         row = await cursor.fetchone()
         return row[0] if row and row[0] else 0
-
-    async def _set_schema_version(self, conn: aiosqlite.Connection, version: int):
-        """Set schema version."""
-        await conn.execute(
-            "INSERT INTO schema_version (version) VALUES (?)", (version,)
-        )
 
     def _get_migrations(self) -> List[Tuple[int, str]]:
         """Get migration scripts."""
@@ -405,18 +405,15 @@ class DatabaseManager:
                 --
                 -- SQLite has no DROP CONSTRAINT, so the table is rebuilt
                 -- (new -> copy -> drop -> rename). ``audit_log`` has no children
-                -- referencing it, so no other table needs fixing up. The
-                -- explicit transaction makes the rebuild atomic; DROP ... IF
-                -- EXISTS keeps the script re-runnable if a previous attempt died
-                -- before the version row was committed.
+                -- referencing it, so no other table needs fixing up. The rebuild
+                -- is atomic because _run_migrations wraps every migration in one
+                -- transaction; DROP ... IF EXISTS keeps the script re-runnable.
                 --
                 -- Rollback: recreate audit_log with
                 -- "FOREIGN KEY (user_id) REFERENCES users(user_id)" using the
                 -- same rebuild dance and delete the version-8 row from
                 -- schema_version. Rows whose user_id has no users entry must be
                 -- purged first or the copy will fail.
-                BEGIN;
-
                 DROP TABLE IF EXISTS audit_log_new;
 
                 CREATE TABLE audit_log_new (
@@ -446,8 +443,6 @@ class DatabaseManager:
                     ON audit_log(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_audit_log_ts_expr
                     ON audit_log(datetime(timestamp));
-
-                COMMIT;
                 """,
             ),
             (

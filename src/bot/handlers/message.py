@@ -19,7 +19,9 @@ from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.rate_limiter import RateLimiter
 from ...security.validators import SecurityValidator
+from ..features.file_handler import FileTooLargeError
 from ..middleware.rate_limit import estimate_message_cost
+from ..utils.claude_run import persist_interaction
 from ..utils.html_format import escape_html
 from ..utils.image_extractor import (
     ImageAttachment,
@@ -468,17 +470,7 @@ async def handle_text_message(
             )
 
             # Log interaction to storage
-            if storage:
-                try:
-                    await storage.save_claude_interaction(
-                        user_id=user_id,
-                        session_id=claude_response.session_id,
-                        prompt=message_text,
-                        response=claude_response,
-                        ip_address=None,  # Telegram doesn't provide IP
-                    )
-                except Exception as e:
-                    logger.warning("Failed to log interaction to storage", error=str(e))
+            await persist_interaction(storage, user_id, message_text, claude_response)
 
             # Format response
             from ..utils.formatting import ResponseFormatter
@@ -832,6 +824,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     parse_mode="HTML",
                 )
 
+            except FileTooLargeError as e:
+                # Falling back would download the same over-limit file again.
+                await progress_msg.edit_text(
+                    f"❌ <b>File Too Large</b>\n\n{escape_html(str(e))}",
+                    parse_mode="HTML",
+                )
+                return
             except Exception as e:
                 logger.warning(
                     "Enhanced file handler failed, falling back to basic handler",
@@ -948,6 +947,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             # nothing usable and is not charged.
             if not claude_response.is_error:
                 actual_cost = claude_response.cost
+
+            # Same central persistence as the text path: without it the upload's
+            # message pair, tool usage and cost row never reach storage.
+            await persist_interaction(
+                context.bot_data.get("storage"), user_id, prompt, claude_response
+            )
 
             # Check if Claude changed the working directory and update our tracking
             _update_working_directory_from_claude_response(
@@ -1114,6 +1119,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 if not claude_response.is_error:
                     actual_cost = claude_response.cost
 
+                # Same central persistence as the text path.
+                await persist_interaction(
+                    context.bot_data.get("storage"),
+                    user_id,
+                    processed_image.prompt,
+                    claude_response,
+                )
+
                 # Check if Claude changed the working directory and update tracking
                 _update_working_directory_from_claude_response(
                     claude_response, context, settings, user_id
@@ -1258,6 +1271,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             # nothing usable and is not charged.
             if not claude_response.is_error:
                 actual_cost = claude_response.cost
+
+            # Same central persistence as the text path.
+            await persist_interaction(
+                context.bot_data.get("storage"),
+                user_id,
+                processed_voice.prompt,
+                claude_response,
+            )
 
             _update_working_directory_from_claude_response(
                 claude_response, context, settings, user_id

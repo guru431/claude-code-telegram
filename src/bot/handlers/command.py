@@ -18,7 +18,10 @@ from ...projects import PrivateTopicsUnavailableError, load_project_registry
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
 from ...storage.models import SessionModel
+from ..middleware.rate_limit import estimate_message_cost
+from ..utils.claude_run import run_claude_for_user
 from ..utils.html_format import escape_html
+from ..utils.session_control import terminate_user_session
 
 logger = structlog.get_logger()
 
@@ -160,51 +163,52 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
+FULL_HELP_TEXT = (
+    "🤖 <b>Claude Code Telegram Bot Help</b>\n\n"
+    "<b>Navigation Commands:</b>\n"
+    "• <code>/ls</code> - List files and directories\n"
+    "• <code>/cd &lt;directory&gt;</code> - Change to directory\n"
+    "• <code>/pwd</code> - Show current directory\n"
+    "• <code>/projects</code> - Show available projects\n\n"
+    "<b>Session Commands:</b>\n"
+    "• <code>/new</code> - Clear context and start a fresh session\n"
+    "• <code>/continue [message]</code> - Explicitly continue last session\n"
+    "• <code>/end</code> - End current session and clear context\n"
+    "• <code>/status</code> - Show session and usage status\n"
+    "• <code>/export</code> - Export session history\n"
+    "• <code>/actions</code> - Show context-aware quick actions\n"
+    "• <code>/git</code> - Git repository information\n\n"
+    "<b>Session Behavior:</b>\n"
+    "• Sessions are automatically maintained per project directory\n"
+    "• Switching directories with <code>/cd</code> resumes the session for that project\n"
+    "• Use <code>/new</code> or <code>/end</code> to explicitly clear session context\n"
+    "• Sessions persist across bot restarts\n\n"
+    "<b>Usage Examples:</b>\n"
+    "• <code>cd myproject</code> - Enter project directory\n"
+    "• <code>ls</code> - See what's in current directory\n"
+    "• <code>Create a simple Python script</code> - Ask Claude to code\n"
+    "• Send a file to have Claude review it\n\n"
+    "<b>File Operations:</b>\n"
+    "• Send text files (.py, .js, .md, etc.) for review\n"
+    "• Claude can read, modify, and create files\n"
+    "• All file operations are within your approved directory\n\n"
+    "<b>Security Features:</b>\n"
+    "• 🔒 Path traversal protection\n"
+    "• ⏱️ Rate limiting to prevent abuse\n"
+    "• 📊 Usage tracking and limits\n"
+    "• 🛡️ Input validation and sanitization\n\n"
+    "<b>Tips:</b>\n"
+    "• Use specific, clear requests for best results\n"
+    "• Check <code>/status</code> to monitor your usage\n"
+    "• Use quick action buttons when available\n"
+    "• File uploads are automatically processed by Claude\n\n"
+    "Need more help? Contact your administrator."
+)
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /help command."""
-    help_text = (
-        "🤖 <b>Claude Code Telegram Bot Help</b>\n\n"
-        "<b>Navigation Commands:</b>\n"
-        "• <code>/ls</code> - List files and directories\n"
-        "• <code>/cd &lt;directory&gt;</code> - Change to directory\n"
-        "• <code>/pwd</code> - Show current directory\n"
-        "• <code>/projects</code> - Show available projects\n\n"
-        "<b>Session Commands:</b>\n"
-        "• <code>/new</code> - Clear context and start a fresh session\n"
-        "• <code>/continue [message]</code> - Explicitly continue last session\n"
-        "• <code>/end</code> - End current session and clear context\n"
-        "• <code>/status</code> - Show session and usage status\n"
-        "• <code>/export</code> - Export session history\n"
-        "• <code>/actions</code> - Show context-aware quick actions\n"
-        "• <code>/git</code> - Git repository information\n\n"
-        "<b>Session Behavior:</b>\n"
-        "• Sessions are automatically maintained per project directory\n"
-        "• Switching directories with <code>/cd</code> resumes the session for that project\n"
-        "• Use <code>/new</code> or <code>/end</code> to explicitly clear session context\n"
-        "• Sessions persist across bot restarts\n\n"
-        "<b>Usage Examples:</b>\n"
-        "• <code>cd myproject</code> - Enter project directory\n"
-        "• <code>ls</code> - See what's in current directory\n"
-        "• <code>Create a simple Python script</code> - Ask Claude to code\n"
-        "• Send a file to have Claude review it\n\n"
-        "<b>File Operations:</b>\n"
-        "• Send text files (.py, .js, .md, etc.) for review\n"
-        "• Claude can read, modify, and create files\n"
-        "• All file operations are within your approved directory\n\n"
-        "<b>Security Features:</b>\n"
-        "• 🔒 Path traversal protection\n"
-        "• ⏱️ Rate limiting to prevent abuse\n"
-        "• 📊 Usage tracking and limits\n"
-        "• 🛡️ Input validation and sanitization\n\n"
-        "<b>Tips:</b>\n"
-        "• Use specific, clear requests for best results\n"
-        "• Check <code>/status</code> to monitor your usage\n"
-        "• Use quick action buttons when available\n"
-        "• File uploads are automatically processed by Claude\n\n"
-        "Need more help? Contact your administrator."
-    )
-
-    await update.message.reply_text(help_text, parse_mode="HTML")
+    await update.message.reply_text(FULL_HELP_TEXT, parse_mode="HTML")
 
 
 async def sync_threads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -365,6 +369,8 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     settings: Settings = context.bot_data["settings"]
     claude_integration: ClaudeIntegration = context.bot_data.get("claude_integration")
     audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    rate_limiter = context.bot_data.get("rate_limiter")
+    storage = context.bot_data.get("storage")
 
     # Parse optional prompt from command arguments
     # If no prompt provided, use a default to continue the conversation
@@ -385,6 +391,7 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # Check if there's an existing session in user context
         claude_session_id = context.user_data.get("claude_session_id")
+        effective_prompt = prompt or default_prompt
 
         if claude_session_id:
             # We have a session in context, continue it directly
@@ -398,12 +405,14 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
             # Continue with the existing session
             # Use default prompt if none provided (Claude CLI requires a prompt)
-            claude_response = await claude_integration.run_command(
-                prompt=prompt or default_prompt,
-                working_directory=current_dir,
-                user_id=user_id,
-                session_id=claude_session_id,
-            )
+            async def _run():
+                return await claude_integration.run_command(
+                    prompt=effective_prompt,
+                    working_directory=current_dir,
+                    user_id=user_id,
+                    session_id=claude_session_id,
+                )
+
         else:
             # No session in context, try to find the most recent session
             status_msg = await update.message.reply_text(
@@ -413,11 +422,28 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
 
             # Use default prompt if none provided
-            claude_response = await claude_integration.continue_session(
-                user_id=user_id,
-                working_directory=current_dir,
-                prompt=prompt or default_prompt,
+            async def _run():
+                return await claude_integration.continue_session(
+                    user_id=user_id,
+                    working_directory=current_dir,
+                    prompt=effective_prompt,
+                )
+
+        # Route through the shared runner so this entry point holds budget and
+        # persists the interaction like the plain-message path does.
+        claude_response, budget_error = await run_claude_for_user(
+            run=_run,
+            prompt=effective_prompt,
+            user_id=user_id,
+            rate_limiter=rate_limiter,
+            storage=storage,
+            estimated_cost=estimate_message_cost(update),
+        )
+        if budget_error:
+            await status_msg.edit_text(
+                f"⏱️ {escape_html(budget_error)}", parse_mode="HTML"
             )
+            return
 
         if claude_response:
             # Update session ID in context
@@ -1054,12 +1080,10 @@ async def end_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
     relative_path = current_dir.relative_to(settings.approved_directory)
 
-    # Clear session data and force a fresh start so the next message does not
-    # auto-resume the just-ended session.
-    context.user_data["claude_session_id"] = None
-    context.user_data["session_started"] = False
-    context.user_data["last_message"] = None
-    context.user_data["force_new_session"] = True
+    # Deactivate the persisted session and clear the Telegram context, so the
+    # next message does not auto-resume the just-ended session and /sessions
+    # stops listing it as active.
+    await terminate_user_session(context, user_id)
 
     # Create quick action buttons
     keyboard = [

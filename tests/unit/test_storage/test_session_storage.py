@@ -74,3 +74,52 @@ class TestSoftDeletedSessions:
         assert (
             await session_storage.load_session("sqlite-session", user_id=555001)
         ) is None
+
+
+class TestUserSessionCounter:
+    """users.session_count must track the production session-write path.
+
+    Regression: only Storage.create_session incremented the counter, and nothing
+    in the running bot calls it — SessionManager persists through
+    SQLiteSessionStorage.save_session, which never touched it. Every deployment
+    reported session_count = 0 no matter how many sessions existed.
+    """
+
+    async def _session_count(self, session_storage, user_id: int) -> int:
+        async with session_storage.db_manager.get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT session_count FROM users WHERE user_id = ?", (user_id,)
+            )
+            row = await cursor.fetchone()
+            return row[0]
+
+    async def test_new_session_increments_counter(
+        self, session_storage, sample_session
+    ):
+        await session_storage.save_session(sample_session)
+
+        assert await self._session_count(session_storage, 555001) == 1
+
+    async def test_resaving_the_same_session_does_not_increment(
+        self, session_storage, sample_session
+    ):
+        await session_storage.save_session(sample_session)
+        sample_session.message_count = 5
+        await session_storage.save_session(sample_session)
+
+        assert await self._session_count(session_storage, 555001) == 1
+
+    async def test_each_distinct_session_counts_once(
+        self, session_storage, sample_session
+    ):
+        await session_storage.save_session(sample_session)
+        second = ClaudeSession(
+            session_id="sqlite-session-2",
+            user_id=555001,
+            project_path=Path("/test/other"),
+            created_at=datetime.now(UTC),
+            last_used=datetime.now(UTC),
+        )
+        await session_storage.save_session(second)
+
+        assert await self._session_count(session_storage, 555001) == 2

@@ -345,3 +345,91 @@ class TestInitializeShutdown:
         processor = StopAwareUpdateProcessor()
         await processor.initialize()
         await processor.shutdown()
+
+
+class TestLockEviction:
+    """Eviction must not split one user across two locks.
+
+    Regression: eviction used Lock.locked(), which reads False in the gap
+    between the owner's release and the woken waiter's acquire. Dropping the
+    lock there let the next update for that user create a second one, so two
+    handlers for the same user ran concurrently.
+    """
+
+    async def test_lock_with_waiter_is_not_evicted(self):
+        processor = StopAwareUpdateProcessor()
+        processor._MAX_USER_LOCKS = 1
+
+        overlap: list[str] = []
+        first_holding = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def first():
+            overlap.append("first_start")
+            first_holding.set()
+            await release_first.wait()
+            overlap.append("first_end")
+
+        async def second():
+            overlap.append("second_start")
+            overlap.append("second_end")
+
+        update_a = _make_update(None, user_id=42)
+        update_b = _make_update(None, user_id=42)
+
+        task_a = asyncio.create_task(processor.do_process_update(update_a, first()))
+        await first_holding.wait()
+
+        # Queues on the same lock while the owner still holds it.
+        task_b = asyncio.create_task(processor.do_process_update(update_b, second()))
+        await asyncio.sleep(0)
+
+        # A third user id arrives at the cap and triggers eviction while user 42
+        # has both an owner and a waiter.
+        processor._evict_idle_locks()
+        assert 42 in processor._user_locks
+
+        release_first.set()
+        await asyncio.gather(task_a, task_b)
+
+        assert overlap == ["first_start", "first_end", "second_start", "second_end"]
+
+    async def test_idle_lock_is_evicted_after_release(self):
+        processor = StopAwareUpdateProcessor()
+
+        async def noop():
+            return None
+
+        await processor.do_process_update(_make_update(None, user_id=9), noop())
+        assert 9 in processor._user_locks
+
+        processor._evict_idle_locks()
+
+        assert processor._user_locks == {}
+        assert processor._lock_refs == {}
+
+    async def test_falls_back_to_shared_lock_when_cap_is_saturated(self):
+        processor = StopAwareUpdateProcessor()
+        processor._MAX_USER_LOCKS = 1
+
+        holding = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocker():
+            holding.set()
+            await release.wait()
+
+        task = asyncio.create_task(
+            processor.do_process_update(_make_update(None, user_id=1), blocker())
+        )
+        await holding.wait()
+
+        # User 1's lock is referenced, so eviction frees nothing and a new user
+        # must reuse the fallback lock rather than grow the map past the cap.
+        key, lock = processor._acquire_lock_slot(_make_update(None, user_id=2))
+        assert key is None
+        assert lock is processor._fallback_lock
+        assert len(processor._user_locks) == 1
+
+        release.set()
+        await task

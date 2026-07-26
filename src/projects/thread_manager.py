@@ -130,53 +130,70 @@ class ProjectThreadManager:
                 active_project_slugs=active_slugs,
             )
             for stale in stale_mappings:
+                await self._retire_stale_mapping(bot, stale, result)
+
+            return result
+
+    async def _retire_stale_mapping(
+        self,
+        bot: Bot,
+        stale: ProjectThreadModel,
+        result: TopicSyncResult,
+    ) -> None:
+        """Close a stale topic, then deactivate its mapping.
+
+        The mapping is deactivated ONLY once Telegram confirmed the topic is
+        gone (or was already gone). Deactivating it after a failed close would
+        retire the row for good — ``list_stale_active_mappings`` only returns
+        active rows — so a transient Telegram error would leave the orphaned
+        topic live forever, with nothing left to retry it. Leaving the mapping
+        active makes the next sync run pick it up again.
+        """
+        try:
+            await self._call_sync_api(
+                lambda: bot.delete_forum_topic(
+                    chat_id=stale.chat_id,
+                    message_thread_id=stale.message_thread_id,
+                ),
+            )
+        except TelegramError as e:
+            # Topic already deleted out of band: deletion succeeded in effect.
+            # Do not misread it as "topics disabled".
+            if self._is_topic_unusable_error(e):
+                pass
+            elif self._is_private_topics_unavailable_error(e):
+                raise PrivateTopicsUnavailableError(
+                    "Private chat topics are not enabled for this bot chat."
+                ) from e
+            else:
+                # Fall back to closing if delete is not supported
                 try:
                     await self._call_sync_api(
-                        lambda: bot.delete_forum_topic(
+                        lambda: bot.close_forum_topic(
                             chat_id=stale.chat_id,
                             message_thread_id=stale.message_thread_id,
                         ),
                     )
-                    result.closed += 1
-                except TelegramError as e:
-                    # Topic already deleted out of band: deletion succeeded in
-                    # effect. Count it and let the finally block deactivate the
-                    # mapping; do not misread it as "topics disabled".
-                    if self._is_topic_unusable_error(e):
-                        result.closed += 1
-                        continue
-                    if self._is_private_topics_unavailable_error(e):
-                        raise PrivateTopicsUnavailableError(
-                            "Private chat topics are not enabled for this bot chat."
-                        ) from e
-                    # Fall back to closing if delete is not supported
-                    try:
-                        await self._call_sync_api(
-                            lambda: bot.close_forum_topic(
-                                chat_id=stale.chat_id,
-                                message_thread_id=stale.message_thread_id,
-                            ),
-                        )
-                        result.closed += 1
-                    except TelegramError as close_error:
-                        result.failed += 1
-                        logger.warning(
-                            "Could not delete/close stale topic",
-                            chat_id=stale.chat_id,
-                            message_thread_id=stale.message_thread_id,
-                            project_slug=stale.project_slug,
-                            error=str(close_error),
-                            delete_error=str(e),
-                        )
-                finally:
-                    await self.repository.set_active(
+                except TelegramError as close_error:
+                    result.failed += 1
+                    logger.warning(
+                        "Could not delete/close stale topic; "
+                        "mapping stays active for the next sync to retry",
                         chat_id=stale.chat_id,
+                        message_thread_id=stale.message_thread_id,
                         project_slug=stale.project_slug,
-                        is_active=False,
+                        error=str(close_error),
+                        delete_error=str(e),
                     )
-                    result.deactivated += 1
+                    return
 
-            return result
+        result.closed += 1
+        await self.repository.set_active(
+            chat_id=stale.chat_id,
+            project_slug=stale.project_slug,
+            is_active=False,
+        )
+        result.deactivated += 1
 
     async def _call_sync_api(
         self,

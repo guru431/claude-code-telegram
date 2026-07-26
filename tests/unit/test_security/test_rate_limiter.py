@@ -512,3 +512,67 @@ class TestCostReservations:
         await rate_limiter.cleanup_inactive_users(timedelta(hours=24))
 
         assert other_id not in rate_limiter.reservations
+
+
+class TestDailyCostHydration:
+    """The daily budget must survive a process restart.
+
+    Regression: cost_tracker is in-memory only, so a restart handed every user a
+    fresh full daily budget while the real spend sat in the cost_tracking table.
+    """
+
+    async def test_spent_budget_is_loaded_on_first_use(self):
+        config = create_test_config(claude_max_cost_per_user=10.0)
+        calls = []
+
+        async def loader(user_id: int) -> float:
+            calls.append(user_id)
+            return 9.5
+
+        limiter = RateLimiter(config, daily_cost_loader=loader)
+
+        allowed, message = await limiter.check_rate_limit(1, cost=1.0)
+
+        assert allowed is False
+        assert "Cost limit exceeded" in message
+        assert calls == [1]
+
+    async def test_hydration_runs_once_per_user(self):
+        config = create_test_config(claude_max_cost_per_user=10.0)
+        calls = []
+
+        async def loader(user_id: int) -> float:
+            calls.append(user_id)
+            return 1.0
+
+        limiter = RateLimiter(config, daily_cost_loader=loader)
+
+        await limiter.check_rate_limit(1, cost=0.1)
+        reservation_id, error = await limiter.reserve_cost(1, 0.1)
+        await limiter.settle_reservation(reservation_id, 0.1)
+
+        assert error is None
+        # Settled costs are written to storage too; re-reading would double-count.
+        assert calls == [1]
+        assert limiter.cost_tracker[1] == pytest.approx(1.1)
+
+    async def test_loader_failure_does_not_block_requests(self):
+        config = create_test_config(claude_max_cost_per_user=10.0)
+
+        async def loader(user_id: int) -> float:
+            raise RuntimeError("db down")
+
+        limiter = RateLimiter(config, daily_cost_loader=loader)
+
+        allowed, _ = await limiter.check_rate_limit(1, cost=0.1)
+
+        assert allowed is True
+
+    async def test_no_loader_keeps_previous_behaviour(self):
+        config = create_test_config(claude_max_cost_per_user=10.0)
+        limiter = RateLimiter(config)
+
+        allowed, _ = await limiter.check_rate_limit(1, cost=0.1)
+
+        assert allowed is True
+        assert limiter.cost_tracker[1] == 0.0

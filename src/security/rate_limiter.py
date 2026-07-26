@@ -20,7 +20,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Set, Tuple
 
 import structlog
 
@@ -122,11 +122,21 @@ class RateLimiter:
     # Sweep it after this long so a leaked hold cannot block a user forever.
     RESERVATION_MAX_AGE = timedelta(hours=1)
 
-    def __init__(self, config: Settings):
+    def __init__(
+        self,
+        config: Settings,
+        daily_cost_loader: Optional[Callable[[int], Awaitable[float]]] = None,
+    ):
         self.config = config
         self.request_buckets: Dict[int, RateLimitBucket] = {}
         self.cost_tracker: Dict[int, float] = defaultdict(float)
         self.cost_reset_time: Dict[int, datetime] = {}
+        # Reads today's already-spent amount from persistent storage the first
+        # time a user touches the budget in this process. Without it a restart
+        # hands every user a full daily budget again, because cost_tracker is
+        # in-memory only while the real spend lives in SQLite.
+        self._daily_cost_loader = daily_cost_loader
+        self._hydrated_users: Set[int] = set()
         # Outstanding budget holds, keyed by reservation id, plus a per-user
         # index for reset/cleanup. A hold is created only by reserve_cost (a
         # real Claude run) and removed only by settle_reservation or the
@@ -163,6 +173,8 @@ class RateLimiter:
         ``settle_reservation``, which a real Claude run must use.
         """
         async with self.locks[user_id]:
+            await self._ensure_cost_hydrated(user_id)
+
             # Check request rate limit
             rate_allowed, rate_message = self._check_request_rate(user_id, tokens)
             if not rate_allowed:
@@ -211,6 +223,7 @@ class RateLimiter:
         amount = max(0.0, estimated_cost)
 
         async with self.locks[user_id]:
+            await self._ensure_cost_hydrated(user_id)
             self._maybe_reset_cost_tracker(user_id)
             self._sweep_stale_reservations(user_id)
 
@@ -287,6 +300,43 @@ class RateLimiter:
                 actual_cost=actual_cost,
                 total_usage=self.cost_tracker[user_id],
             )
+
+    async def _ensure_cost_hydrated(self, user_id: int) -> None:
+        """Seed this user's daily tracker from storage, once per process.
+
+        Caller must hold ``self.locks[user_id]``. Runs exactly once per user:
+        every cost settled afterwards is added both to the in-memory tracker and
+        to ``cost_tracking``, so re-reading storage later would double-count.
+        A loader failure is not retried for the same reason — a retry could land
+        after some spend had already accumulated in memory.
+        """
+        if self._daily_cost_loader is None or user_id in self._hydrated_users:
+            return
+
+        self._hydrated_users.add(user_id)
+        try:
+            already_spent = await self._daily_cost_loader(user_id)
+        except Exception as e:
+            logger.warning(
+                "Failed to hydrate daily cost from storage",
+                user_id=user_id,
+                error=str(e),
+            )
+            return
+
+        if already_spent <= 0:
+            return
+
+        # Run the (first, always-due) reset before seeding so it cannot wipe
+        # the value we just loaded, then anchor the window to now.
+        self._maybe_reset_cost_tracker(user_id)
+        self.cost_tracker[user_id] += already_spent
+        self.cost_reset_time[user_id] = datetime.now(UTC)
+        logger.info(
+            "Hydrated daily cost from storage",
+            user_id=user_id,
+            already_spent=already_spent,
+        )
 
     def _sweep_stale_reservations(self, user_id: int) -> None:
         """Release this user's holds that were never settled (caller bug)."""
@@ -540,6 +590,9 @@ class RateLimiter:
             self.cost_reset_time.pop(user_id, None)
             self._drop_user_reservations(user_id)
             self.locks.pop(user_id, None)
+            # Forget the hydration marker too: the tracker this user's spend
+            # lived in is gone, so a later request must re-read it from storage.
+            self._hydrated_users.discard(user_id)
 
         if inactive_users:
             logger.info(

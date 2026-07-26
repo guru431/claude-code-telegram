@@ -92,6 +92,19 @@ class SQLiteSessionStorage(SessionStorage):
             # upsert so a failed upsert cannot leave a committed orphan user.
             await self._ensure_user_exists(conn, session.user_id)
 
+            # Does this session already have a row? The upsert below reports
+            # rowcount 1 for both insert and update, so ownership of
+            # users.session_count needs the answer up front. This is the
+            # production write path for sessions (SessionManager -> here), and
+            # it never bumped the counter — only Storage.create_session did,
+            # which nothing in the running bot calls. The result was
+            # sessions=N / users.session_count=0 in every deployment.
+            cursor = await conn.execute(
+                "SELECT 1 FROM sessions WHERE session_id = ?",
+                (session_model.session_id,),
+            )
+            is_new_row = await cursor.fetchone() is None
+
             # Single race-safe upsert: avoids the UPDATE-then-INSERT PK race of
             # two separate pooled connections, and restores is_active=TRUE so a
             # session marked inactive by cleanup/eviction becomes visible to
@@ -121,6 +134,18 @@ class SQLiteSessionStorage(SessionStorage):
                     session_model.message_count,
                 ),
             )
+
+            if is_new_row:
+                # Same transaction as the INSERT: two separate commits can
+                # desync the counter if the process dies in between. Only the
+                # session_count column is touched, so this cannot clobber a
+                # concurrent increment_stats (which owns total_cost/
+                # message_count).
+                await conn.execute(
+                    "UPDATE users SET session_count = session_count + 1 "
+                    "WHERE user_id = ?",
+                    (session_model.user_id,),
+                )
 
             await conn.commit()
 

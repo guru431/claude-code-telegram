@@ -37,7 +37,9 @@ from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
 from ..security.secret_patterns import redact_secrets
+from .features.file_handler import FileTooLargeError
 from .middleware.rate_limit import estimate_message_cost
+from .utils.claude_run import persist_interaction
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
 from .utils.html_format import escape_html
 from .utils.image_extractor import (
@@ -1354,20 +1356,12 @@ class MessageOrchestrator:
                             )
 
                             # Store interaction
-                            storage = context.bot_data.get("storage")
-                            if storage:
-                                try:
-                                    await storage.save_claude_interaction(
-                                        user_id=user_id,
-                                        session_id=claude_response.session_id,
-                                        prompt=message_text,
-                                        response=claude_response,
-                                        ip_address=None,
-                                    )
-                                except Exception as e:
-                                    logger.warning(
-                                        "Failed to log interaction", error=str(e)
-                                    )
+                            await persist_interaction(
+                                context.bot_data.get("storage"),
+                                user_id,
+                                message_text,
+                                claude_response,
+                            )
 
                             # Format response (no reply_markup — strip keyboards)
                             from .utils.formatting import ResponseFormatter
@@ -1500,6 +1494,10 @@ class MessageOrchestrator:
                     update.message.caption or "Please review this file:",
                 )
                 prompt = processed_file.prompt
+            except FileTooLargeError as e:
+                # Falling back would download the same over-limit file again.
+                await progress_msg.edit_text(str(e))
+                return
             except Exception as e:
                 logger.warning(
                     "Enhanced file handler failed, falling back to basic",
@@ -1771,6 +1769,15 @@ class MessageOrchestrator:
                     # not charged; it settles at 0.0 below.
                     if not claude_response.is_error:
                         media_cost = claude_response.cost
+                    # Same central persistence as the agentic text path: without
+                    # it a media run is missing from history, cost reporting and
+                    # the audit trail.
+                    await persist_interaction(
+                        context.bot_data.get("storage"),
+                        user_id,
+                        prompt,
+                        claude_response,
+                    )
                 except Exception:
                     # Clear the dead "Working..." progress message (with its
                     # now-useless Stop button) before the caller reports the

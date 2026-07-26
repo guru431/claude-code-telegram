@@ -1,10 +1,16 @@
 """Tests for YAML project registry loading."""
 
+import os
+import sys
 from pathlib import Path
 
 import pytest
 
-from src.projects.registry import load_project_registry, parse_enabled
+from src.projects.registry import (
+    canonical_path_key,
+    load_project_registry,
+    parse_enabled,
+)
 
 
 class TestParseEnabled:
@@ -124,3 +130,35 @@ def test_load_project_registry_rejects_outside_approved_dir(tmp_path: Path) -> N
         load_project_registry(config_file, approved)
 
     assert "outside approved directory" in str(exc_info.value)
+
+
+class TestCanonicalPathKey:
+    """Case folding is only correct on case-insensitive filesystems.
+
+    Regression: the key was unconditionally casefolded, so on Linux the two
+    distinct directories ``Foo`` and ``foo`` collapsed onto one key — discovery
+    silently skipped one and the registry rejected the pair as a duplicate path.
+    """
+
+    def test_identical_paths_share_a_key(self):
+        assert canonical_path_key("/srv/projects/app") == canonical_path_key(
+            "/srv/projects/app"
+        )
+
+    @pytest.mark.skipif(
+        os.name == "nt" or sys.platform == "darwin",
+        reason="case-insensitive filesystem: Foo and foo really are one directory",
+    )
+    def test_case_differing_paths_are_distinct_on_case_sensitive_fs(self):
+        assert canonical_path_key("/srv/projects/Foo") != canonical_path_key(
+            "/srv/projects/foo"
+        )
+
+    @pytest.mark.skipif(
+        os.name != "nt" and sys.platform != "darwin",
+        reason="case-sensitive filesystem",
+    )
+    def test_case_differing_paths_collide_on_case_insensitive_fs(self):
+        assert canonical_path_key(r"C:\projects\Foo") == canonical_path_key(
+            r"C:\projects\foo"
+        )

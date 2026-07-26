@@ -1,8 +1,10 @@
 """YAML-backed project registry for thread mode."""
 
+import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import structlog
 import yaml
@@ -11,6 +13,25 @@ logger = structlog.get_logger()
 
 _TRUE_VALUES = frozenset({"true", "yes", "y", "on", "1"})
 _FALSE_VALUES = frozenset({"false", "no", "n", "off", "0"})
+
+# Whether the platform's filesystem treats 'Foo' and 'foo' as the same
+# directory. Only there may a path key be case-folded: on a case-sensitive
+# filesystem 'Foo' and 'foo' are two valid, distinct project directories, and
+# folding them onto one key makes discovery silently skip one of them and the
+# registry reject the pair as a duplicate path.
+_CASE_INSENSITIVE_FS = os.name == "nt" or sys.platform == "darwin"
+
+
+def canonical_path_key(path: Union[str, Path]) -> str:
+    """Return the identity key for a filesystem path.
+
+    Single source of truth for "are these two paths the same directory",
+    shared by the registry's duplicate check and discovery's dedupe so both
+    writers of projects.yaml agree. Case is folded only on case-insensitive
+    platforms (see :data:`_CASE_INSENSITIVE_FS`).
+    """
+    text = os.path.normcase(os.fspath(path))
+    return text.casefold() if _CASE_INSENSITIVE_FS else text
 
 
 def parse_enabled(value: object, context: str) -> bool:
@@ -134,9 +155,7 @@ def load_project_registry(
             )
             continue
 
-        # Casefold: Windows paths are case-insensitive, so 'Foo' and 'foo' are
-        # the same directory and must collide here rather than register twice.
-        abs_path_key = str(absolute_path).casefold()
+        abs_path_key = canonical_path_key(absolute_path)
         if slug in seen_slugs:
             raise ValueError(f"Duplicate project slug: {slug}")
         if name in seen_names:

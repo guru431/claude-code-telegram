@@ -6,13 +6,33 @@
 # a password, use SYSTEM principal or a gMSA. The current script registers
 # under the calling user account and prompts for the password interactively,
 # so the secret never appears in plain text inside the script source.
+#
+# -ProjectRoot overrides the auto-detected repository checkout.
+# -DryRun prints the action that would be registered and exits without
+# prompting for credentials or touching Task Scheduler.
+param(
+    [string]$ProjectRoot,
+    [switch]$DryRun
+)
 
 $t_name  = 'claude-code-telegram'
 $t_dir   = '\'
 
-# Use the script's own directory as working dir (avoids hard-coded UNC).
-$t_work  = $PSScriptRoot
-if (-not $t_work) { $t_work = (Get-Location).Path }
+# Project root = the repository checkout, i.e. the PARENT of this examples/
+# directory (.venv and src/ live there, not next to this script). Using
+# $PSScriptRoot directly pointed the task at examples\ and every run failed
+# with "Virtualenv not found".
+$t_work = $ProjectRoot
+if (-not $t_work) {
+    if ($PSScriptRoot) { $t_work = Split-Path -Parent $PSScriptRoot }
+    else { $t_work = (Get-Location).Path }
+}
+
+if (-not (Test-Path (Join-Path $t_work 'pyproject.toml')) -or
+    -not (Test-Path (Join-Path $t_work 'src'))) {
+    Write-Error "Not a project root: $t_work (expected pyproject.toml and src\). Pass -ProjectRoot <path>."
+    exit 1
+}
 
 if (-not (Test-Path "$t_work\.venv\Scripts\python.exe")) {
     Write-Error "Virtualenv not found at $t_work\.venv. Run 'poetry install' first."
@@ -25,6 +45,15 @@ $t_arg = "/c set CLAUDECODE= && pushd `"$t_work`" && .venv\Scripts\python.exe -m
 $action   = New-ScheduledTaskAction -Execute $t_exe -Argument $t_arg -WorkingDirectory $t_work
 $trigger  = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit 0 -DisallowHardTerminate -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+
+if ($DryRun) {
+    Write-Host "Project root : $t_work"
+    Write-Host "Execute      : $t_exe"
+    Write-Host "Argument     : $t_arg"
+    Write-Host "Working dir  : $($action.WorkingDirectory)"
+    Write-Host "(dry run - nothing registered)"
+    exit 0
+}
 
 $userName = "$env:USERDOMAIN\$env:USERNAME"
 $cred = Get-Credential -Message "Password for scheduled task user $userName" -UserName $userName

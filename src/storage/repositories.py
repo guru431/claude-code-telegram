@@ -822,6 +822,24 @@ class CostTrackingRepository:
                 (user_id, date, cost, cost),
             )
 
+    async def get_daily_cost(self, user_id: int, date: Optional[str] = None) -> float:
+        """Return the cost already recorded for *user_id* on *date* (today by default).
+
+        Read by the rate limiter at startup: its in-memory daily tracker starts
+        empty on every process start, so without this the user gets a fresh full
+        daily budget after each restart even though the spend is on disk here.
+        """
+        if not date:
+            date = datetime.now(UTC).strftime("%Y-%m-%d")
+
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT daily_cost FROM cost_tracking WHERE user_id = ? AND date = ?",
+                (user_id, date),
+            )
+            row = await cursor.fetchone()
+            return float(row[0]) if row and row[0] else 0.0
+
     async def get_user_daily_costs(
         self, user_id: int, days: int = 30
     ) -> List[CostTrackingModel]:

@@ -12,6 +12,8 @@ from typing import Dict, Iterator, List, Optional, Set, Tuple
 import structlog
 import yaml
 
+from .registry import canonical_path_key
+
 logger = structlog.get_logger()
 
 # Directories to skip during discovery (common non-project dirs)
@@ -62,10 +64,11 @@ def path_dedupe_key(approved_root: Path, rel_path: str) -> Optional[str]:
     into projects.yaml, which then makes ``load_project_registry`` raise
     "Duplicate project path" and takes the bot down on the next startup.
 
-    Resolving and casefolding collapses all those spellings onto one key.
-    Casefold is required because Windows paths are case-insensitive and
-    ``Path.resolve()`` only restores the on-disk casing for paths that already
-    exist.
+    Resolving and normalizing collapses all those spellings onto one key via
+    the shared ``canonical_path_key``, which folds case only on case-insensitive
+    filesystems — ``Path.resolve()`` restores the on-disk casing only for paths
+    that already exist, and on Linux ``Foo`` and ``foo`` are genuinely two
+    different directories.
 
     Returns ``None`` for paths that must never be registered: absolute paths
     and anything resolving to (or outside of) ``approved_root``.
@@ -86,7 +89,7 @@ def path_dedupe_key(approved_root: Path, rel_path: str) -> Optional[str]:
     except ValueError:
         return None
 
-    return str(resolved).casefold()
+    return canonical_path_key(resolved)
 
 
 def iter_project_dirs(approved_root: Path) -> Iterator[Path]:
@@ -152,7 +155,7 @@ def discover_new_projects(
 
     existing_projects: List[Dict[str, str]] = data.get("projects", [])
 
-    # Collect existing paths (resolved + casefolded) to avoid duplicates. The
+    # Collect existing paths (canonical keys) to avoid duplicates. The
     # registry dedupes by resolved absolute path, so discovery must use the same
     # notion of identity or it will append an entry that breaks the next load.
     existing_paths: Set[str] = set()

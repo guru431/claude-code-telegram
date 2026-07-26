@@ -216,7 +216,10 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         config.approved_directory,
         disable_security_patterns=config.disable_security_patterns,
     )
-    rate_limiter = RateLimiter(config)
+    # The daily cost budget must survive a restart: the limiter keeps its
+    # tracker in memory, so it seeds each user's already-spent amount from the
+    # persisted cost_tracking table on first use.
+    rate_limiter = RateLimiter(config, daily_cost_loader=storage.costs.get_daily_cost)
 
     # Create audit storage and logger — persist the security forensic trail
     # (auth attempts, violations, /restart, file access, rate-limit breaches)

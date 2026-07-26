@@ -62,6 +62,10 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
         # One lock per user id so distinct users run concurrently; a single
         # fallback lock serializes updates that carry no effective_user.
         self._user_locks: dict[int, asyncio.Lock] = {}
+        # In-flight updates per user id, counted across the whole
+        # acquire/release window. Eviction consults this instead of
+        # Lock.locked() — see _evict_idle_locks.
+        self._lock_refs: dict[int, int] = {}
         self._fallback_lock = asyncio.Lock()
 
     @classmethod
@@ -87,13 +91,19 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
             await coroutine
         else:
             # One at a time per user; distinct users run concurrently.
-            async with self._lock_for(update):
-                await coroutine
+            user_key, lock = self._acquire_lock_slot(update)
+            try:
+                async with lock:
+                    await coroutine
+            finally:
+                self._release_lock_slot(user_key)
 
-    def _lock_for(self, update: object) -> asyncio.Lock:
-        """Return the serialization lock for this update's user.
+    def _acquire_lock_slot(self, update: object) -> tuple[Optional[int], asyncio.Lock]:
+        """Return ``(user_key, lock)`` and register an in-flight reference.
 
-        Updates without an effective_user share a single fallback lock.
+        The reference must be dropped with :meth:`_release_lock_slot` once the
+        update is done with the lock. Updates without an effective_user share a
+        single fallback lock and register no reference (``user_key`` is None).
         """
         if isinstance(update, Update) and update.effective_user:
             user_id = update.effective_user.id
@@ -101,25 +111,41 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
             if lock is None:
                 if len(self._user_locks) >= self._MAX_USER_LOCKS:
                     self._evict_idle_locks()
-                    # If every tracked lock is currently held, eviction freed
-                    # nothing; fall back to the shared lock rather than grow the
-                    # map past the cap. This hard-bounds _user_locks at
+                    # If every tracked lock is currently referenced, eviction
+                    # freed nothing; fall back to the shared lock rather than
+                    # grow the map past the cap. This hard-bounds _user_locks at
                     # _MAX_USER_LOCKS even under flood.
                     if len(self._user_locks) >= self._MAX_USER_LOCKS:
-                        return self._fallback_lock
+                        return None, self._fallback_lock
                 lock = asyncio.Lock()
                 self._user_locks[user_id] = lock
-            return lock
-        return self._fallback_lock
+            self._lock_refs[user_id] = self._lock_refs.get(user_id, 0) + 1
+            return user_id, lock
+        return None, self._fallback_lock
+
+    def _release_lock_slot(self, user_key: Optional[int]) -> None:
+        """Drop this update's reference to its per-user lock."""
+        if user_key is None:
+            return
+        remaining = self._lock_refs.get(user_key, 0) - 1
+        if remaining > 0:
+            self._lock_refs[user_key] = remaining
+        else:
+            self._lock_refs.pop(user_key, None)
 
     def _evict_idle_locks(self) -> None:
-        """Drop per-user locks that are provably not held.
+        """Drop per-user locks that no in-flight update is referencing.
 
-        Only removes locks where ``locked()`` is False, so an in-flight update
-        never loses the lock serializing it. Runs synchronously (no await) so the
-        map is not mutated concurrently mid-iteration.
+        ``asyncio.Lock.locked()`` is NOT a safe idleness test here: between the
+        owner's ``release()`` and the woken waiter's ``acquire()`` the lock
+        briefly reads unlocked even though a waiter is already queued on it.
+        Evicting there lets the next update for that user create a *second*
+        lock, so two handlers for the same user enter the critical section at
+        once. The reference count spans the whole acquire/release window,
+        including that gap. Runs synchronously (no await) so the map is not
+        mutated concurrently mid-iteration.
         """
-        idle = [uid for uid, lock in self._user_locks.items() if not lock.locked()]
+        idle = [uid for uid in self._user_locks if not self._lock_refs.get(uid)]
         for uid in idle:
             self._user_locks.pop(uid, None)
 

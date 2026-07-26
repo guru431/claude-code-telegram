@@ -13,7 +13,10 @@ from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
 from ...utils.constants import TELEGRAM_MAX_MESSAGE_LENGTH
+from ..middleware.rate_limit import estimate_prompt_cost
+from ..utils.claude_run import run_claude_for_user
 from ..utils.html_format import escape_html, split_telegram_html, tg_len
+from ..utils.session_control import terminate_user_session
 
 # session_export is imported lazily inside the export callback to keep the
 # command/callback dispatch path lightweight — this module is the largest
@@ -292,22 +295,7 @@ async def handle_action_callback(
     query, action_type: str, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Handle general action callbacks."""
-    actions = {
-        "help": _handle_help_action,
-        "show_projects": _handle_show_projects_action,
-        "new_session": _handle_new_session_action,
-        "continue": _handle_continue_action,
-        "end_session": _handle_end_session_action,
-        "status": _handle_status_action,
-        "ls": _handle_ls_action,
-        "start_coding": _handle_start_coding_action,
-        "quick_actions": _handle_quick_actions_action,
-        "refresh_status": _handle_refresh_status_action,
-        "refresh_ls": _handle_refresh_ls_action,
-        "export": _handle_export_action,
-    }
-
-    handler = actions.get(action_type)
+    handler = ACTION_HANDLERS.get(action_type)
     if handler:
         await handler(query, context)
     else:
@@ -370,6 +358,49 @@ async def _handle_help_action(query, context: ContextTypes.DEFAULT_TYPE) -> None
 
     await query.edit_message_text(
         help_text, parse_mode="HTML", reply_markup=reply_markup
+    )
+
+
+async def _handle_full_help_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the same detailed help text as the /help command."""
+    from .command import FULL_HELP_TEXT
+
+    await query.edit_message_text(
+        FULL_HELP_TEXT,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🏠 Main Menu", callback_data="action:main_menu")]]
+        ),
+    )
+
+
+async def _handle_main_menu_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the main menu (same entry points as /start)."""
+    settings: Settings = context.bot_data["settings"]
+    current_dir = context.user_data.get(
+        "current_directory", settings.approved_directory
+    )
+    relative_path = current_dir.relative_to(settings.approved_directory)
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "📁 Show Projects", callback_data="action:show_projects"
+            ),
+            InlineKeyboardButton("❓ Get Help", callback_data="action:help"),
+        ],
+        [
+            InlineKeyboardButton("🆕 New Session", callback_data="action:new_session"),
+            InlineKeyboardButton("📊 Check Status", callback_data="action:status"),
+        ],
+    ]
+
+    await query.edit_message_text(
+        "🏠 <b>Main Menu</b>\n\n"
+        f"📂 Working directory: <code>{escape_html(str(relative_path))}/</code>\n\n"
+        "Pick an action below, or just send a message to start coding.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -557,12 +588,10 @@ async def _handle_end_session_action(query, context: ContextTypes.DEFAULT_TYPE) 
     )
     relative_path = current_dir.relative_to(settings.approved_directory)
 
-    # Clear session data and force a fresh start so the next message does not
-    # auto-resume the just-ended session.
-    context.user_data["claude_session_id"] = None
-    context.user_data["session_started"] = False
-    context.user_data["last_message"] = None
-    context.user_data["force_new_session"] = True
+    # Deactivate the persisted session and clear the Telegram context, so the
+    # next message does not auto-resume the just-ended session and /sessions
+    # stops listing it as active.
+    await terminate_user_session(context, query.from_user.id)
 
     # Create quick action buttons
     keyboard = [
@@ -600,6 +629,8 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = query.from_user.id
     settings: Settings = context.bot_data["settings"]
     claude_integration: ClaudeIntegration = context.bot_data.get("claude_integration")
+    rate_limiter = context.bot_data.get("rate_limiter")
+    storage = context.bot_data.get("storage")
 
     current_dir = context.user_data.get(
         "current_directory", settings.approved_directory
@@ -616,6 +647,7 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
 
         # Check if there's an existing session in user context
         claude_session_id = context.user_data.get("claude_session_id")
+        continue_prompt = "Please continue where we left off"
 
         if claude_session_id:
             # Continue with the existing session.
@@ -627,12 +659,14 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
                 parse_mode="HTML",
             )
 
-            claude_response = await claude_integration.run_command(
-                prompt="Please continue where we left off",
-                working_directory=current_dir,
-                user_id=user_id,
-                session_id=claude_session_id,
-            )
+            async def _run():
+                return await claude_integration.run_command(
+                    prompt=continue_prompt,
+                    working_directory=current_dir,
+                    user_id=user_id,
+                    session_id=claude_session_id,
+                )
+
         else:
             # No session in context, try to find the most recent session
             await query.edit_message_text(
@@ -641,11 +675,28 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
                 parse_mode="HTML",
             )
 
-            claude_response = await claude_integration.continue_session(
-                user_id=user_id,
-                working_directory=current_dir,
-                prompt=None,  # No prompt = use --continue
+            async def _run():
+                return await claude_integration.continue_session(
+                    user_id=user_id,
+                    working_directory=current_dir,
+                    prompt=None,  # No prompt = use --continue
+                )
+
+        # Shared runner: holds the budget and persists the interaction, which
+        # this button used to skip entirely.
+        claude_response, budget_error = await run_claude_for_user(
+            run=_run,
+            prompt=continue_prompt,
+            user_id=user_id,
+            rate_limiter=rate_limiter,
+            storage=storage,
+            estimated_cost=estimate_prompt_cost(continue_prompt),
+        )
+        if budget_error:
+            await query.edit_message_text(
+                f"⏱️ {escape_html(budget_error)}", parse_mode="HTML"
             )
+            return
 
         if claude_response:
             # Update session ID in context
@@ -1038,10 +1089,26 @@ async def handle_quick_action_callback(
             parse_mode="HTML",
         )
 
-        # Run the action through Claude
-        claude_response = await claude_integration.run_command(
-            prompt=action.prompt, working_directory=current_dir, user_id=user_id
+        # Run the action through Claude via the shared runner so the run holds
+        # budget and lands in history like a typed message would.
+        async def _run():
+            return await claude_integration.run_command(
+                prompt=action.prompt, working_directory=current_dir, user_id=user_id
+            )
+
+        claude_response, budget_error = await run_claude_for_user(
+            run=_run,
+            prompt=action.prompt,
+            user_id=user_id,
+            rate_limiter=context.bot_data.get("rate_limiter"),
+            storage=context.bot_data.get("storage"),
+            estimated_cost=estimate_prompt_cost(action.prompt),
         )
+        if budget_error:
+            await query.edit_message_text(
+                f"⏱️ {escape_html(budget_error)}", parse_mode="HTML"
+            )
+            return
 
         if claude_response:
             # Format and send the response. Truncate the composed message, not
@@ -1117,12 +1184,29 @@ async def handle_followup_callback(
             parse_mode="HTML",
         )
 
-        claude_response = await claude_integration.run_command(
+        async def _run():
+            return await claude_integration.run_command(
+                prompt=suggestion,
+                working_directory=current_dir,
+                user_id=user_id,
+                session_id=session_id,
+            )
+
+        # Shared runner: a follow-up button is a full Claude run and must be
+        # budgeted and persisted like the message the user could have typed.
+        claude_response, budget_error = await run_claude_for_user(
+            run=_run,
             prompt=suggestion,
-            working_directory=current_dir,
             user_id=user_id,
-            session_id=session_id,
+            rate_limiter=context.bot_data.get("rate_limiter"),
+            storage=context.bot_data.get("storage"),
+            estimated_cost=estimate_prompt_cost(suggestion),
         )
+        if budget_error:
+            await query.edit_message_text(
+                f"⏱️ {escape_html(budget_error)}", parse_mode="HTML"
+            )
+            return
 
         if claude_response:
             context.user_data["claude_session_id"] = claude_response.session_id
@@ -1187,11 +1271,10 @@ async def handle_conversation_callback(
         if conversation_enhancer:
             conversation_enhancer.clear_context(user_id)
 
-        # Clear session data so the next message starts fresh instead of
-        # auto-resuming the just-ended session.
-        context.user_data["claude_session_id"] = None
-        context.user_data["session_started"] = False
-        context.user_data["force_new_session"] = True
+        # Deactivate the persisted session and clear the Telegram context so
+        # the next message starts fresh instead of auto-resuming the just-ended
+        # session, and /sessions stops listing it as active.
+        await terminate_user_session(context, user_id)
 
         current_dir = context.user_data.get(
             "current_directory", settings.approved_directory
@@ -1492,3 +1575,24 @@ def _escape_markdown(text: str) -> str:
     Legacy name kept for compatibility with callers; actually escapes HTML.
     """
     return escape_html(text)
+
+
+# Dispatch table for ``action:<name>`` callback_data. Module-level so a test can
+# assert every action button rendered anywhere in the bot resolves to a handler
+# instead of silently falling through to "Unknown Action".
+ACTION_HANDLERS = {
+    "help": _handle_help_action,
+    "full_help": _handle_full_help_action,
+    "main_menu": _handle_main_menu_action,
+    "show_projects": _handle_show_projects_action,
+    "new_session": _handle_new_session_action,
+    "continue": _handle_continue_action,
+    "end_session": _handle_end_session_action,
+    "status": _handle_status_action,
+    "ls": _handle_ls_action,
+    "start_coding": _handle_start_coding_action,
+    "quick_actions": _handle_quick_actions_action,
+    "refresh_status": _handle_refresh_status_action,
+    "refresh_ls": _handle_refresh_ls_action,
+    "export": _handle_export_action,
+}
