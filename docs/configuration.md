@@ -52,8 +52,11 @@ token-login flow.
 # WARNING: This allows characters such as pipes and redirections in validated paths.
 DISABLE_SECURITY_PATTERNS=false
 
-# Disable ToolMonitor allowlist/disallowlist checks (default: false)
-# WARNING: This only skips tool-name allow/disallow checks; path and Bash safety checks still apply.
+# Hand the SDK no tool restrictions at all (default: false)
+# WARNING: passes BOTH allowed_tools=None AND disallowed_tools=None to the SDK, so
+# CLAUDE_DISALLOWED_TOOLS stops being enforced too. Per-call path checks
+# (can_use_tool) and Bash directory-boundary checks still apply. An explicit
+# per-run tool override (e.g. the read-only webhook set) is not widened.
 DISABLE_TOOL_VALIDATION=false
 ```
 
@@ -69,14 +72,15 @@ CLAUDE_MAX_TURNS=10
 # Timeout for Claude operations in seconds
 CLAUDE_TIMEOUT_SECONDS=300
 
-# Maximum cost per user in USD (lifetime budget for rate limiter)
+# Maximum cost per user in USD (daily budget for the rate limiter; the counter
+# resets when the UTC calendar day rolls over, matching the cost_tracking table)
 CLAUDE_MAX_COST_PER_USER=10.0
 
 # Maximum cost per individual request in USD (SDK-level hard cap)
 CLAUDE_MAX_COST_PER_REQUEST=5.0
 
 # Allowed Claude tools (comma-separated list; see docs/tools.md for descriptions)
-CLAUDE_ALLOWED_TOOLS=Read,Write,Edit,Bash,Glob,Grep,LS,Task,TaskOutput,MultiEdit,NotebookRead,NotebookEdit,WebFetch,TodoRead,TodoWrite,WebSearch
+CLAUDE_ALLOWED_TOOLS=Read,Write,Edit,Bash,Glob,Grep,LS,Task,TaskOutput,MultiEdit,NotebookRead,NotebookEdit,WebFetch,TodoRead,TodoWrite,WebSearch,Skill,AskUserQuestion,EnterPlanMode,ExitPlanMode
 ```
 
 #### Rate Limiting
@@ -340,13 +344,20 @@ The configuration system performs extensive validation:
 ### Cross-Field Validation
 
 - `MCP_CONFIG_PATH` is required when `ENABLE_MCP=true`
-- `MISTRAL_API_KEY` is required when `VOICE_PROVIDER=mistral`
-- `OPENAI_API_KEY` is required when `VOICE_PROVIDER=openai`
+- `TELEGRAM_WEBHOOK_SECRET` is required when `WEBHOOK_URL` is set (and must match `[A-Za-z0-9_-]{1,256}`)
+- `PROJECT_THREADS_CHAT_ID` is required when `PROJECT_THREADS_MODE=group`, and `PROJECTS_CONFIG_PATH` is required whenever `ENABLE_PROJECT_THREADS=true`
+
+The voice provider's API key (`MISTRAL_API_KEY` / `OPENAI_API_KEY`) is **not**
+checked at startup: a missing key only disables transcription, and a voice
+message is answered with a notice naming the variable to set. The bot starts
+normally, which is what keeps the default `ENABLE_VOICE_MESSAGES=true` usable
+without a voice provider.
 
 ### Value Validation
 
 - `LOG_LEVEL` must be one of: DEBUG, INFO, WARNING, ERROR, CRITICAL
-- Numeric values must be positive where appropriate
+- `RATE_LIMIT_REQUESTS`, `RATE_LIMIT_WINDOW`, `RATE_LIMIT_BURST`, `CLAUDE_MAX_TURNS` and `CLAUDE_TIMEOUT_SECONDS` must be greater than 0
+- `CLAUDE_RETRY_MAX_ATTEMPTS` must be ≥ 0 (0 disables retries); `VERBOSE_LEVEL` must be 0-2
 - User IDs in `ALLOWED_USERS` must be valid integers
 
 ## Claude Integration Options

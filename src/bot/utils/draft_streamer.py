@@ -65,6 +65,17 @@ class DraftStreamer:
         self._last_send_time = 0.0
         self._enabled = True
 
+    @property
+    def enabled(self) -> bool:
+        """False once a draft send failed and the streamer switched itself off.
+
+        Callers use this to fall back to another progress channel: in a chat
+        where ``sendMessageDraft`` is not accepted (e.g. a forum topic on an
+        older Bot API), the first attempt disables the streamer and progress
+        must come from somewhere else.
+        """
+        return self._enabled
+
     async def append_tool(self, line: str) -> None:
         """Append a tool activity line and send a draft if throttled."""
         if not self._enabled or not line:

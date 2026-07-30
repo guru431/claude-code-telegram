@@ -115,10 +115,10 @@ async def auth_middleware(handler: Callable, event: Any, data: Dict[str, Any]) -
         global _last_rejection_gc
         now = time.monotonic()
         # Evict entries older than the throttle window so the map stays bounded
-        # under a stream of distinct unauthorized senders (mirrors the GC in
-        # burst_protection_middleware). Entries past the window are no longer
-        # throttling anything, so dropping them is safe. The sweep itself runs
-        # at most once per window to keep per-message cost O(1).
+        # under a stream of distinct unauthorized senders. Entries past the
+        # window are no longer throttling anything, so dropping them is safe.
+        # The sweep itself runs at most once per window to keep per-message
+        # cost O(1).
         if now - _last_rejection_gc >= _REJECTION_REPLY_WINDOW:
             _last_rejection_gc = now
             stale_cutoff = now - _REJECTION_REPLY_WINDOW

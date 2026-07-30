@@ -225,7 +225,7 @@ async def handle_cd_callback(
 
         resumed_session_info = ""
         if claude_integration:
-            existing_session = await claude_integration._find_resumable_session(
+            existing_session = await claude_integration.find_resumable_session(
                 user_id, new_path
             )
             if existing_session:

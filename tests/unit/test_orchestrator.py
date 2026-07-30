@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.bot.orchestrator import MessageOrchestrator
+from src.claude.exceptions import ClaudeTimeoutError
 from src.config import create_test_config
 from src.security.secret_patterns import redact_secrets as _redact_secrets
 
@@ -301,7 +302,7 @@ async def test_repo_scoped_to_thread_project_root_allows_child(
     update.message.reply_text = AsyncMock()
 
     claude = MagicMock()
-    claude._find_resumable_session = AsyncMock(return_value=None)
+    claude.find_resumable_session = AsyncMock(return_value=None)
     context = MagicMock()
     context.user_data = {"_thread_context": {"project_root": str(proj)}}
     context.bot_data = {"claude_integration": claude}
@@ -1389,6 +1390,64 @@ async def test_sessions_shows_local_sessions_to_admin(
     assert "hello from vscode" in text
 
 
+async def test_sessions_shows_first_and_last_prompt(
+    isolation_settings, deps, tmp_dir, monkeypatch
+):
+    """A stored session gets both previews read back from its JSONL.
+
+    Without them the row is an 8-hex id and a path, which cannot distinguish
+    two sessions in the same project.
+    """
+    import src.claude.local_sessions as local_sessions_mod
+
+    monkeypatch.setattr(
+        local_sessions_mod,
+        "load_session_previews",
+        lambda cwd, session_id: ("set up the parser", "now fix the retry loop"),
+    )
+
+    orchestrator = MessageOrchestrator(isolation_settings, deps)
+    storage = _storage_mock()
+    storage.sessions.get_user_sessions.return_value = [
+        _session_record("own-session-1", 111, tmp_dir)
+    ]
+
+    update = _sessions_update(user_id=111)
+    await orchestrator.agentic_sessions(update, _ctx(storage))
+
+    text = update.message.reply_text.call_args[0][0]
+    assert "set up the parser" in text
+    assert "now fix the retry loop" in text
+
+
+async def test_sessions_marks_the_session_that_will_resume(
+    isolation_settings, deps, tmp_dir
+):
+    """The marker follows the resolver, not the id cached in user_data."""
+    orchestrator = MessageOrchestrator(isolation_settings, deps)
+    storage = _storage_mock()
+    storage.sessions.get_user_sessions.return_value = [
+        _session_record("stale-one", 111, tmp_dir),
+        _session_record("resumes-next", 111, tmp_dir),
+    ]
+
+    claude = MagicMock()
+    claude.find_resumable_session = AsyncMock(
+        return_value=SimpleNamespace(session_id="resumes-next")
+    )
+    context = _ctx(storage)
+    context.bot_data["claude_integration"] = claude
+    context.user_data["claude_session_id"] = "stale-one"
+
+    update = _sessions_update(user_id=111)
+    await orchestrator.agentic_sessions(update, context)
+
+    text = update.message.reply_text.call_args[0][0]
+    active_row = next(line for line in text.splitlines() if "active" in line)
+    assert "resumes-" in active_row
+    assert "stale-on" not in active_row
+
+
 async def test_resume_rejects_another_users_session(isolation_settings, deps, tmp_dir):
     """Owner check is server-side: a forged callback for a foreign session fails."""
     orchestrator = MessageOrchestrator(isolation_settings, deps)
@@ -1538,14 +1597,36 @@ async def test_agentic_text_settles_reservation_with_actual_cost(
     limiter.settle_reservation.assert_awaited_once_with("rid-1", 1.23)
 
 
-async def test_agentic_text_settles_at_zero_on_soft_error(agentic_settings, deps):
-    """A run the SDK flagged as an error produced nothing usable — charge 0."""
+async def test_agentic_text_charges_reported_cost_on_soft_error(agentic_settings, deps):
+    """A flagged-error run (max_turns, budget cap) already spent real money."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    response = MagicMock()
+    response.session_id = "s-1"
+    response.is_error = True
+    response.error_type = "error_max_turns"
+    response.cost = 9.99
+
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock(return_value=response)
+    limiter = _reserving_limiter()
+
+    await orchestrator.agentic_text(
+        _cost_update(), _cost_context(agentic_settings, claude_integration, limiter)
+    )
+
+    limiter.settle_reservation.assert_awaited_once_with("rid-1", 9.99)
+
+
+async def test_agentic_text_settles_at_zero_without_result_message(
+    agentic_settings, deps
+):
+    """No ResultMessage means no known cost — the user is charged nothing."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     response = MagicMock()
     response.session_id = "s-1"
     response.is_error = True
     response.error_type = "no_result_message"
-    response.cost = 9.99  # must NOT be charged
+    response.cost = 0.0
 
     claude_integration = AsyncMock()
     claude_integration.run_command = AsyncMock(return_value=response)
@@ -1589,3 +1670,126 @@ async def test_agentic_text_does_not_run_when_reservation_refused(
 
     claude_integration.run_command.assert_not_called()
     limiter.settle_reservation.assert_not_awaited()
+
+
+# --- One run path for text and media ----------------------------------------
+#
+# agentic_text and _handle_agentic_media_message both go through
+# _run_and_format, so persistence and the is_error branch cannot drift apart
+# between the two entry points again.
+
+
+async def test_agentic_text_persists_soft_error_run(agentic_settings, deps):
+    """A flagged-error run is still part of history and cost reporting."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    response = MagicMock()
+    response.session_id = "s-1"
+    response.is_error = True
+    response.error_type = "error_max_turns"
+    response.cost = 0.5
+
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock(return_value=response)
+    limiter = _reserving_limiter()
+    context = _cost_context(agentic_settings, claude_integration, limiter)
+    storage = AsyncMock()
+    context.bot_data["storage"] = storage
+
+    await orchestrator.agentic_text(_cost_update(), context)
+
+    storage.save_claude_interaction.assert_awaited_once()
+
+
+async def test_media_run_persists_soft_error_run(agentic_settings, deps):
+    """The media path stores a flagged-error run exactly like the text path."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    response = MagicMock()
+    response.session_id = "s-1"
+    response.is_error = True
+    response.error_type = "error_max_turns"
+    response.cost = 0.5
+
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock(return_value=response)
+    limiter = _reserving_limiter()
+    context = _cost_context(agentic_settings, claude_integration, limiter)
+    storage = AsyncMock()
+    context.bot_data["storage"] = storage
+
+    update = _cost_update()
+    progress_msg = AsyncMock()
+    await orchestrator._handle_agentic_media_message(
+        update=update,
+        context=context,
+        prompt="describe this",
+        progress_msg=progress_msg,
+        user_id=123,
+        chat=update.message.chat,
+    )
+
+    storage.save_claude_interaction.assert_awaited_once()
+    limiter.settle_reservation.assert_awaited_once_with("rid-1", 0.5)
+
+
+async def test_timeout_drops_stored_session_id(agentic_settings, deps):
+    """Resuming a timed-out session just reproduces the timeout."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock(
+        side_effect=ClaudeTimeoutError("timed out")
+    )
+    limiter = _reserving_limiter()
+    context = _cost_context(agentic_settings, claude_integration, limiter)
+    context.user_data["claude_session_id"] = "stuck-1"
+
+    await orchestrator.agentic_text(_cost_update(), context)
+
+    assert context.user_data["claude_session_id"] is None
+
+
+async def test_generic_error_keeps_stored_session_id(agentic_settings, deps):
+    """An unrelated failure says nothing about the session — keep resuming it."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock(side_effect=RuntimeError("boom"))
+    limiter = _reserving_limiter()
+    context = _cost_context(agentic_settings, claude_integration, limiter)
+    context.user_data["claude_session_id"] = "fine-1"
+
+    await orchestrator.agentic_text(_cost_update(), context)
+
+    assert context.user_data["claude_session_id"] == "fine-1"
+
+
+# --- Draft streaming reaches forum topics ------------------------------------
+
+
+def _chat(chat_type: str, is_forum: bool = False):
+    chat = MagicMock()
+    chat.type = chat_type
+    chat.is_forum = is_forum
+    return chat
+
+
+def test_drafts_supported_in_private_and_forum_topics(tmp_dir, deps):
+    settings = create_test_config(
+        approved_directory=str(tmp_dir), agentic_mode=True, enable_stream_drafts=True
+    )
+    orchestrator = MessageOrchestrator(settings, deps)
+
+    assert orchestrator._drafts_supported(_chat("private"), None) is True
+    assert (
+        orchestrator._drafts_supported(_chat("supergroup", is_forum=True), 42) is True
+    )
+    # Plain group message (no topic) and a forum's General thread stay off.
+    assert orchestrator._drafts_supported(_chat("supergroup"), None) is False
+    assert orchestrator._drafts_supported(_chat("group"), 42) is False
+
+
+def test_drafts_disabled_by_setting(tmp_dir, deps):
+    settings = create_test_config(
+        approved_directory=str(tmp_dir), agentic_mode=True, enable_stream_drafts=False
+    )
+    orchestrator = MessageOrchestrator(settings, deps)
+
+    assert orchestrator._drafts_supported(_chat("private"), None) is False

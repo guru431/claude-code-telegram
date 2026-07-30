@@ -4,14 +4,14 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.1.x   | Current development |
+| 1.5.x   | Current development |
 
 ## Security Model
 
 The Claude Code Telegram Bot implements a defense-in-depth security model with multiple layers:
 
 ### 1. Authentication & Authorization
-- **User Whitelist**: Only pre-approved Telegram user IDs can access the bot
+- **User Whitelist**: Only pre-approved Telegram user IDs can access the bot. This is the *only* authentication method — there is no token-login flow
 - **Session Management**: Secure session handling with timeout and cleanup
 
 ### 2. Directory Boundaries
@@ -31,15 +31,15 @@ The Claude Code Telegram Bot implements a defense-in-depth security model with m
 > shell command, so applying them would block normal conversation; they are
 > intentionally **not** applied. Do not assume message-content filtering is
 > active in the default mode. Safety there is enforced at the **tool level**:
-> the SDK `can_use_tool` callback, `ToolMonitor` (allow/deny lists, file-path
-> boundaries, dangerous-bash and interpreter inline-code checks), and the OS
-> sandbox. Harden those layers (and keep `SANDBOX_ENABLED` on) rather than
-> relying on input sanitization in agentic mode.
+> the SDK allow/deny tool lists, the SDK `can_use_tool` callback (file-path
+> boundaries and secret-basename blocking), `check_bash_directory_boundary`,
+> and the OS sandbox. Harden those layers (and keep `SANDBOX_ENABLED` on)
+> rather than relying on input sanitization in agentic mode.
 
 ### 4. Rate Limiting
 - **Request Rate Limiting**: Token bucket algorithm prevents abuse with configurable limits
-- **Cost-Based Limiting**: Tracks and limits Claude usage costs per user
-- **Burst Protection**: Configurable burst capacity prevents spike attacks
+- **Cost-Based Limiting**: Tracks and limits Claude usage costs per user, reset on the UTC calendar day
+- **Burst Capacity**: `RATE_LIMIT_BURST` sets how many requests may arrive back-to-back before throttling applies
 
 ### 5. Audit Logging
 - **Authentication Events**: All login attempts and auth failures logged
@@ -57,12 +57,12 @@ The Claude Code Telegram Bot implements a defense-in-depth security model with m
 
 All planned security features are implemented and active:
 
-- Multi-provider authentication system (whitelist + token)
+- Telegram ID whitelist authentication (fail-closed on an empty list)
 - Rate limiting with token bucket algorithm (request and cost-based)
-- Input validation with path traversal, command injection, and zip bomb protection
+- Input validation with path traversal, command injection, and zip bomb protection (classic mode — see the agentic-mode note above)
 - Directory isolation with approved directory boundaries
 - Security audit logging with risk assessment and event tracking
-- Bot middleware framework (auth, rate limit, security, burst protection)
+- Bot middleware framework (auth, rate limit, security), wired for both messages and callback queries
 - Webhook signature verification (GitHub HMAC-SHA256, generic Bearer token)
 - Event security middleware for webhook and scheduled event validation
 - Configuration security via Pydantic validators and SecretStr
@@ -181,7 +181,7 @@ ENVIRONMENT=production  # Enables strict security defaults
 
 **Do not create public GitHub issues for security vulnerabilities.**
 
-For security issues, please email: [Insert security contact email]
+Report privately through **GitHub Security Advisories**: open the repository's **Security** tab and choose *Report a vulnerability*. This creates a private advisory visible only to the maintainers.
 
 Include: description, steps to reproduce, potential impact, and suggested mitigation.
 

@@ -29,7 +29,12 @@ def _encode_path(path: Path) -> str:
 
 @dataclass
 class LocalSession:
-    """Minimal metadata for a session discovered on disk."""
+    """Minimal metadata for a session discovered on disk.
+
+    ``last_message`` is only populated by :func:`list_all_local_sessions` (the
+    ``/sessions`` listing, where it is what actually tells two sessions apart).
+    The auto-resume lookups do not need it and skip the extra tail read.
+    """
 
     session_id: str
     cwd: str
@@ -37,6 +42,7 @@ class LocalSession:
     jsonl_path: Path
     first_message: str = ""
     mtime: float = 0.0
+    last_message: str = ""
 
 
 def _claude_projects_dir() -> Path:
@@ -49,6 +55,88 @@ def _claude_projects_dir() -> Path:
 # memory just to discard most of it. 4 MiB is comfortably above the largest
 # legitimate Claude session prompts we observe.
 _MAX_LINE_BYTES = 4 * 1024 * 1024
+
+
+# How much of a JSONL tail we scan for the most recent user message. The last
+# prompt of a session sits within a few KB of the end, so reading a whole
+# (possibly many-MB) transcript to render one preview line is not worth it.
+_TAIL_SCAN_BYTES = 256 * 1024
+
+# Preview length used for both the first and the last user message.
+_PREVIEW_CHARS = 60
+
+
+def _extract_user_text(obj: dict) -> str:
+    """Return the text carried by a JSONL ``user`` entry, else "".
+
+    Tool results also arrive as ``type: "user"`` entries, but they hold
+    ``tool_result`` blocks rather than text — those yield "" so callers keep
+    looking for a real prompt.
+    """
+    if obj.get("type") != "user":
+        return ""
+    message = obj.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content", [])
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text", "").strip()
+                if text:
+                    return text
+    return ""
+
+
+def _parse_session_tail(jsonl_path: Path) -> str:
+    """Return the most recent user message in *jsonl_path*, truncated.
+
+    Only the last ``_TAIL_SCAN_BYTES`` are read, so the cost does not grow with
+    the length of the session. Returns "" when that window holds no user text
+    (e.g. a long trailing tool loop) or the file cannot be read.
+    """
+    try:
+        with open(jsonl_path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            start = max(0, size - _TAIL_SCAN_BYTES)
+            fh.seek(start)
+            blob = fh.read()
+        if start > 0:
+            # The window almost certainly begins mid-line; drop that fragment.
+            _, _, blob = blob.partition(b"\n")
+        for raw in reversed(blob.splitlines()):
+            if not raw.strip():
+                continue
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            text = _extract_user_text(obj)
+            if text:
+                return text[:_PREVIEW_CHARS]
+    except OSError:
+        return ""
+    return ""
+
+
+def load_session_previews(cwd: Path, session_id: str) -> tuple[str, str]:
+    """Return ``(first_message, last_message)`` for one already-known session.
+
+    Enriches rows the bot took from its own storage, where no directory scan
+    happened: the JSONL path is fully determined by the session's cwd and id, so
+    this is a couple of bounded reads rather than a walk.
+    """
+    path = _claude_projects_dir() / _encode_path(cwd) / f"{session_id}.jsonl"
+    if not path.is_file():
+        return "", ""
+    head = _parse_session_head(path)
+    first = head.get("first_message", "") if head else ""
+    return first, _parse_session_tail(path)
 
 
 def _parse_session_head(jsonl_path: Path) -> Optional[dict]:
@@ -95,18 +183,8 @@ def _parse_session_head(jsonl_path: Path) -> Optional[dict]:
                 if result is None:
                     result = obj
                 # Look for the first user message
-                if not first_message and obj.get("type") == "user":
-                    msg = obj.get("message", {})
-                    content = msg.get("content", [])
-                    if isinstance(content, str) and content.strip():
-                        first_message = content.strip()[:60]
-                    elif isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                text = block.get("text", "").strip()
-                                if text:
-                                    first_message = text[:60]
-                                    break
+                if not first_message:
+                    first_message = _extract_user_text(obj)[:_PREVIEW_CHARS]
                 # Stop after we have both metadata and first message
                 if result is not None and first_message:
                     break
@@ -298,6 +376,9 @@ def list_all_local_sessions(
                 jsonl_path=entry,
                 first_message=first.get("first_message", ""),
                 mtime=mtime,
+                # The newest prompt is what distinguishes two long sessions in
+                # the same project; the opening one often does not.
+                last_message=_parse_session_tail(entry),
             )
         )
 

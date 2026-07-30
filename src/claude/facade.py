@@ -61,8 +61,19 @@ class ClaudeIntegration:
                 "session_manager is required: ClaudeIntegration methods depend "
                 "on it and would otherwise raise AttributeError"
             )
+        # sdk_manager is required for the same reason session_manager is, plus a
+        # security one: a default-constructed ClaudeSDKManager has no
+        # SecurityValidator, so options.can_use_tool is never wired and the only
+        # remaining tool-level protection (path boundaries, secret basenames,
+        # bash directory checks) silently disappears. Fail loudly instead.
+        if sdk_manager is None:
+            raise ValueError(
+                "sdk_manager is required: a default-constructed ClaudeSDKManager "
+                "has no SecurityValidator, which disables the can_use_tool "
+                "tool-level checks"
+            )
         self.config = config
-        self.sdk_manager = sdk_manager or ClaudeSDKManager(config)
+        self.sdk_manager = sdk_manager
         self.session_manager = session_manager
 
     async def run_command(
@@ -233,6 +244,20 @@ class ClaudeIntegration:
             images=images,
             interrupt_event=interrupt_event,
         )
+
+    async def find_resumable_session(
+        self,
+        user_id: int,
+        working_directory: Path,
+    ) -> Optional["ClaudeSession"]:  # noqa: F821
+        """Answer "which session would resume in this directory?".
+
+        Public counterpart of :meth:`_find_resumable_session`: five handlers
+        outside this class (``/cd``, ``/status``, the directory callback,
+        ``/repo`` and the project-thread router) need exactly this answer, which
+        makes it part of the facade's API rather than an internal detail.
+        """
+        return await self._find_resumable_session(user_id, working_directory)
 
     async def _find_resumable_session(
         self,

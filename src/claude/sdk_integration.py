@@ -185,6 +185,15 @@ class ClaudeSDKManager:
         self.config = config
         self.security_validator = security_validator
 
+        # Without a validator, options.can_use_tool is never set below, so
+        # nothing checks tool paths or secret basenames. Legitimate in tests;
+        # in a real run it must be visible in the startup log.
+        if security_validator is None:
+            logger.warning(
+                "No SecurityValidator passed to ClaudeSDKManager — "
+                "can_use_tool tool-level validation is disabled"
+            )
+
         # Note: ANTHROPIC_API_KEY is passed through ClaudeAgentOptions.env so it
         # only reaches the Claude CLI subprocess, not os.environ. This prevents
         # the key from leaking to other subprocesses, MCP servers, or surviving

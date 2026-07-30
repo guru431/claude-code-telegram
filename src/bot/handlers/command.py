@@ -728,7 +728,7 @@ async def change_directory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         resumed_session_info = ""
         if claude_integration:
-            existing_session = await claude_integration._find_resumable_session(
+            existing_session = await claude_integration.find_resumable_session(
                 user_id, resolved_path
             )
             if existing_session:
@@ -941,7 +941,7 @@ async def session_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "claude_integration"
         )
         if claude_integration:
-            existing = await claude_integration._find_resumable_session(
+            existing = await claude_integration.find_resumable_session(
                 user_id, current_dir
             )
             if existing:

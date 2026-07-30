@@ -30,7 +30,8 @@ class EventSecurityMiddleware:
       and atomic deduplication before an event is ever published.
     - Agent layer: webhook-driven runs use a read-only tool set
       (``_WEBHOOK_READONLY_TOOLS`` in ``events.handlers``), and tool calls
-      are gated by the SDK ``can_use_tool`` callback / ``ToolMonitor``.
+      are gated by the SDK ``can_use_tool`` callback and
+      ``check_bash_directory_boundary``.
 
     ``security`` and ``auth`` are retained for future per-user/path events
     (e.g. authenticated bus sources) that would carry validatable fields.

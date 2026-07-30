@@ -105,7 +105,11 @@ CREATE TABLE audit_log (
     ip_address TEXT
 );
 
--- User tokens table (for token auth)
+-- Historical artifact of migration 1: a token-auth provider that was never
+-- shipped. Nothing reads or writes this table (the Telegram ID whitelist is the
+-- only authentication method). It stays because migration 1 is already applied
+-- in every existing database and must not be rewritten; drop it in a future
+-- migration if the empty table ever gets in the way.
 CREATE TABLE user_tokens (
     token_id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,

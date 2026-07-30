@@ -12,7 +12,16 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+)
 from uuid import uuid4
 
 import structlog
@@ -33,6 +42,7 @@ from telegram.ext import (
     filters,
 )
 
+from ..claude.exceptions import ClaudeProcessError, ClaudeTimeoutError
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
@@ -82,6 +92,7 @@ _TOOL_ICONS: Dict[str, str] = {
     "NotebookEdit": "\U0001f4d3",
     "TodoRead": "\u2611\ufe0f",
     "TodoWrite": "\u2611\ufe0f",
+    "Skill": "\U0001f9e9",
     "AskUserQuestion": "\u2753",
     "EnterPlanMode": "\U0001f4cb",
     "ExitPlanMode": "\U0001f4cb",
@@ -93,6 +104,17 @@ def _tool_icon(name: str) -> str:
     return _TOOL_ICONS.get(name, "\U0001f527")
 
 
+# Leading newline + spaces that indent a session preview under its list row.
+_PREVIEW_INDENT = "\n   "
+
+
+def _truncate(text: str, limit: int) -> str:
+    """Shorten *text* to *limit* characters, marking the cut with an ellipsis."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "…"
+
+
 @dataclass
 class _SessionEntry:
     """One row of the /sessions list, normalised across its two sources."""
@@ -101,6 +123,7 @@ class _SessionEntry:
     cwd: str
     when: datetime
     preview: str = ""
+    last_preview: str = ""
     is_local: bool = False
 
 
@@ -953,8 +976,12 @@ class MessageOrchestrator:
                     # is redacted too, but the draft must not leak first.
                     await draft_streamer.append_text(redact_secrets(update_obj.content))
 
-            # Throttle progress message edits to avoid Telegram rate limits
-            if not draft_streamer and verbose_level >= 1:
+            # Throttle progress message edits to avoid Telegram rate limits.
+            # A streamer that disabled itself (draft rejected by Telegram) is
+            # treated as absent, so the user still sees progress.
+            if verbose_level >= 1 and (
+                draft_streamer is None or not draft_streamer.enabled
+            ):
                 now = time.time()
                 if (now - last_edit_time[0]) >= 2.0 and tool_log:
                     last_edit_time[0] = now
@@ -1192,6 +1219,189 @@ class MessageOrchestrator:
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
 
+    async def _run_and_format(
+        self,
+        *,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        prompt: str,
+        user_id: int,
+        progress_msg: Any,
+        request_id: str,
+        interrupt_event: asyncio.Event,
+        mcp_images: List[ImageAttachment],
+        stop_kb: Optional[InlineKeyboardMarkup] = None,
+        images: Optional[List[Dict[str, str]]] = None,
+        draft_streamer: Optional[DraftStreamer] = None,
+    ) -> Tuple[List["FormattedMessage"], bool]:
+        """Run one prompt through Claude and turn the outcome into messages.
+
+        Single home for everything both agentic paths (text and media) must do
+        identically: budget reservation, the run itself, the ``is_error`` branch,
+        cost settlement, persistence and formatting. Keeping one copy is what
+        stops the two paths from drifting on *when* a run is charged or stored.
+
+        Must be called inside ``_claude_run`` (it needs that run's
+        *interrupt_event*). Returns ``(formatted_messages, success)``. An empty
+        message list means the outcome was already reported in place on
+        *progress_msg* (integration missing, budget refused) — the caller must
+        leave that message alone and stop.
+        """
+        from .handlers.message import (
+            _format_error_message,
+            _update_working_directory_from_claude_response,
+        )
+        from .utils.formatting import FormattedMessage, ResponseFormatter
+
+        claude_integration = context.bot_data.get("claude_integration")
+        if not claude_integration:
+            await progress_msg.edit_text(
+                "Claude integration not available. Check configuration.",
+                reply_markup=None,
+            )
+            return [], False
+
+        current_dir = context.user_data.get(
+            "current_directory", self.settings.approved_directory
+        )
+        session_id = context.user_data.get("claude_session_id")
+        # Check if /new was used — skip auto-resume for this first message. The
+        # flag is only cleared after a successful run so retries keep the intent.
+        force_new = bool(context.user_data.get("force_new_session"))
+
+        verbose_level = self._get_verbose_level(context)
+        tool_log: List[Dict[str, Any]] = []
+        on_stream = self._make_stream_callback(
+            verbose_level,
+            progress_msg,
+            tool_log,
+            time.monotonic(),
+            mcp_images=mcp_images,
+            approved_directory=self.settings.approved_directory,
+            draft_streamer=draft_streamer,
+            reply_markup=stop_kb,
+            interrupt_event=interrupt_event,
+        )
+
+        # Rate limiting was already enforced by rate_limit_middleware (group -1);
+        # re-checking here would double-charge the token bucket. The money for
+        # this specific run is held below and released in the finally on every
+        # path (success, soft error, exception, cancel).
+        rate_limiter = context.bot_data.get("rate_limiter")
+        reservation_id: Optional[str] = None
+        actual_cost = 0.0
+        if rate_limiter:
+            reservation_id, reserve_error = await rate_limiter.reserve_cost(
+                user_id, estimate_message_cost(update)
+            )
+            if reserve_error:
+                await progress_msg.edit_text(
+                    escape_html(reserve_error), reply_markup=None
+                )
+                return [], False
+
+        try:
+            claude_response = await claude_integration.run_command(
+                prompt=prompt,
+                working_directory=current_dir,
+                user_id=user_id,
+                session_id=session_id,
+                on_stream=on_stream,
+                force_new=force_new,
+                images=images,
+                interrupt_event=interrupt_event,
+            )
+
+            context.user_data["claude_session_id"] = claude_response.session_id
+
+            # Charge whatever Claude reports, including on a run flagged
+            # is_error: error_max_turns and the max_budget_usd cap both burn real
+            # tokens before failing, and a budget that ignores them lets a
+            # retry loop spend without moving the counter. A run that produced
+            # no ResultMessage at all reports cost 0 and settles at 0.
+            actual_cost = claude_response.cost
+
+            # Persist every run, soft error included, so history, cost
+            # reporting and the audit trail see the same set of runs whether the
+            # prompt arrived as text or as media.
+            await persist_interaction(
+                context.bot_data.get("storage"),
+                user_id,
+                prompt,
+                claude_response,
+            )
+
+            # The run completed without raising but the SDK flagged an error
+            # (e.g. no ResultMessage / budget cap). Surface it explicitly and
+            # keep force_new set so the next message still starts fresh.
+            if claude_response.is_error:
+                return [
+                    FormattedMessage(
+                        self._error_with_ref(
+                            _format_error_message(
+                                claude_response.error_type
+                                or "Claude returned an error."
+                            ),
+                            request_id,
+                        ),
+                        parse_mode="HTML",
+                    )
+                ], False
+
+            # New session produced a usable result — clear the one-shot flag now.
+            if force_new:
+                context.user_data["force_new_session"] = False
+
+            _update_working_directory_from_claude_response(
+                claude_response, context, self.settings, user_id
+            )
+
+            formatter = ResponseFormatter(self.settings)
+            # Redact secrets from the response body before it leaves the bot —
+            # tool OUTPUT (e.g. a printenv dump) can land here.
+            response_content = redact_secrets(claude_response.content or "")
+            if claude_response.interrupted:
+                response_content = response_content + "\n\n_(Interrupted by user)_"
+            return formatter.format_claude_response(response_content), True
+
+        except Exception as e:
+            logger.error(
+                "Claude integration failed",
+                error=str(e),
+                user_id=user_id,
+            )
+            # A timeout or a dead CLI process leaves the resumed session in an
+            # unknown state; resuming it on the next message just reproduces the
+            # failure. Drop the stored id so the next message starts a fresh
+            # session without the user having to run /new.
+            if isinstance(e, (ClaudeTimeoutError, ClaudeProcessError)):
+                context.user_data["claude_session_id"] = None
+            return [
+                FormattedMessage(
+                    self._error_with_ref(_format_error_message(e), request_id),
+                    parse_mode="HTML",
+                )
+            ], False
+        finally:
+            # Always release the hold, so a failed run cannot leave budget
+            # blocked until the sweeper runs.
+            if rate_limiter and reservation_id:
+                await rate_limiter.settle_reservation(reservation_id, actual_cost)
+
+    def _drafts_supported(self, chat: Any, message_thread_id: Optional[int]) -> bool:
+        """Return True when draft streaming may be attempted for this chat.
+
+        Private chats plus forum topics (the multi-project layout, where the
+        user spends most of their time). A draft rejected by Telegram disables
+        the streamer, and ``_make_stream_callback`` then falls back to verbose
+        progress edits, so attempting it costs nothing.
+        """
+        if not self.settings.enable_stream_drafts:
+            return False
+        if chat.type == "private":
+            return True
+        return message_thread_id is not None and bool(getattr(chat, "is_forum", False))
+
     async def agentic_text(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -1211,16 +1421,8 @@ class MessageOrchestrator:
                 message_length=len(message_text),
             )
 
-            # Rate limiting was already enforced by rate_limit_middleware
-            # (group -1); re-checking here would double-charge the token bucket.
-            # We only need the rate_limiter reference later to record the run's
-            # actual cost.
-            rate_limiter = context.bot_data.get("rate_limiter")
-
             chat = update.message.chat
             await chat.send_action("typing")
-
-            verbose_level = self._get_verbose_level(context)
 
             # Stop button lives on the progress message; the run lifecycle
             # (interrupt event, lock, ActiveRequest, heartbeat) is owned by the
@@ -1238,30 +1440,10 @@ class MessageOrchestrator:
                 async with self._claude_run(
                     user_id=user_id, chat=chat, progress_msg=progress_msg
                 ) as interrupt_event:
-                    claude_integration = context.bot_data.get("claude_integration")
-                    if not claude_integration:
-                        await progress_msg.edit_text(
-                            "Claude integration not available. Check configuration.",
-                            reply_markup=None,
-                        )
-                        return
-
-                    current_dir = context.user_data.get(
-                        "current_directory", self.settings.approved_directory
-                    )
-                    session_id = context.user_data.get("claude_session_id")
-
-                    # Check if /new was used — skip auto-resume for this first
-                    # message. Flag is only cleared after a successful run so
-                    # retries keep the intent.
-                    force_new = bool(context.user_data.get("force_new_session"))
-
-                    # --- Verbose progress tracking via stream callback ---
-                    tool_log: List[Dict[str, Any]] = []
-                    start_time = time.monotonic()
-
-                    # Stream drafts (private chats only)
-                    if self.settings.enable_stream_drafts and chat.type == "private":
+                    # Drafts in private chats and in forum topics (the
+                    # multi-project layout). A topic that rejects drafts falls
+                    # back to verbose progress edits on its own.
+                    if self._drafts_supported(chat, update.message.message_thread_id):
                         draft_streamer = DraftStreamer(
                             bot=context.bot,
                             chat_id=chat.id,
@@ -1270,145 +1452,22 @@ class MessageOrchestrator:
                             throttle_interval=self.settings.stream_draft_interval,
                         )
 
-                    on_stream = self._make_stream_callback(
-                        verbose_level,
-                        progress_msg,
-                        tool_log,
-                        start_time,
-                        mcp_images=mcp_images,
-                        approved_directory=self.settings.approved_directory,
-                        draft_streamer=draft_streamer,
-                        reply_markup=stop_kb,
+                    formatted_messages, success = await self._run_and_format(
+                        update=update,
+                        context=context,
+                        prompt=message_text,
+                        user_id=user_id,
+                        progress_msg=progress_msg,
+                        request_id=request_id,
                         interrupt_event=interrupt_event,
+                        mcp_images=mcp_images,
+                        stop_kb=stop_kb,
+                        draft_streamer=draft_streamer,
                     )
-
-                    # Hold budget for this specific run. The middleware only
-                    # throttled; money is charged here and released in the
-                    # finally below on every path (success, soft error,
-                    # exception, cancel).
-                    reservation_id: Optional[str] = None
-                    actual_cost = 0.0
-                    if rate_limiter:
-                        reservation_id, reserve_error = await rate_limiter.reserve_cost(
-                            user_id, estimate_message_cost(update)
-                        )
-                        if reserve_error:
-                            await progress_msg.edit_text(
-                                escape_html(reserve_error), reply_markup=None
-                            )
-                            return
-
-                    try:
-                        claude_response = await claude_integration.run_command(
-                            prompt=message_text,
-                            working_directory=current_dir,
-                            user_id=user_id,
-                            session_id=session_id,
-                            on_stream=on_stream,
-                            force_new=force_new,
-                            interrupt_event=interrupt_event,
-                        )
-
-                        context.user_data["claude_session_id"] = (
-                            claude_response.session_id
-                        )
-
-                        # The run completed without raising but the SDK flagged
-                        # an error (e.g. no ResultMessage / budget cap). Surface
-                        # it explicitly and don't charge cost for a run that
-                        # produced no usable result.
-                        if claude_response.is_error:
-                            success = False
-                            from .handlers.message import _format_error_message
-                            from .utils.formatting import FormattedMessage
-
-                            formatted_messages = [
-                                FormattedMessage(
-                                    self._error_with_ref(
-                                        _format_error_message(
-                                            claude_response.error_type
-                                            or "Claude returned an error."
-                                        ),
-                                        request_id,
-                                    ),
-                                    parse_mode="HTML",
-                                )
-                            ]
-                        else:
-                            # New session produced a usable result — clear the
-                            # one-shot flag now. A soft error (is_error above)
-                            # keeps it so the next message still forces a new
-                            # session, matching the exception path.
-                            if force_new:
-                                context.user_data["force_new_session"] = False
-
-                            # Settled in the finally below so a later failure
-                            # cannot leave the hold outstanding.
-                            actual_cost = claude_response.cost
-
-                            # Track directory changes
-                            from .handlers.message import (
-                                _update_working_directory_from_claude_response,
-                            )
-
-                            _update_working_directory_from_claude_response(
-                                claude_response, context, self.settings, user_id
-                            )
-
-                            # Store interaction
-                            await persist_interaction(
-                                context.bot_data.get("storage"),
-                                user_id,
-                                message_text,
-                                claude_response,
-                            )
-
-                            # Format response (no reply_markup — strip keyboards)
-                            from .utils.formatting import ResponseFormatter
-
-                            formatter = ResponseFormatter(self.settings)
-
-                            # Redact secrets from the response body before it
-                            # leaves the bot — tool OUTPUT (e.g. a printenv dump)
-                            # can land here.
-                            response_content = redact_secrets(
-                                claude_response.content or ""
-                            )
-                            if claude_response.interrupted:
-                                response_content = (
-                                    response_content + "\n\n_(Interrupted by user)_"
-                                )
-
-                            formatted_messages = formatter.format_claude_response(
-                                response_content
-                            )
-
-                    except Exception as e:
-                        success = False
-                        logger.error(
-                            "Claude integration failed",
-                            error=str(e),
-                            user_id=user_id,
-                        )
-                        from .handlers.message import _format_error_message
-                        from .utils.formatting import FormattedMessage
-
-                        formatted_messages = [
-                            FormattedMessage(
-                                self._error_with_ref(
-                                    _format_error_message(e), request_id
-                                ),
-                                parse_mode="HTML",
-                            )
-                        ]
-                    finally:
-                        # Always release the hold. A run that produced no
-                        # usable result settles at 0.0 and costs the user
-                        # nothing.
-                        if rate_limiter and reservation_id:
-                            await rate_limiter.settle_reservation(
-                                reservation_id, actual_cost
-                            )
+                    if not formatted_messages:
+                        # Outcome already reported in place on the progress
+                        # message (integration missing, budget refused).
+                        return
             finally:
                 if draft_streamer:
                     try:
@@ -1693,21 +1752,6 @@ class MessageOrchestrator:
         request_id = uuid4().hex
         bind_contextvars(request_id=request_id)
         try:
-            claude_integration = context.bot_data.get("claude_integration")
-            if not claude_integration:
-                await progress_msg.edit_text(
-                    "Claude integration not available. Check configuration."
-                )
-                return
-
-            current_dir = context.user_data.get(
-                "current_directory", self.settings.approved_directory
-            )
-            session_id = context.user_data.get("claude_session_id")
-            force_new = bool(context.user_data.get("force_new_session"))
-
-            verbose_level = self._get_verbose_level(context)
-
             # Stop button on the existing progress message; the run lifecycle
             # (interrupt event, lock, ActiveRequest, heartbeat) is owned by the
             # _claude_run context manager (same mechanism as agentic_text).
@@ -1717,137 +1761,37 @@ class MessageOrchestrator:
             except Exception:
                 pass
 
-            tool_log: List[Dict[str, Any]] = []
             mcp_images_media: List[ImageAttachment] = []
             formatted_messages: List["FormattedMessage"] = []
-
-            # Throttling already happened in rate_limit_middleware (group -1);
-            # this reference is only used to hold and settle the run's budget.
-            rate_limiter = context.bot_data.get("rate_limiter")
 
             async with self._claude_run(
                 user_id=user_id, chat=chat, progress_msg=progress_msg
             ) as interrupt_event:
-                on_stream = self._make_stream_callback(
-                    verbose_level,
-                    progress_msg,
-                    tool_log,
-                    time.monotonic(),
-                    mcp_images=mcp_images_media,
-                    approved_directory=self.settings.approved_directory,
-                    reply_markup=stop_kb,
+                # Same single implementation as the text path: reservation,
+                # is_error handling, cost settlement, persistence and formatting.
+                formatted_messages, _success = await self._run_and_format(
+                    update=update,
+                    context=context,
+                    prompt=prompt,
+                    user_id=user_id,
+                    progress_msg=progress_msg,
+                    request_id=request_id,
                     interrupt_event=interrupt_event,
+                    mcp_images=mcp_images_media,
+                    stop_kb=stop_kb,
+                    images=images,
                 )
-                # Hold budget for this run; released in the finally below on
-                # every path, so a soft error or exception costs nothing.
-                media_reservation_id: Optional[str] = None
-                media_cost = 0.0
-                if rate_limiter:
-                    media_reservation_id, reserve_error = (
-                        await rate_limiter.reserve_cost(
-                            user_id, estimate_message_cost(update)
-                        )
-                    )
-                    if reserve_error:
-                        await progress_msg.edit_text(
-                            escape_html(reserve_error), reply_markup=None
-                        )
-                        return
+                if not formatted_messages:
+                    # Outcome already reported in place on the progress message.
+                    return
 
-                try:
-                    claude_response = await claude_integration.run_command(
-                        prompt=prompt,
-                        working_directory=current_dir,
-                        user_id=user_id,
-                        session_id=session_id,
-                        on_stream=on_stream,
-                        force_new=force_new,
-                        images=images,
-                        interrupt_event=interrupt_event,
-                    )
-                    # A run flagged is_error produced nothing usable and is
-                    # not charged; it settles at 0.0 below.
-                    if not claude_response.is_error:
-                        media_cost = claude_response.cost
-                    # Same central persistence as the agentic text path: without
-                    # it a media run is missing from history, cost reporting and
-                    # the audit trail.
-                    await persist_interaction(
-                        context.bot_data.get("storage"),
-                        user_id,
-                        prompt,
-                        claude_response,
-                    )
-                except Exception:
-                    # Clear the dead "Working..." progress message (with its
-                    # now-useless Stop button) before the caller reports the
-                    # error — otherwise it lingers forever in the chat.
-                    try:
-                        await progress_msg.delete()
-                    except Exception:
-                        logger.debug("Failed to delete progress message, ignoring")
-                    raise
-                finally:
-                    if rate_limiter and media_reservation_id:
-                        await rate_limiter.settle_reservation(
-                            media_reservation_id, media_cost
-                        )
-
-            context.user_data["claude_session_id"] = claude_response.session_id
-
-            from .handlers.message import (
-                _update_working_directory_from_claude_response,
-            )
-            from .utils.formatting import ResponseFormatter
-
-            # The run completed without raising but the SDK flagged an error
-            # (e.g. no ResultMessage / budget cap). Surface it and skip the cost
-            # charge for a 'no_result_message' run that produced nothing usable.
-            if claude_response.is_error:
-                from .handlers.message import _format_error_message
-
-                try:
-                    await progress_msg.delete()
-                except Exception:
-                    logger.debug("Failed to delete progress message, ignoring")
-                await update.effective_message.reply_text(
-                    self._error_with_ref(
-                        _format_error_message(
-                            claude_response.error_type or "Claude returned an error."
-                        ),
-                        request_id,
-                    ),
-                    parse_mode="HTML",
-                )
-                return
-
-            # The run succeeded; from here on always clear the "Working..."
-            # message (with its Stop button) even if post-processing raises —
-            # otherwise the caller reports an error AND a stale progress message
-            # lingers.
+            # Always clear the "Working..." message (with its Stop button)
+            # before replying — a stale progress message next to an error
+            # response is worse than no progress message at all.
             try:
-                # New session produced a usable result — clear the one-shot flag
-                # now. A soft error (is_error above) keeps it so the next message
-                # still forces a new session, matching the exception path.
-                if force_new:
-                    context.user_data["force_new_session"] = False
-
-                _update_working_directory_from_claude_response(
-                    claude_response, context, self.settings, user_id
-                )
-
-                formatter = ResponseFormatter(self.settings)
-                # Redact secrets from the response body before it leaves the
-                # bot — tool OUTPUT (e.g. a printenv dump) can land here.
-                response_content = redact_secrets(claude_response.content or "")
-                if claude_response.interrupted:
-                    response_content = response_content + "\n\n_(Interrupted by user)_"
-                formatted_messages = formatter.format_claude_response(response_content)
-            finally:
-                try:
-                    await progress_msg.delete()
-                except Exception:
-                    logger.debug("Failed to delete progress message, ignoring")
+                await progress_msg.delete()
+            except Exception:
+                logger.debug("Failed to delete progress message, ignoring")
 
             # Use MCP-collected images (from send_image_to_user tool calls).
             await self._deliver_response(update, formatted_messages, mcp_images_media)
@@ -1975,7 +1919,7 @@ class MessageOrchestrator:
             claude_integration = context.bot_data.get("claude_integration")
             session_id = None
             if claude_integration:
-                existing = await claude_integration._find_resumable_session(
+                existing = await claude_integration.find_resumable_session(
                     update.effective_user.id, target_path
                 )
                 if existing:
@@ -2293,7 +2237,7 @@ class MessageOrchestrator:
         claude_integration = context.bot_data.get("claude_integration")
         session_id = None
         if claude_integration:
-            existing = await claude_integration._find_resumable_session(
+            existing = await claude_integration.find_resumable_session(
                 query.from_user.id, new_path
             )
             if existing:
@@ -2330,7 +2274,11 @@ class MessageOrchestrator:
         (CLI, VS Code, another operator's runs) carry no Telegram owner, so they
         are listed for admins only.
         """
-        from ..claude.local_sessions import _is_within, list_all_local_sessions
+        from ..claude.local_sessions import (
+            _is_within,
+            list_all_local_sessions,
+            load_session_previews,
+        )
 
         user_id = update.effective_user.id
         current_session_id = context.user_data.get("claude_session_id")
@@ -2378,9 +2326,11 @@ class MessageOrchestrator:
                 known = by_id.get(local.session_id)
                 if known is not None:
                     # Same session from both sources: keep the owned entry but
-                    # borrow the JSONL preview, which storage does not record.
+                    # borrow the JSONL previews, which storage does not record.
                     if not known.preview:
                         known.preview = local.first_message
+                    if not known.last_preview:
+                        known.last_preview = local.last_message
                     continue
                 entries.append(
                     _SessionEntry(
@@ -2388,6 +2338,7 @@ class MessageOrchestrator:
                         cwd=local.cwd,
                         when=datetime.fromtimestamp(local.mtime, tz=UTC),
                         preview=local.first_message,
+                        last_preview=local.last_message,
                         is_local=True,
                     )
                 )
@@ -2398,6 +2349,39 @@ class MessageOrchestrator:
         if not entries:
             await update.message.reply_text("No sessions found.")
             return
+
+        # Rows that came from storage carry no preview at all — an 8-hex id and
+        # a path do not tell two sessions in the same project apart. The JSONL
+        # for a known session is at a computable path, so filling them in is a
+        # couple of bounded reads per row rather than a directory walk.
+        needs_preview = [e for e in entries if not e.preview and not e.last_preview]
+        if needs_preview:
+            previews = await asyncio.to_thread(
+                lambda rows=needs_preview: [
+                    load_session_previews(Path(e.cwd), e.session_id) for e in rows
+                ]
+            )
+            for entry, (first_msg, last_msg) in zip(needs_preview, previews):
+                entry.preview = first_msg
+                entry.last_preview = last_msg
+
+        # Which session the *next* message in the current directory would
+        # actually resume. Not necessarily the id in user_data: after a timeout
+        # reset, or for a directory last used from another client, the resolver
+        # can land on a different session (or none).
+        current_dir = context.user_data.get(
+            "current_directory", self.settings.approved_directory
+        )
+        resumable_id: Optional[str] = None
+        claude_integration = context.bot_data.get("claude_integration")
+        if claude_integration is not None:
+            try:
+                resumable = await claude_integration.find_resumable_session(
+                    user_id, Path(current_dir)
+                )
+                resumable_id = resumable.session_id if resumable else None
+            except Exception:
+                logger.debug("Resumable-session lookup failed for /sessions")
 
         lines: list[str] = []
         keyboard_rows: list[list[InlineKeyboardButton]] = []
@@ -2418,15 +2402,25 @@ class MessageOrchestrator:
             else:
                 age_str = f"{age.seconds // 60}m ago"
 
-            marker = " \u25c0" if sess.session_id == current_session_id else ""
+            # "active" is the session the next message in the current
+            # directory actually resumes. The plain marker means "stored as
+            # current" without being the one the resolver picked.
+            if resumable_id and sess.session_id == resumable_id:
+                marker = " ● active"
+            elif sess.session_id == current_session_id:
+                marker = " ◀"
+            else:
+                marker = ""
             origin = " · local" if sess.is_local else ""
             preview = ""
             if sess.preview:
-                # Truncate to ~40 chars for display
-                msg_preview = sess.preview[:40]
-                if len(sess.preview) > 40:
-                    msg_preview += "…"
-                preview = f"\n   <i>{escape_html(msg_preview)}</i>"
+                first_line = escape_html(_truncate(sess.preview, 40))
+                preview += _PREVIEW_INDENT + f"<i>{first_line}</i>"
+            if sess.last_preview and sess.last_preview != sess.preview:
+                # The latest prompt is what identifies a long-running session;
+                # its opening line usually does not.
+                last_line = escape_html(_truncate(sess.last_preview, 40))
+                preview += _PREVIEW_INDENT + f"↳ <i>{last_line}</i>"
             lines.append(
                 f"{i}. <code>{escape_html(str(display_path))}/</code>"
                 f" · <code>{short_id}</code> · {age_str}{origin}{marker}{preview}"

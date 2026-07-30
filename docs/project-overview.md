@@ -48,7 +48,7 @@ A Telegram bot that provides remote access to Claude Code, allowing developers t
 
 ### Security & Access Control
 - Approved directory boundaries
-- User authentication (whitelist and token-based)
+- User authentication (Telegram ID whitelist)
 - Rate limiting per user
 - Webhook authentication (HMAC-SHA256, Bearer token)
 - Audit logging
@@ -111,7 +111,7 @@ Webhook/Cron -> EventBus -> AgentHandler -> ClaudeIntegration
 ### Security Model
 
 - **Directory Isolation**: All operations confined to approved directory tree
-- **User Authentication**: Whitelist or token-based access
+- **User Authentication**: Telegram ID whitelist (the only auth method — no token-login flow)
 - **Rate Limiting**: Prevent abuse and control costs
 - **Webhook Verification**: HMAC-SHA256 and Bearer token authentication
 - **Audit Trail**: Log all operations for security review

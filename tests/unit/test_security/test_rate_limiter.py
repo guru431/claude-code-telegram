@@ -208,6 +208,33 @@ class TestRateLimiter:
         assert rate_limiter.cost_tracker[user_id] == 0
         assert rate_limiter.cost_reset_time[user_id] > old_time
 
+    async def test_cost_window_follows_utc_calendar_day(self, rate_limiter):
+        """The window rolls with the UTC date, not 24h from first use.
+
+        Otherwise the in-memory limit and the persistent ``cost_tracking``
+        day (which groups by ``%Y-%m-%d``) count from different calendars.
+        """
+        user_id = 123
+        now = datetime.now(UTC)
+
+        # Late yesterday: less than 24h ago on most days, but the stored day
+        # has already rolled over, so the tracker must start fresh.
+        rate_limiter.cost_reset_time[user_id] = (now - timedelta(days=1)).replace(
+            hour=23, minute=30
+        )
+        rate_limiter.cost_tracker[user_id] = 3.0
+        rate_limiter._maybe_reset_cost_tracker(user_id)
+        assert rate_limiter.cost_tracker[user_id] == 0
+
+        # Start of today: nearly 24h old on a late-day run, still the same
+        # calendar day, so the spend stands.
+        rate_limiter.cost_reset_time[user_id] = now.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        rate_limiter.cost_tracker[user_id] = 3.0
+        rate_limiter._maybe_reset_cost_tracker(user_id)
+        assert rate_limiter.cost_tracker[user_id] == 3.0
+
     async def test_user_status_reporting(self, rate_limiter):
         """Test user status reporting."""
         user_id = 123

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Draft streaming in forum topics**: `ENABLE_STREAM_DRAFTS` now also applies to project topics, not just private chats. A chat that rejects drafts falls back to verbose progress edits automatically
+- **`/sessions` shows the newest prompt**: each row lists the first *and* the last user message (read from the session's JSONL tail), and marks with `● active` the session the next message would actually resume
+- **Public `ClaudeIntegration.find_resumable_session()`**: five handlers were reaching into the private `_find_resumable_session`
+
+### Fixed
+- **Flagged-error runs are charged**: a run that ends in `error_max_turns` or hits the `max_budget_usd` cap spent real tokens, so its cost now counts against the daily budget. Only a run with no `ResultMessage` (unknown cost) settles at 0
+- **Cost window follows the UTC calendar day** instead of a rolling 24h anchored at first use, so the in-memory limit and the persistent `cost_tracking` day no longer count from different calendars
+- **Media and text runs behave identically**: both go through one `_run_and_format`, so persistence, the `is_error` branch and cost settlement cannot drift apart
+- **A timed-out or crashed session is dropped** from `user_data`, so the next message starts fresh instead of resuming the stuck session (no `/new` needed)
+- **`ClaudeIntegration` no longer silently builds an unvalidated SDK manager**: `sdk_manager` is required, since a default-constructed one has no `SecurityValidator` and disables the `can_use_tool` checks
+- **Positive-value validation** on `RATE_LIMIT_REQUESTS`, `RATE_LIMIT_WINDOW`, `RATE_LIMIT_BURST`, `CLAUDE_MAX_TURNS` and `CLAUDE_TIMEOUT_SECONDS`
+- **`projects.tmp` cleanup**: a failed config dump in project discovery no longer leaves a truncated temp file behind
+
+### Removed
+- **Dead middleware**: `burst_protection_middleware` and `cost_tracking_middleware` were never registered; they are gone along with the test that kept them alive. `RATE_LIMIT_BURST` (bucket capacity) is the burst control that actually runs
+
+### Documentation
+- Removed the deleted `ToolMonitor` from the security docs (`CLAUDE.md`, `AGENTS.md`, `SECURITY.md`, `docs/tools.md`, `docs/configuration.md`, `docs/README.md`) and described what `DISABLE_TOOL_VALIDATION` really does (it clears the deny-list too)
+- One authentication story everywhere: the Telegram ID whitelist is the only method; the unused `user_tokens` table is marked as a migration artifact
+- `CLAUDE_MAX_COST_PER_USER` documented as a daily budget (it was described as lifetime)
+- `SECURITY.md`: supported version 1.5.x, a real vulnerability-reporting channel, and no more "burst protection" in the list of active measures
+- Tool reference lists all 20 default tools (`Skill`, `AskUserQuestion`, `EnterPlanMode`, `ExitPlanMode` were missing)
+
 ## [1.5.0] - 2026-03-04
 
 ### Added

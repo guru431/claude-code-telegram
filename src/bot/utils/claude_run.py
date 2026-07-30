@@ -85,9 +85,10 @@ async def run_claude_for_user(
     try:
         response = await run()
         if response is not None:
-            # A run flagged is_error produced nothing usable and is not charged.
-            if not getattr(response, "is_error", False):
-                actual_cost = getattr(response, "cost", 0.0) or 0.0
+            # Charge the reported cost even when the run is flagged is_error:
+            # error_max_turns and the max_budget_usd cap burn real tokens before
+            # failing. A run with no ResultMessage reports 0 and settles at 0.
+            actual_cost = getattr(response, "cost", 0.0) or 0.0
             await persist_interaction(storage, user_id, prompt, response)
         return response, None
     finally:

@@ -233,11 +233,18 @@ def discover_new_projects(
     # mid-write must not leave a truncated projects.yaml that fails to load on the
     # next startup (which would take the bot down).
     tmp_path = config_path.with_suffix(".tmp")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        yaml.dump(
-            data, f, default_flow_style=False, allow_unicode=True, sort_keys=False
-        )
-    os.replace(tmp_path, config_path)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            yaml.dump(
+                data, f, default_flow_style=False, allow_unicode=True, sort_keys=False
+            )
+        os.replace(tmp_path, config_path)
+    except Exception:
+        # A failed dump (e.g. a non-serialisable value in the config) would
+        # otherwise leave a truncated projects.tmp next to projects.yaml, one
+        # per failed run.
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     logger.info(
         "New projects discovered and added to config",

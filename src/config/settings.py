@@ -93,10 +93,10 @@ class Settings(BaseSettings):
         None, description="Claude model to use (defaults to CLI default if unset)"
     )
     claude_max_turns: int = Field(
-        DEFAULT_CLAUDE_MAX_TURNS, description="Max conversation turns"
+        DEFAULT_CLAUDE_MAX_TURNS, gt=0, description="Max conversation turns"
     )
     claude_timeout_seconds: int = Field(
-        DEFAULT_CLAUDE_TIMEOUT_SECONDS, description="Claude timeout"
+        DEFAULT_CLAUDE_TIMEOUT_SECONDS, gt=0, description="Claude timeout"
     )
     claude_max_cost_per_user: float = Field(
         DEFAULT_CLAUDE_MAX_COST_PER_USER, description="Max cost per user"
@@ -107,7 +107,6 @@ class Settings(BaseSettings):
     )
     # NOTE: When changing this list, also update docs/tools.md,
     # docs/configuration.md, .env.example,
-    # src/claude/facade.py (_get_admin_instructions),
     # and src/bot/orchestrator.py (_TOOL_ICONS).
     claude_allowed_tools: Optional[List[str]] = Field(
         default=[
@@ -178,14 +177,17 @@ class Settings(BaseSettings):
     )
 
     # Rate limiting
+    # All three must be positive: rate_limit_window is a divisor when the
+    # limiter computes its refill rate, and a zero capacity/burst would reject
+    # every request instead of "no limit".
     rate_limit_requests: int = Field(
-        DEFAULT_RATE_LIMIT_REQUESTS, description="Requests per window"
+        DEFAULT_RATE_LIMIT_REQUESTS, gt=0, description="Requests per window"
     )
     rate_limit_window: int = Field(
-        DEFAULT_RATE_LIMIT_WINDOW, description="Rate limit window seconds"
+        DEFAULT_RATE_LIMIT_WINDOW, gt=0, description="Rate limit window seconds"
     )
     rate_limit_burst: int = Field(
-        DEFAULT_RATE_LIMIT_BURST, description="Burst capacity"
+        DEFAULT_RATE_LIMIT_BURST, gt=0, description="Burst capacity"
     )
 
     # Storage
@@ -300,7 +302,10 @@ class Settings(BaseSettings):
     # Streaming drafts (Telegram sendMessageDraft)
     enable_stream_drafts: bool = Field(
         False,
-        description="Stream partial responses via sendMessageDraft (private chats only)",
+        description=(
+            "Stream partial responses via sendMessageDraft "
+            "(private chats and forum topics)"
+        ),
     )
     stream_draft_interval: float = Field(
         0.3,

@@ -34,7 +34,7 @@ src/
     monitor.py             -- валидация tool calls
   config/                  -- Pydantic Settings, feature flags, YAML-загрузчик
   storage/                 -- SQLite: repository pattern, миграции
-  security/                -- auth (whitelist + token), валидация, rate limiter, аудит
+  security/                -- auth (whitelist по Telegram ID), валидация, rate limiter, аудит
   api/                     -- FastAPI webhook-сервер (GitHub HMAC-SHA256, Bearer)
   events/                  -- EventBus (async pub/sub)
   scheduler/               -- APScheduler cron-задачи
@@ -60,6 +60,7 @@ docs/                      -- документация (setup, configuration, to
 - **Мульти-проектные топики** -- маршрутизация по проектам через Telegram topics
 - **MCP-сервер** -- отправка изображений пользователю из Claude
 - **5-уровневая безопасность**: auth -> directory isolation -> input validation -> rate limiting -> audit
+  (input validation работает только в classic-режиме; в agentic-режиме, который включён по умолчанию, текст — это промт к Claude, и защита переносится на уровень инструментов — см. [SECURITY.md](SECURITY.md))
 
 ## Конфигурация
 

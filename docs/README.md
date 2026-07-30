@@ -8,7 +8,7 @@ Quick links to every doc in this project. Start with the [README](../README.md) 
 |----------|-------------|
 | [Setup & Installation](setup.md) | Prerequisites, authentication options, install methods, and first-run troubleshooting |
 | [Configuration](configuration.md) | Full environment variable reference, feature flags, and Pydantic Settings internals |
-| [Available Tools](tools.md) | The 16 tools Claude can use, allowlist/disallowlist config, and ToolMonitor behaviour |
+| [Available Tools](tools.md) | The 20 tools Claude can use, allowlist/disallowlist config, and the per-call security checks |
 | [Development](development.md) | Local dev setup, running tests, linting, project structure, and contribution workflow |
 | [Systemd Setup](../SYSTEMD_SETUP.md) | Running the bot as a persistent systemd user service |
 

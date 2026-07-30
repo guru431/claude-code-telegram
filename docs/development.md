@@ -279,7 +279,7 @@ We aim for >80% test coverage. Current coverage:
 - **Test utilities** for easy test configuration
 
 #### TODO-3: Authentication & Security Framework
-- Multi-provider authentication system (whitelist and token-based)
+- Telegram ID whitelist authentication (`WhitelistAuthProvider` — the only provider)
 - Rate limiting with token bucket algorithm
 - Comprehensive input validation and path traversal prevention
 - Security audit logging with risk assessment

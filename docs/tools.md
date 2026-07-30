@@ -4,9 +4,9 @@ This document describes the tools that Claude Code can use when interacting thro
 
 ## Overview
 
-By default, the bot allows **16 tools**. These are configured via the `CLAUDE_ALLOWED_TOOLS` environment variable and validated at runtime by the [ToolMonitor](../src/claude/monitor.py).
+By default, the bot allows **20 tools**. These are configured via the `CLAUDE_ALLOWED_TOOLS` environment variable and passed to the SDK as its allow-list, so a tool outside the list is never offered to Claude in the first place. Calls that are allowed by name are still checked per-call by the SDK [`can_use_tool` callback](../src/claude/sdk_integration.py) (path boundaries, secret basenames) and by [`check_bash_directory_boundary`](../src/claude/monitor.py).
 
-When Claude uses a tool during a conversation, the tool name appears in real-time if verbose output is enabled (`/verbose 1` or `/verbose 2`). If Claude attempts to use a tool that is not in the allowed list, the bot blocks the call and displays an error with the list of currently allowed tools.
+When Claude uses a tool during a conversation, the tool name appears in real-time if verbose output is enabled (`/verbose 1` or `/verbose 2`). A tool outside the allow-list is not available to Claude at all, so there is no "blocked tool" message to see — narrowing the list simply removes the capability.
 
 ## Tool Reference
 
@@ -60,6 +60,15 @@ When Claude uses a tool during a conversation, the tool name appears in real-tim
 |------|------|-------------|
 | **Task** | 🧠 | Launch a sub-agent to handle complex, multi-step operations autonomously. The sub-agent runs with its own context and returns a result when finished. |
 | **TaskOutput** | 🧠 | Read the output of a background sub-agent launched by **Task**. Required for retrieving results from agents that were run in the background. |
+| **Skill** | 🧩 | Invoke a packaged skill — a set of instructions for a specific kind of task, loaded on demand. |
+
+### Planning & Interaction
+
+| Tool | Icon | Description |
+|------|------|-------------|
+| **AskUserQuestion** | ❓ | Ask you a multiple-choice question when a decision cannot be made from the request alone. |
+| **EnterPlanMode** | 📋 | Switch to planning: research and propose an approach before changing anything. |
+| **ExitPlanMode** | 📋 | Leave planning and present the finished plan for approval. |
 
 ## Verbose Output
 
@@ -92,16 +101,18 @@ The default allowed tools list is defined in `src/config/settings.py` and can be
 
 ```bash
 # Allow only specific tools (comma-separated)
-CLAUDE_ALLOWED_TOOLS=Read,Write,Edit,Bash,Glob,Grep,LS,Task,TaskOutput,MultiEdit,NotebookRead,NotebookEdit,WebFetch,TodoRead,TodoWrite,WebSearch
+CLAUDE_ALLOWED_TOOLS=Read,Write,Edit,Bash,Glob,Grep,LS,Task,TaskOutput,MultiEdit,NotebookRead,NotebookEdit,WebFetch,TodoRead,TodoWrite,WebSearch,Skill,AskUserQuestion,EnterPlanMode,ExitPlanMode
 
 # Explicitly block specific tools (comma-separated, takes precedence over allowed)
 CLAUDE_DISALLOWED_TOOLS=Bash,Write
 ```
 
-To allow all tools without name-based validation:
+To hand the SDK no tool restrictions at all (e.g. to reach MCP tools that are not on the list):
 
 ```bash
-# Skip tool allow/disallow checks (path and bash safety checks still apply)
+# Passes BOTH allowed_tools=None AND disallowed_tools=None to the SDK, so
+# CLAUDE_DISALLOWED_TOOLS stops being enforced too. Path and bash boundary
+# checks still apply. Trusted environments only.
 DISABLE_TOOL_VALIDATION=true
 ```
 

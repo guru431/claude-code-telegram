@@ -60,11 +60,25 @@ class TestBudgetAccounting:
         run.assert_not_awaited()
         limiter.settle_reservation.assert_not_awaited()
 
-    async def test_error_response_settles_at_zero(self):
+    async def test_error_response_still_charges_reported_cost(self):
+        """A flagged-error run burned real tokens; the budget must see them."""
         limiter = _rate_limiter()
 
         await run_claude_for_user(
             run=AsyncMock(return_value=_response(cost=0.9, is_error=True)),
+            prompt="hi",
+            user_id=7,
+            rate_limiter=limiter,
+        )
+
+        limiter.settle_reservation.assert_awaited_once_with("res-1", 0.9)
+
+    async def test_error_response_without_cost_settles_at_zero(self):
+        """A run that produced no ResultMessage has no known cost."""
+        limiter = _rate_limiter()
+
+        await run_claude_for_user(
+            run=AsyncMock(return_value=_response(cost=0.0, is_error=True)),
             prompt="hi",
             user_id=7,
             rate_limiter=limiter,

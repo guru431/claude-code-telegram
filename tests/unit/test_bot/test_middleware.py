@@ -281,30 +281,6 @@ class TestMiddlewareBlocksSubsequentGroups:
         assert auth_mod._last_rejection_gc == gc_after_first
         assert 4242 in auth_mod._last_rejection_reply
 
-    async def test_burst_tracker_state_persists_across_updates(self, bot):
-        """burst_protection stores state in bot_data, which persists per-app.
-
-        Guards the invariant that middleware ``data`` is the persistent
-        ``context.bot_data`` mapping, not a fresh per-update dict -- burst
-        protection would silently stop working if that changed.
-        """
-        from src.bot.middleware.rate_limit import burst_protection_middleware
-
-        event = MagicMock()
-        event.effective_user = MagicMock()
-        event.effective_user.id = 555
-        event.effective_message = MagicMock()
-        event.effective_message.reply_text = AsyncMock()
-
-        async def handler(ev, d):
-            return None
-
-        data: dict = {}
-        for _ in range(3):
-            await burst_protection_middleware(handler, event, data)
-
-        assert len(data["burst_tracker"][555]["recent_requests"]) == 3
-
     async def test_dependencies_injected_before_middleware_runs(
         self, bot, mock_update, mock_context
     ):

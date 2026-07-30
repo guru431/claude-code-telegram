@@ -439,13 +439,20 @@ class RateLimiter:
         return self.request_buckets[user_id]
 
     def _maybe_reset_cost_tracker(self, user_id: int) -> None:
-        """Reset cost tracker if reset period has passed."""
-        now = datetime.now(UTC)
-        last_reset = self.cost_reset_time.get(user_id, now - timedelta(days=1))
+        """Zero the cost tracker when the UTC calendar day has rolled over.
 
-        # Reset daily (configurable)
-        reset_interval = timedelta(hours=24)
-        if now - last_reset >= reset_interval:
+        The window has to be the same day the persistent ``cost_tracking`` table
+        aggregates by — ``CostTrackingRepository.get_daily_cost`` groups on
+        ``strftime('%Y-%m-%d')``. A rolling 24h window anchored at first use
+        would drift away from it: a restart at 23:00 UTC anchors the window
+        there while the stored day rolls at 00:00, so for almost a full day the
+        in-memory limit counts from a different day than the value it hydrated
+        from.
+        """
+        now = datetime.now(UTC)
+        last_reset = self.cost_reset_time.get(user_id)
+
+        if last_reset is None or last_reset.date() != now.date():
             old_cost = self.cost_tracker[user_id]
             self.cost_tracker[user_id] = 0
             self.cost_reset_time[user_id] = now
@@ -472,14 +479,14 @@ class RateLimiter:
         Non-mutating counterpart of ``_maybe_reset_cost_tracker`` for the
         read path: it reports the cost the user *would* have after any due
         daily reset, plus the effective reset timestamp, without touching
-        ``self.cost_tracker`` or ``self.cost_reset_time``.
+        ``self.cost_tracker`` or ``self.cost_reset_time``. Uses the same UTC
+        calendar-day boundary, so the two never disagree.
         """
         now = datetime.now(UTC)
-        last_reset = self.cost_reset_time.get(user_id, now - timedelta(days=1))
-        reset_interval = timedelta(hours=24)
-        if now - last_reset >= reset_interval:
+        last_reset = self.cost_reset_time.get(user_id)
+        if last_reset is None or last_reset.date() != now.date():
             return 0.0, now
-        return self.cost_tracker[user_id], self.cost_reset_time.get(user_id, now)
+        return self.cost_tracker[user_id], last_reset
 
     async def record_actual_cost(
         self, user_id: int, cost: float, reservation_id: Optional[str] = None
