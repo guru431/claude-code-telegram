@@ -351,7 +351,7 @@ class Settings(BaseSettings):
     )
     api_server_port: int = Field(8080, description="Webhook API server port")
     enable_scheduler: bool = Field(False, description="Enable job scheduler")
-    github_webhook_secret: Optional[str] = Field(
+    github_webhook_secret: Optional[SecretStr] = Field(
         None, description="GitHub webhook HMAC secret"
     )
     github_webhook_events: Optional[List[str]] = Field(
@@ -360,7 +360,7 @@ class Settings(BaseSettings):
             "GitHub event types that trigger an agent run; others are ignored"
         ),
     )
-    webhook_api_secret: Optional[str] = Field(
+    webhook_api_secret: Optional[SecretStr] = Field(
         None, description="Shared secret for generic webhook providers"
     )
     notification_chat_ids: Optional[List[int]] = Field(

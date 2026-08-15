@@ -260,7 +260,14 @@ class QuickActionManager:
     async def execute_action(
         self, action_id: str, session: SessionModel, callback: Optional[Callable] = None
     ) -> str:
-        """Execute a quick action.
+        """Resolve a quick action to the prompt to send Claude.
+
+        Returns ``QuickAction.prompt`` — the documented single source of truth
+        for what a quick action asks Claude to do. It used to return
+        ``action.command`` (the bare routing keyword, e.g. "test"), which
+        contradicted that docstring and would have been sent to Claude verbatim.
+        ``handle_quick_action_callback`` reads ``action.prompt`` directly and is
+        the live path today; this keeps the two in agreement.
 
         Args:
             action_id: ID of action to execute
@@ -268,7 +275,7 @@ class QuickActionManager:
             callback: Optional callback for command execution
 
         Returns:
-            Command to execute
+            The prompt to send to Claude.
         """
         action = self.actions.get(action_id)
         if not action:
@@ -278,5 +285,4 @@ class QuickActionManager:
             f"Executing quick action: {action.name} for session {session.session_id}"
         )
 
-        # Return the command - actual execution is handled by the bot
-        return action.command
+        return action.prompt

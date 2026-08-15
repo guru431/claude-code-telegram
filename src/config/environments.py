@@ -1,5 +1,7 @@
 """Environment-specific configuration overrides."""
 
+import tempfile
+from pathlib import Path
 from typing import Any, Dict
 
 
@@ -39,7 +41,10 @@ class TestingConfig:
     debug: bool = True
     development_mode: bool = True
     database_url: str = "sqlite:///:memory:"
-    approved_directory: str = "/tmp/test_projects"
+    # Platform temp dir, not a hardcoded "/tmp": tests that read this class
+    # directly (rather than going through create_test_config) would otherwise
+    # point at a non-existent path on Windows.
+    approved_directory: str = str(Path(tempfile.gettempdir()) / "test_projects")
     enable_telemetry: bool = False
     claude_timeout_seconds: int = 30  # Faster timeout for tests
     rate_limit_requests: int = 1000  # No rate limiting in tests

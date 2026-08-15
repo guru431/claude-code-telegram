@@ -227,9 +227,13 @@ async def validate_message_content(
             )
             return False, "Suspicious URL detected"
 
-    # Sanitize content using security validator
+    # Sanitize content using security validator. Compare against the same
+    # whitespace normalisation the sanitiser applies (" ".join(split())):
+    # otherwise deeply indented code loses half its length to collapsed
+    # whitespace alone and gets rejected as "dangerous characters".
     sanitized = security_validator.sanitize_command_input(text)
-    if len(sanitized) < len(text) * 0.5:  # More than 50% removed
+    baseline = " ".join(text.split())
+    if len(sanitized) < len(baseline) * 0.5:  # More than 50% removed
         if audit_logger:
             await audit_logger.log_security_violation(
                 user_id=user_id,
@@ -242,7 +246,7 @@ async def validate_message_content(
         logger.warning(
             "Excessive content sanitization required",
             user_id=user_id,
-            original_length=len(text),
+            original_length=len(baseline),
             sanitized_length=len(sanitized),
         )
         return False, "Content contains too many dangerous characters"

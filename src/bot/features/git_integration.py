@@ -316,7 +316,10 @@ class GitIntegration:
                 "git",
                 "log",
                 f"--max-count={limit}",
-                "--pretty=format:%H|%an|%aI|%s",
+                # \x1f (unit separator) instead of '|': a commit subject may
+                # legitimately contain a pipe, which would make the field count
+                # wrong and silently drop the commit from the history.
+                "--pretty=format:%H%x1f%an%x1f%aI%x1f%s",
                 "--numstat",
                 "--",
                 file_path,
@@ -331,9 +334,9 @@ class GitIntegration:
             if not line:
                 continue
 
-            if "|" in line and len(line.split("|")) == 4:
+            parts = line.split("\x1f", 3)
+            if len(parts) == 4:
                 # Commit info line
-                parts = line.split("|")
 
                 if current_commit:
                     commits.append(current_commit)

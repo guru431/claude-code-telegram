@@ -217,6 +217,9 @@ class ResponseFormatter:
         def _truncate_code(m: re.Match) -> str:  # type: ignore[type-arg]
             full = m.group(0)
             if len(full) > self.max_code_block_length:
+                # Keep the original opening tags so a truncated block keeps the
+                # `class="language-..."` hint that short blocks have.
+                opening = full[: full.index(">", full.index("<code")) + 1]
                 # m.group(1) is the inner content of an ALREADY-escaped <pre><code>
                 # block (markdown_to_telegram_html ran first). Do not escape it a
                 # second time, and back the cut off so it never lands inside an
@@ -226,7 +229,7 @@ class ResponseFormatter:
                 amp = truncated.rfind("&")
                 if amp != -1 and ";" not in truncated[amp:]:
                     truncated = truncated[:amp]
-                return f"<pre><code>{truncated}\n... (truncated)</code></pre>"
+                return f"{opening}{truncated}\n... (truncated)</code></pre>"
             return full
 
         return re.sub(

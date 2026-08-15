@@ -1,9 +1,13 @@
 """Budget-reservation invariants for the classic message handlers.
 
 Every classic path that runs Claude must take a cost reservation before the
-run and settle it in a ``finally``. The invariant under test is that a failed
-run (exception) or an empty run (``is_error``) settles at ``0.0`` and leaves
-the user's budget exactly where it started — the hold must never leak.
+run and settle it in a ``finally``. The invariants under test:
+
+- a run that raised settles at ``0.0`` and leaves the user's budget exactly
+  where it started — the hold must never leak;
+- a run flagged ``is_error`` still settles at the cost Claude reported, exactly
+  as the agentic path does: error_max_turns and the budget cap burn real tokens
+  before failing, and ignoring them lets a retry loop spend for free.
 """
 
 from datetime import UTC, datetime
@@ -31,6 +35,7 @@ def _claude_response(cost: float = 0.42, is_error: bool = False) -> SimpleNamesp
         cost=cost,
         content="done",
         is_error=is_error,
+        error_type="error_max_turns" if is_error else None,
     )
 
 
@@ -101,6 +106,14 @@ def _assert_settled_free(limiter: RateLimiter) -> None:
     assert limiter.cost_tracker[USER_ID] == pytest.approx(0.0)
 
 
+def _assert_settled_at(limiter: RateLimiter, cost: float) -> None:
+    """The hold was released at the run's real cost and nothing leaked."""
+    assert limiter.settled_costs == [pytest.approx(cost)]
+    assert limiter.reservations == {}
+    assert not limiter.user_reservations.get(USER_ID)
+    assert limiter.cost_tracker[USER_ID] == pytest.approx(cost)
+
+
 # --------------------------------------------------------------------------
 # 1. classic text
 # --------------------------------------------------------------------------
@@ -119,14 +132,14 @@ async def test_text_run_failure_releases_reservation(tmp_path, rate_limiter):
     _assert_settled_free(rate_limiter)
 
 
-async def test_text_is_error_releases_reservation(tmp_path, rate_limiter):
-    """A run flagged is_error produced nothing usable and is not charged."""
+async def test_text_is_error_charges_reported_cost(tmp_path, rate_limiter):
+    """A run flagged is_error still burned tokens, so it is still charged."""
     await _run_text(
         tmp_path,
         rate_limiter,
         AsyncMock(return_value=_claude_response(cost=0.42, is_error=True)),
     )
-    _assert_settled_free(rate_limiter)
+    _assert_settled_at(rate_limiter, 0.42)
 
 
 async def test_text_success_charges_actual_cost(tmp_path, rate_limiter):
@@ -164,13 +177,13 @@ async def test_document_run_failure_releases_reservation(tmp_path, rate_limiter)
     _assert_settled_free(rate_limiter)
 
 
-async def test_document_is_error_releases_reservation(tmp_path, rate_limiter):
+async def test_document_is_error_charges_reported_cost(tmp_path, rate_limiter):
     await _run_document(
         tmp_path,
         rate_limiter,
         AsyncMock(return_value=_claude_response(cost=0.42, is_error=True)),
     )
-    _assert_settled_free(rate_limiter)
+    _assert_settled_at(rate_limiter, 0.42)
 
 
 async def test_document_does_not_double_throttle(tmp_path, rate_limiter):
@@ -216,13 +229,13 @@ async def test_photo_run_failure_releases_reservation(tmp_path, rate_limiter):
     _assert_settled_free(rate_limiter)
 
 
-async def test_photo_is_error_releases_reservation(tmp_path, rate_limiter):
+async def test_photo_is_error_charges_reported_cost(tmp_path, rate_limiter):
     await _run_photo(
         tmp_path,
         rate_limiter,
         AsyncMock(return_value=_claude_response(cost=0.42, is_error=True)),
     )
-    _assert_settled_free(rate_limiter)
+    _assert_settled_at(rate_limiter, 0.42)
 
 
 # --------------------------------------------------------------------------
@@ -254,13 +267,13 @@ async def test_voice_run_failure_releases_reservation(tmp_path, rate_limiter):
     _assert_settled_free(rate_limiter)
 
 
-async def test_voice_is_error_releases_reservation(tmp_path, rate_limiter):
+async def test_voice_is_error_charges_reported_cost(tmp_path, rate_limiter):
     await _run_voice(
         tmp_path,
         rate_limiter,
         AsyncMock(return_value=_claude_response(cost=0.42, is_error=True)),
     )
-    _assert_settled_free(rate_limiter)
+    _assert_settled_at(rate_limiter, 0.42)
 
 
 # --------------------------------------------------------------------------

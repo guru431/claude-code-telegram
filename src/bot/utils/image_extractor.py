@@ -131,6 +131,12 @@ def open_validated(attachment: ImageAttachment) -> BinaryIO:
     caller will read from, so no further swap can affect it. The re-resolved
     path is also re-checked against the recorded approved directory.
 
+    Known limit: identity is ``(st_dev, st_ino, st_size)``, i.e. metadata. A
+    rewrite in place that keeps the inode *and* the exact byte count passes.
+    That is deliberate — the check exists to stop the file being swapped for one
+    outside the approved directory, not to freeze its contents, and hashing
+    every image on delivery would cost a full extra read.
+
     Raises:
         ImageIdentityError: if the boundary or the recorded identity no longer
             holds.

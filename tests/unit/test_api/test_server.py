@@ -5,6 +5,7 @@ import hmac
 from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from src.api.server import (
     _try_record_webhook,
@@ -17,15 +18,23 @@ from src.events.types import WebhookEvent
 from src.storage.facade import Storage
 
 
+def _secret(value):  # type: ignore[no-untyped-def]
+    """Wrap a secret in SecretStr, passing None straight through."""
+    return SecretStr(value) if value is not None else None
+
+
 def make_settings(**overrides):  # type: ignore[no-untyped-def]
     """Create a minimal mock settings object."""
     from unittest.mock import MagicMock
 
     settings = MagicMock()
     settings.development_mode = True
-    settings.github_webhook_secret = overrides.get("github_webhook_secret", "gh-secret")
-    settings.webhook_api_secret = overrides.get(
-        "webhook_api_secret", "default-api-secret"
+    # Both are SecretStr on the real Settings model.
+    settings.github_webhook_secret = _secret(
+        overrides.get("github_webhook_secret", "gh-secret")
+    )
+    settings.webhook_api_secret = _secret(
+        overrides.get("webhook_api_secret", "default-api-secret")
     )
     settings.api_server_port = 8080
     settings.api_server_host = "127.0.0.1"

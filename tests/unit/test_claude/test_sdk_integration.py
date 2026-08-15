@@ -14,12 +14,14 @@ from claude_agent_sdk import (
     TextBlock,
     ToolPermissionContext,
 )
+from claude_agent_sdk._errors import MessageParseError
 from claude_agent_sdk.types import StreamEvent
 
 from src.claude.sdk_integration import (
     ClaudeResponse,
     ClaudeSDKManager,
     StreamUpdate,
+    _iter_sdk_messages,
     _make_can_use_tool_callback,
 )
 from src.config.settings import Settings
@@ -1048,6 +1050,56 @@ class TestCanUseToolCallback:
 
         assert len(captured_options) == 1
         assert captured_options[0].can_use_tool is None
+
+
+class TestIterSdkMessages:
+    """Pin the raw-stream path and its public-API fallback.
+
+    ``client._query`` is private SDK API: if a release renames or drops it, the
+    fallback must keep the bot running instead of AttributeError-ing on every
+    message.
+    """
+
+    async def test_uses_raw_query_stream_when_available(self):
+        client = _mock_client(_make_assistant_message("from raw"))
+        client.receive_messages = MagicMock(
+            side_effect=AssertionError("public API must not be used")
+        )
+
+        messages = [m async for m in _iter_sdk_messages(client)]
+
+        assert len(messages) == 1
+        assert messages[0].content[0].text == "from raw"
+
+    async def test_falls_back_to_public_receive_messages(self):
+        client = AsyncMock()
+        # Simulate an SDK version without the private query object.
+        client._query = None
+
+        async def receive_messages():
+            yield _make_assistant_message("from public")
+
+        client.receive_messages = receive_messages
+
+        messages = [m async for m in _iter_sdk_messages(client)]
+
+        assert len(messages) == 1
+        assert messages[0].content[0].text == "from public"
+
+    async def test_unparseable_message_does_not_stop_the_stream(self):
+        client = _mock_client("bad", _make_result_message())
+
+        with patch(
+            "src.claude.sdk_integration.parse_message",
+            side_effect=lambda x: (
+                (_ for _ in ()).throw(MessageParseError("nope", x)) if x == "bad" else x
+            ),
+        ):
+            messages = [m async for m in _iter_sdk_messages(client)]
+
+        # The unparseable message is skipped; the ResultMessage still arrives.
+        assert len(messages) == 1
+        assert isinstance(messages[0], ResultMessage)
 
 
 class TestSessionIdFallback:

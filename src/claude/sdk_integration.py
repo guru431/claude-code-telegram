@@ -173,6 +173,38 @@ def _make_can_use_tool_callback(
     return can_use_tool
 
 
+async def _iter_sdk_messages(client: Any) -> AsyncIterator[Any]:
+    """Yield parsed SDK messages for a connected client.
+
+    Prefers the raw stream behind ``client._query`` and parses each message
+    here: when ``parse_message`` raises inside the SDK's own
+    ``receive_messages()`` generator (e.g. on a ``rate_limit_event``), Python
+    terminates that generator permanently and every later message is lost --
+    including the ``ResultMessage`` the whole run depends on.
+
+    ``_query`` is private API, so a future SDK release may rename or drop it.
+    Fall back to the public ``client.receive_messages()`` in that case: it is
+    less resilient to unparseable messages, but it keeps the bot working
+    instead of failing every run with an AttributeError.
+    """
+    query = getattr(client, "_query", None)
+    raw_receive = getattr(query, "receive_messages", None)
+
+    if raw_receive is None:
+        logger.warning("SDK raw message stream unavailable; falling back to public API")
+        async for message in client.receive_messages():
+            yield message
+        return
+
+    async for raw_data in raw_receive():
+        try:
+            message = parse_message(raw_data)
+        except MessageParseError as e:
+            logger.debug("Skipping unparseable message", error=str(e))
+            continue
+        yield message
+
+
 class ClaudeSDKManager:
     """Manage Claude Code SDK integration."""
 
@@ -408,24 +440,8 @@ class ClaudeSDKManager:
                     else:
                         await client.query(prompt)
 
-                    # Iterate over raw messages and parse them ourselves
-                    # so that MessageParseError (e.g. from rate_limit_event)
-                    # doesn't kill the underlying async generator. When
-                    # parse_message raises inside the SDK's receive_messages()
-                    # generator, Python terminates that generator permanently,
-                    # causing us to lose all subsequent messages including
-                    # the ResultMessage.
                     try:
-                        async for raw_data in client._query.receive_messages():
-                            try:
-                                message = parse_message(raw_data)
-                            except MessageParseError as e:
-                                logger.debug(
-                                    "Skipping unparseable message",
-                                    error=str(e),
-                                )
-                                continue
-
+                        async for message in _iter_sdk_messages(client):
                             messages.append(message)
 
                             if isinstance(message, ResultMessage):

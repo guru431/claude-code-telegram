@@ -544,7 +544,8 @@ class RateLimiter:
 
         # Get cost status (computed without mutating the tracker)
         current_cost, effective_reset = self._effective_cost(user_id)
-        cost_remaining = max(0, self.config.claude_max_cost_per_user - current_cost)
+        cost_limit = self.config.claude_max_cost_per_user
+        cost_remaining = max(0, cost_limit - current_cost)
         # Portion of ``current`` that is an in-flight hold rather than spend.
         reserved = sum(
             self.reservations[rid].amount
@@ -557,9 +558,11 @@ class RateLimiter:
             "cost_usage": {
                 "current": current_cost,
                 "reserved": reserved,
-                "limit": self.config.claude_max_cost_per_user,
+                "limit": cost_limit,
                 "remaining": cost_remaining,
-                "utilization": current_cost / self.config.claude_max_cost_per_user,
+                # A limit of 0 forbids spending outright; report it as fully
+                # utilised instead of dividing by zero (mirrors audit.py).
+                "utilization": (current_cost / cost_limit if cost_limit > 0 else 1.0),
             },
             "last_reset": effective_reset.isoformat(),
         }
@@ -591,7 +594,17 @@ class RateLimiter:
                 inactive_users.append(user_id)
 
         # Clean up data
+        evicted = []
         for user_id in inactive_users:
+            lock = self.locks[user_id]
+            if lock.locked():
+                # Somebody is mid-``reserve_cost``/``settle_reservation`` under
+                # this lock. Dropping it now would hand the next caller a fresh
+                # lock from the defaultdict, putting two coroutines in the same
+                # critical section over a tracker entry we just deleted.
+                continue
+            # No await between the check above and the pops below, so the lock
+            # cannot be taken underneath us.
             self.request_buckets.pop(user_id, None)
             self.cost_tracker.pop(user_id, None)
             self.cost_reset_time.pop(user_id, None)
@@ -600,7 +613,9 @@ class RateLimiter:
             # Forget the hydration marker too: the tracker this user's spend
             # lived in is gone, so a later request must re-read it from storage.
             self._hydrated_users.discard(user_id)
+            evicted.append(user_id)
 
+        inactive_users = evicted
         if inactive_users:
             logger.info(
                 "Cleaned up inactive users",

@@ -310,18 +310,38 @@ class ClaudeCodeBot:
             SecurityError,
         )
 
-        error_messages = {
-            AuthenticationError: "🔒 Authentication required. Please contact the administrator.",
-            SecurityError: "🛡️ Security violation detected. This incident has been logged.",
-            RateLimitExceeded: "⏱️ Rate limit exceeded. Please wait before sending more messages.",
-            ConfigurationError: "⚙️ Configuration error. Please contact the administrator.",
-            asyncio.TimeoutError: "⏰ Operation timed out. Please try again with a simpler request.",
-        }
+        # Ordered most specific first and matched with isinstance: an exact
+        # ``type(error)`` lookup gives every subclass of a registered error the
+        # generic text instead of the message written for its base class.
+        error_messages = [
+            (
+                AuthenticationError,
+                "🔒 Authentication required. Please contact the administrator.",
+            ),
+            (
+                SecurityError,
+                "🛡️ Security violation detected. This incident has been logged.",
+            ),
+            (
+                RateLimitExceeded,
+                "⏱️ Rate limit exceeded. Please wait before sending more messages.",
+            ),
+            (
+                ConfigurationError,
+                "⚙️ Configuration error. Please contact the administrator.",
+            ),
+            (
+                asyncio.TimeoutError,
+                "⏰ Operation timed out. Please try again with a simpler request.",
+            ),
+        ]
 
         error_type = type(error)
-        user_message = error_messages.get(
-            error_type, "❌ An unexpected error occurred. Please try again."
-        )
+        user_message = "❌ An unexpected error occurred. Please try again."
+        for error_cls, message in error_messages:
+            if isinstance(error, error_cls):
+                user_message = message
+                break
 
         # Try to notify user
         if update and update.effective_message:
@@ -336,11 +356,18 @@ class ClaudeCodeBot:
         audit_logger: Optional[AuditLogger] = context.bot_data.get("audit_logger")
         if audit_logger and update and update.effective_user:
             try:
-                await audit_logger.log_security_violation(
+                # Not a security violation: this handler also catches Telegram
+                # network hiccups and plain bugs. Filing those as violations
+                # pollutes the security dashboard's top_violation_types and
+                # buries the real ones.
+                await audit_logger.log_session_event(
                     user_id=update.effective_user.id,
-                    violation_type="system_error",
-                    details=f"Error type: {error_type.__name__}, Message: {str(error)}",
-                    severity="medium",
+                    action="system_error",
+                    success=False,
+                    details={
+                        "error_type": error_type.__name__,
+                        "message": str(error),
+                    },
                 )
             except Exception:
                 logger.exception("Failed to log error to audit system")

@@ -22,6 +22,7 @@ from ..middleware.rate_limit import estimate_message_cost
 from ..utils.claude_run import run_claude_for_user
 from ..utils.html_format import escape_html
 from ..utils.session_control import terminate_user_session
+from ..utils.upload_limits import format_file_size
 
 logger = structlog.get_logger()
 
@@ -565,7 +566,7 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     # Get file size
                     try:
                         size = item.stat().st_size
-                        size_str = _format_file_size(size)
+                        size_str = format_file_size(size)
                         files.append(f"📄 {safe_name} ({size_str})")
                     except OSError:
                         files.append(f"📄 {safe_name}")
@@ -691,8 +692,24 @@ async def change_directory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                         )
                     return
             else:
-                resolved_path = current_dir / target_path
-                resolved_path = resolved_path.resolve()
+                # DI is expected to always supply the validator; if it ever does
+                # not, fall back to an explicit boundary check rather than
+                # silently allowing an unchecked path out of the approved root.
+                resolved_path = (current_dir / target_path).resolve()
+                if not _is_within_root(resolved_path, directory_root):
+                    await update.message.reply_text(
+                        "❌ <b>Access Denied</b>\n\n"
+                        "Path is outside the approved directory.",
+                        parse_mode="HTML",
+                    )
+                    if audit_logger:
+                        await audit_logger.log_security_violation(
+                            user_id=user_id,
+                            violation_type="path_traversal_attempt",
+                            details=f"Attempted path: {target_path}",
+                            severity="medium",
+                        )
+                    return
 
         if project_root and not _is_within_root(resolved_path, project_root):
             await update.message.reply_text(
@@ -760,7 +777,7 @@ async def change_directory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await audit_logger.log_command(user_id, "cd", [target_path], True)
 
     except Exception as e:
-        error_msg = f"❌ <b>Error changing directory</b>\n\n{str(e)}"
+        error_msg = f"❌ <b>Error changing directory</b>\n\n{escape_html(str(e))}"
         await update.message.reply_text(error_msg, parse_mode="HTML")
 
         # Log failed command
@@ -892,7 +909,11 @@ async def show_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        project_list = "\n".join([f"• <code>{project}/</code>" for project in projects])
+        # Directory names may legitimately contain <, > or &; unescaped they
+        # make Telegram reject the whole message as malformed HTML.
+        project_list = "\n".join(
+            [f"• <code>{escape_html(project)}/</code>" for project in projects]
+        )
 
         await update.message.reply_text(
             f"📁 <b>Available Projects</b>\n\n"
@@ -1323,16 +1344,21 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     logger.info("Restart requested via /restart command", user_id=user_id)
 
-    # SIGBREAK/SIGTERM triggers the graceful-shutdown handler in main.py, which
-    # records the restart intent and exits NON-ZERO so the process manager
-    # relaunches the bot: on the documented Windows deployment that is the
-    # Scheduled Task's restart-on-failure, on Linux any restart-on-exit manager.
+    # Flag the intent explicitly. main.py reads this flag to exit NON-ZERO so
+    # the process manager relaunches the bot: on the documented Windows
+    # deployment that is the Scheduled Task's restart-on-failure, on Linux any
+    # restart-on-exit manager. Deriving the intent from the signal number does
+    # not work portably -- SIGBREAK exists only on Windows, so on Linux the
+    # SIGTERM below is indistinguishable from a clean stop and the bot would
+    # exit 0 and stay down.
+    context.bot_data["restart_requested"] = True
+
+    # The signal triggers main.py's graceful-shutdown handler.
     #
     # On Windows, Python only honours SIGTERM as an alias for ``terminate()``
     # and does not invoke the Python-level signal handler installed via
     # signal.signal(). To still get the same graceful path, we use SIGBREAK
-    # (CTRL_BREAK_EVENT) on Windows, which is handled by main.py's handler chain
-    # and flagged there as a restart (non-zero exit).
+    # (CTRL_BREAK_EVENT) on Windows, which is handled by main.py's handler chain.
     try:
         if sys.platform == "win32":
             sig = getattr(signal, "SIGBREAK", signal.SIGTERM)
@@ -1347,15 +1373,6 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Non-zero so restart-on-failure relaunches rather than treating the
         # /restart as a clean stop.
         os._exit(1)
-
-
-def _format_file_size(size: int) -> str:
-    """Format file size in human-readable format."""
-    for unit in ["B", "KB", "MB", "GB"]:
-        if size < 1024:
-            return f"{size:.1f}{unit}" if unit != "B" else f"{size}B"
-        size /= 1024
-    return f"{size:.1f}TB"
 
 
 def _escape_markdown(text: str) -> str:

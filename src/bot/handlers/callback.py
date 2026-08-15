@@ -17,6 +17,7 @@ from ..middleware.rate_limit import estimate_prompt_cost
 from ..utils.claude_run import run_claude_for_user
 from ..utils.html_format import escape_html, split_telegram_html, tg_len
 from ..utils.session_control import terminate_user_session
+from ..utils.upload_limits import format_file_size
 
 # session_export is imported lazily inside the export callback to keep the
 # command/callback dispatch path lightweight — this module is the largest
@@ -59,6 +60,26 @@ def _get_thread_project_root(
     if not thread_context:
         return None
     return Path(thread_context["project_root"]).resolve()
+
+
+def _relative_to_root(
+    current_dir: Path, settings: Settings, context: ContextTypes.DEFAULT_TYPE
+) -> Path:
+    """Return ``current_dir`` relative to the root that applies to this chat.
+
+    In thread mode the project root comes from projects.yaml and may live
+    outside ``approved_directory``, so a plain
+    ``relative_to(settings.approved_directory)`` raises ValueError and takes the
+    whole button handler into the generic error path. ``handle_cd_callback``
+    already picks the base correctly; every other handler shares that choice
+    here. If the directory is under neither root, fall back to its own name
+    rather than exposing the absolute host path.
+    """
+    base = _get_thread_project_root(settings, context) or settings.approved_directory
+    try:
+        return current_dir.relative_to(base)
+    except ValueError:
+        return Path(current_dir.name)
 
 
 async def handle_callback_query(
@@ -380,7 +401,7 @@ async def _handle_main_menu_action(query, context: ContextTypes.DEFAULT_TYPE) ->
     current_dir = context.user_data.get(
         "current_directory", settings.approved_directory
     )
-    relative_path = current_dir.relative_to(settings.approved_directory)
+    relative_path = _relative_to_root(current_dir, settings, context)
 
     keyboard = [
         [
@@ -524,7 +545,7 @@ async def _handle_new_session_action(query, context: ContextTypes.DEFAULT_TYPE) 
     current_dir = context.user_data.get(
         "current_directory", settings.approved_directory
     )
-    relative_path = current_dir.relative_to(settings.approved_directory)
+    relative_path = _relative_to_root(current_dir, settings, context)
 
     keyboard = [
         [
@@ -586,7 +607,7 @@ async def _handle_end_session_action(query, context: ContextTypes.DEFAULT_TYPE) 
     current_dir = context.user_data.get(
         "current_directory", settings.approved_directory
     )
-    relative_path = current_dir.relative_to(settings.approved_directory)
+    relative_path = _relative_to_root(current_dir, settings, context)
 
     # Deactivate the persisted session and clear the Telegram context, so the
     # next message does not auto-resume the just-ended session and /sessions
@@ -654,7 +675,7 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.edit_message_text(
                 f"🔄 <b>Continuing Session</b>\n\n"
                 f"Session ID: <code>{escape_html(claude_session_id[:8])}...</code>\n"
-                f"Directory: <code>{escape_html(str(current_dir.relative_to(settings.approved_directory)))}/</code>\n\n"
+                f"Directory: <code>{escape_html(str(_relative_to_root(current_dir, settings, context)))}/</code>\n\n"
                 f"Continuing where you left off...",
                 parse_mode="HTML",
             )
@@ -721,7 +742,7 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.edit_message_text(
                 "❌ <b>No Session Found</b>\n\n"
                 f"No recent Claude session found in this directory.\n"
-                f"Directory: <code>{escape_html(str(current_dir.relative_to(settings.approved_directory)))}/</code>\n\n"
+                f"Directory: <code>{escape_html(str(_relative_to_root(current_dir, settings, context)))}/</code>\n\n"
                 f"<b>What you can do:</b>\n"
                 f"• Use the button below to start a fresh session\n"
                 f"• Check your session status\n"
@@ -770,7 +791,7 @@ async def _handle_status_action(query, context: ContextTypes.DEFAULT_TYPE) -> No
     current_dir = context.user_data.get(
         "current_directory", settings.approved_directory
     )
-    relative_path = current_dir.relative_to(settings.approved_directory)
+    relative_path = _relative_to_root(current_dir, settings, context)
 
     # Get usage info if rate limiter is available
     rate_limiter = context.bot_data.get("rate_limiter")
@@ -867,7 +888,7 @@ async def _handle_ls_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
                 else:
                     try:
                         size = item.stat().st_size
-                        size_str = _format_file_size(size)
+                        size_str = format_file_size(size)
                         files.append(f"📄 {safe_name} ({size_str})")
                     except OSError:
                         files.append(f"📄 {safe_name}")
@@ -875,7 +896,7 @@ async def _handle_ls_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
             return directories + files
 
         items = await asyncio.to_thread(_walk_directory)
-        relative_path = current_dir.relative_to(settings.approved_directory)
+        relative_path = _relative_to_root(current_dir, settings, context)
 
         if not items:
             message = f"📂 <code>{escape_html(str(relative_path))}/</code>\n\n<i>(empty directory)</i>"
@@ -1084,7 +1105,7 @@ async def handle_quick_action_callback(
         # Execute the action
         await query.edit_message_text(
             f"🚀 <b>Executing {action.icon} {escape_html(action.name)}</b>\n\n"
-            f"Running quick action in directory: <code>{escape_html(str(current_dir.relative_to(settings.approved_directory)))}/</code>\n\n"
+            f"Running quick action in directory: <code>{escape_html(str(_relative_to_root(current_dir, settings, context)))}/</code>\n\n"
             f"Please wait...",
             parse_mode="HTML",
         )
@@ -1110,12 +1131,15 @@ async def handle_quick_action_callback(
             )
             return
 
-        if claude_response:
+        if claude_response is not None:
             # Format and send the response. Truncate the composed message, not
             # just the body -- the header also counts against Telegram's limit.
+            # A run that succeeded but produced no text is not a failure; say so
+            # rather than sending an empty body (which Telegram rejects).
+            body = escape_html(claude_response.content or "") or "<i>(no output)</i>"
             done_text = _first_chunk(
                 f"✅ <b>{action.icon} {escape_html(action.name)} Complete</b>\n\n"
-                f"{escape_html(claude_response.content)}"
+                f"{body}"
             )
             if isinstance(query.message, Message):
                 await query.message.reply_text(done_text, parse_mode="HTML")
@@ -1208,16 +1232,27 @@ async def handle_followup_callback(
             )
             return
 
-        if claude_response:
+        if claude_response is not None:
             context.user_data["claude_session_id"] = claude_response.session_id
 
-            response_text = _first_chunk(escape_html(claude_response.content))
+            # An empty body would be rejected by Telegram as an empty message.
+            response_text = _first_chunk(
+                escape_html(claude_response.content or "") or "<i>(no output)</i>"
+            )
             if isinstance(query.message, Message):
                 await query.message.reply_text(response_text, parse_mode="HTML")
             else:
                 await context.bot.send_message(
                     query.from_user.id, response_text, parse_mode="HTML"
                 )
+        else:
+            # No response at all: without this the user is left staring at
+            # "Working on it..." forever.
+            await query.edit_message_text(
+                f"💡 <b>{escape_html(suggestion)}</b>\n\n"
+                "❌ Claude returned no response. Please try again.",
+                parse_mode="HTML",
+            )
 
         logger.info(
             "Follow-up suggestion executed",
@@ -1279,7 +1314,7 @@ async def handle_conversation_callback(
         current_dir = context.user_data.get(
             "current_directory", settings.approved_directory
         )
-        relative_path = current_dir.relative_to(settings.approved_directory)
+        relative_path = _relative_to_root(current_dir, settings, context)
 
         # Create quick action buttons
         keyboard = [
@@ -1558,15 +1593,6 @@ async def handle_export_callback(
             f"❌ <b>Export Failed</b>\n\n{escape_html(str(e))}",
             parse_mode="HTML",
         )
-
-
-def _format_file_size(size: int) -> str:
-    """Format file size in human-readable format."""
-    for unit in ["B", "KB", "MB", "GB"]:
-        if size < 1024:
-            return f"{size:.1f}{unit}" if unit != "B" else f"{size}B"
-        size /= 1024
-    return f"{size:.1f}TB"
 
 
 def _escape_markdown(text: str) -> str:

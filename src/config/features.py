@@ -80,9 +80,9 @@ class FeatureFlags:
         """Check if streaming drafts via sendMessageDraft is enabled."""
         return self.settings.enable_stream_drafts
 
-    def is_feature_enabled(self, feature_name: str) -> bool:
-        """Generic feature check by name."""
-        feature_map = {
+    def _feature_map(self) -> dict[str, bool]:
+        """Single source of truth for feature name -> enabled state."""
+        return {
             "mcp": self.mcp_enabled,
             "git": self.git_enabled,
             "file_uploads": self.file_uploads_enabled,
@@ -96,31 +96,11 @@ class FeatureFlags:
             "voice_messages": self.voice_messages_enabled,
             "stream_drafts": self.stream_drafts_enabled,
         }
-        return feature_map.get(feature_name, False)
+
+    def is_feature_enabled(self, feature_name: str) -> bool:
+        """Generic feature check by name."""
+        return self._feature_map().get(feature_name, False)
 
     def get_enabled_features(self) -> list[str]:
         """Get list of all enabled features."""
-        features = []
-        if self.mcp_enabled:
-            features.append("mcp")
-        if self.git_enabled:
-            features.append("git")
-        if self.file_uploads_enabled:
-            features.append("file_uploads")
-        if self.quick_actions_enabled:
-            features.append("quick_actions")
-        if self.telemetry_enabled:
-            features.append("telemetry")
-        if self.webhook_enabled:
-            features.append("webhook")
-        if self.development_features_enabled:
-            features.append("development")
-        if self.api_server_enabled:
-            features.append("api_server")
-        if self.scheduler_enabled:
-            features.append("scheduler")
-        if self.voice_messages_enabled:
-            features.append("voice_messages")
-        if self.stream_drafts_enabled:
-            features.append("stream_drafts")
-        return features
+        return [name for name, enabled in self._feature_map().items() if enabled]

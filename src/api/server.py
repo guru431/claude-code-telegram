@@ -76,13 +76,15 @@ def create_api_app(
 
         # Verify signature based on provider
         if provider == "github":
-            secret = settings.github_webhook_secret
-            if not secret:
+            github_secret = settings.github_webhook_secret
+            if not github_secret:
                 raise HTTPException(
                     status_code=500,
                     detail="GitHub webhook secret not configured",
                 )
-            if not verify_github_signature(body, x_hub_signature_256, secret):
+            if not verify_github_signature(
+                body, x_hub_signature_256, github_secret.get_secret_value()
+            ):
                 logger.warning(
                     "GitHub webhook signature verification failed",
                     delivery_id=x_github_delivery,
@@ -107,8 +109,8 @@ def create_api_app(
                 return {"status": "ignored", "event": event_type_name}
         else:
             # Generic provider — require auth (fail-closed)
-            secret = settings.webhook_api_secret
-            if not secret:
+            api_secret = settings.webhook_api_secret
+            if not api_secret:
                 # Log the actionable config detail server-side only; the client
                 # gets a generic message so the env-var name is not leaked for
                 # reconnaissance.
@@ -120,7 +122,7 @@ def create_api_app(
                     status_code=500,
                     detail="Webhook endpoint not configured",
                 )
-            if not verify_shared_secret(authorization, secret):
+            if not verify_shared_secret(authorization, api_secret.get_secret_value()):
                 raise HTTPException(status_code=401, detail="Invalid authorization")
             event_type_name = request.headers.get("X-Event-Type", "unknown")
             delivery_id = request.headers.get("X-Delivery-ID")

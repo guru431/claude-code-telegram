@@ -99,6 +99,7 @@ class JobScheduler:
                 self._fire_event,
                 trigger=trigger,
                 kwargs={
+                    "job_id": job_id,
                     "job_name": job_name,
                     "prompt": prompt,
                     "working_directory": str(work_dir),
@@ -123,15 +124,22 @@ class JobScheduler:
         return job_id
 
     async def remove_job(self, job_id: str) -> bool:
-        """Remove a scheduled job."""
+        """Remove a scheduled job.
+
+        Returns True only if an active job row was actually deactivated, so the
+        caller can tell "removed" apart from "no such job".
+        """
         try:
             self._scheduler.remove_job(job_id)
         except Exception:
             logger.warning("Job not found in scheduler", job_id=job_id)
 
-        await self._delete_job(job_id)
-        logger.info("Scheduled job removed", job_id=job_id)
-        return True
+        removed = await self._delete_job(job_id)
+        if removed:
+            logger.info("Scheduled job removed", job_id=job_id)
+        else:
+            logger.warning("Scheduled job not found in database", job_id=job_id)
+        return removed
 
     async def list_jobs(self) -> List[Dict[str, Any]]:
         """List all scheduled jobs from the database."""
@@ -149,9 +157,11 @@ class JobScheduler:
         working_directory: str,
         target_chat_ids: List[int],
         skill_name: Optional[str],
+        job_id: str = "",
     ) -> None:
         """Called by APScheduler when a job triggers. Publishes a ScheduledEvent."""
         event = ScheduledEvent(
+            job_id=job_id,
             job_name=job_name,
             prompt=prompt,
             working_directory=Path(working_directory),
@@ -161,6 +171,7 @@ class JobScheduler:
 
         logger.info(
             "Scheduled job fired",
+            job_id=job_id,
             job_name=job_name,
             event_id=event.id,
         )
@@ -203,6 +214,7 @@ class JobScheduler:
                         self._fire_event,
                         trigger=trigger,
                         kwargs={
+                            "job_id": row_dict["job_id"],
                             "job_name": row_dict["job_name"],
                             "prompt": row_dict["prompt"],
                             "working_directory": row_dict["working_directory"],
@@ -275,11 +287,17 @@ class JobScheduler:
             )
             await conn.commit()
 
-    async def _delete_job(self, job_id: str) -> None:
-        """Soft-delete a job from the database."""
+    async def _delete_job(self, job_id: str) -> bool:
+        """Soft-delete a job from the database.
+
+        Returns True if an active row was deactivated, False if there was
+        nothing to deactivate.
+        """
         async with self.db_manager.get_connection() as conn:
-            await conn.execute(
-                "UPDATE scheduled_jobs SET is_active = 0 WHERE job_id = ?",
+            cursor = await conn.execute(
+                "UPDATE scheduled_jobs SET is_active = 0 "
+                "WHERE job_id = ? AND is_active = 1",
                 (job_id,),
             )
             await conn.commit()
+            return bool(cursor.rowcount)

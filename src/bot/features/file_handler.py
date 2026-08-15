@@ -25,7 +25,7 @@ from typing import Any, Dict, List
 
 from telegram import Document
 
-from src.bot.utils.upload_limits import exceeds_upload_limit
+from src.bot.utils.upload_limits import exceeds_upload_limit, format_file_size
 from src.config import Settings
 from src.security.validators import SecurityValidator
 
@@ -41,6 +41,9 @@ class FileTooLargeError(ValueError):
 
 # Hard limit on number of files in an archive (zip-bomb mitigation).
 MAX_ARCHIVE_FILES = 10000
+
+# Cap on total bytes an archive may expand to on disk (zip-bomb mitigation).
+MAX_ARCHIVE_BYTES = 100 * 1024 * 1024
 
 # Cap on inlined file content per file (chars) to keep prompts bounded,
 # matching the fallback in handlers/message.py.
@@ -288,8 +291,13 @@ class FileHandler:
                             f"(>{MAX_ARCHIVE_FILES})"
                         )
                     total_size = sum(f.file_size for f in zf.filelist)
-                    if total_size > 100 * 1024 * 1024:  # 100MB limit
+                    if total_size > MAX_ARCHIVE_BYTES:
                         raise ValueError("Archive too large")
+
+                    # The check above trusts the central-directory metadata,
+                    # which an attacker writes. Count the bytes actually landing
+                    # on disk as well and stop at the same cap.
+                    written_total = 0
 
                     # Extract with security checks
                     for file_info in zf.filelist:
@@ -327,7 +335,14 @@ class FileHandler:
                             zf.open(file_info) as source,
                             open(safe_target, "wb") as target,
                         ):
-                            shutil.copyfileobj(source, target)
+                            while True:
+                                chunk = source.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                written_total += len(chunk)
+                                if written_total > MAX_ARCHIVE_BYTES:
+                                    raise ValueError("Archive too large")
+                                target.write(chunk)
 
             elif ext == ".tar" or name_lower.endswith(
                 (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz")
@@ -341,7 +356,7 @@ class FileHandler:
                         )
                     # Security checks
                     total_size = sum(member.size for member in members)
-                    if total_size > 100 * 1024 * 1024:  # 100MB limit
+                    if total_size > MAX_ARCHIVE_BYTES:
                         raise ValueError("Archive too large")
 
                     # Extract with security checks. PEP 706 added the
@@ -415,7 +430,7 @@ class FileHandler:
                 # Bare filename inside extract_dir (defense-in-depth; stem of a
                 # sanitized download is already a single component).
                 out_path = extract_dir / Path(out_name).name
-                limit = 100 * 1024 * 1024  # 100MB cap, matches archive limits
+                limit = MAX_ARCHIVE_BYTES
                 written = 0
                 with source, open(out_path, "wb") as target:
                     while True:
@@ -525,11 +540,7 @@ class FileHandler:
 
     def _format_size(self, size: int) -> str:
         """Format file size for display"""
-        for unit in ["B", "KB", "MB", "GB"]:
-            if size < 1024.0:
-                return f"{size:.1f}{unit}"
-            size /= 1024.0
-        return f"{size:.1f}TB"
+        return format_file_size(size)
 
     def _find_code_files(self, directory: Path) -> List[Path]:
         """Find all code files in directory"""

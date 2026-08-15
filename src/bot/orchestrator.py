@@ -1803,7 +1803,14 @@ class MessageOrchestrator:
     ) -> None:
         """Handle stop: callbacks — interrupt a running Claude request."""
         query = update.callback_query
-        target_user_id = int(query.data.split(":", 1)[1])
+        # callback_data is client-supplied and the ``^stop:`` pattern accepts any
+        # payload, so "stop:abc" would raise before the query is answered and
+        # leave the user with a spinning button.
+        try:
+            target_user_id = int(query.data.split(":", 1)[1])
+        except (IndexError, ValueError):
+            await query.answer("Invalid stop request.", show_alert=False)
+            return
 
         # Only the requesting user can stop their own request
         if query.from_user.id != target_user_id:
@@ -1946,16 +1953,19 @@ class MessageOrchestrator:
                 )
             return
 
-        # No args — list repos
+        # No args — list repos. The scan (iterdir + one stat per entry for the
+        # git badge) runs off the event loop like the equivalent listings in
+        # callback.py and file_handler.py: on a slow or networked filesystem it
+        # would otherwise stall update processing for every user.
+        def _scan_repos() -> List[Tuple[str, bool]]:
+            return [
+                (d.name, (d / ".git").is_dir())
+                for d in sorted(base.iterdir(), key=lambda d: d.name)
+                if d.is_dir() and not d.name.startswith(".")
+            ]
+
         try:
-            entries = sorted(
-                [
-                    d
-                    for d in base.iterdir()
-                    if d.is_dir() and not d.name.startswith(".")
-                ],
-                key=lambda d: d.name,
-            )
+            entries = await asyncio.to_thread(_scan_repos)
         except OSError as e:
             await update.message.reply_text(f"Error reading workspace: {e}")
             return
@@ -1972,11 +1982,10 @@ class MessageOrchestrator:
         keyboard_rows: List[list] = []  # type: ignore[type-arg]
         current_name = current_dir.name if current_dir != base else None
 
-        for d in entries:
-            is_git = (d / ".git").is_dir()
+        for name, is_git in entries:
             icon = "\U0001f4e6" if is_git else "\U0001f4c1"
-            marker = " \u25c0" if d.name == current_name else ""
-            lines.append(f"{icon} <code>{escape_html(d.name)}/</code>{marker}")
+            marker = " \u25c0" if name == current_name else ""
+            lines.append(f"{icon} <code>{escape_html(name)}/</code>{marker}")
 
         # Build inline keyboard (2 per row). Telegram caps callback_data at
         # 64 UTF-8 bytes; a name that overflows would break the whole reply,
@@ -1985,7 +1994,7 @@ class MessageOrchestrator:
             row = []
             for j in range(2):
                 if i + j < len(entries):
-                    name = entries[i + j].name
+                    name = entries[i + j][0]
                     if len(f"cd:{name}".encode("utf-8")) > 64:
                         continue
                     row.append(InlineKeyboardButton(name, callback_data=f"cd:{name}"))
@@ -2105,11 +2114,18 @@ class MessageOrchestrator:
                 await update.message.reply_text(usage, parse_mode="HTML")
                 return
             job_id = args[1]
-            await scheduler.remove_job(job_id)
-            await update.message.reply_text(
-                f"Removed job <code>{escape_html(str(job_id))}</code>.",
-                parse_mode="HTML",
-            )
+            # remove_job reports whether an active job actually existed, so a
+            # typo'd id no longer gets a confident "Removed".
+            if await scheduler.remove_job(job_id):
+                await update.message.reply_text(
+                    f"Removed job <code>{escape_html(str(job_id))}</code>.",
+                    parse_mode="HTML",
+                )
+            else:
+                await update.message.reply_text(
+                    f"No active job <code>{escape_html(str(job_id))}</code>.",
+                    parse_mode="HTML",
+                )
 
         else:
             await update.message.reply_text(usage, parse_mode="HTML")

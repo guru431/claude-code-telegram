@@ -321,11 +321,9 @@ async def run_application(app: Dict[str, Any]) -> int:
 
     # Set up signal handlers for graceful shutdown
     shutdown_event = asyncio.Event()
-    shutdown_signal: Dict[str, Any] = {}
 
     def signal_handler(signum: int, frame: Any) -> None:
         logger.info("Shutdown signal received", signal=signum)
-        shutdown_signal["signum"] = signum
         shutdown_event.set()
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -625,11 +623,15 @@ async def run_application(app: Dict[str, Any]) -> int:
 
         # Decide the process exit code. A clean stop (SIGINT/SIGTERM) exits 0
         # and the Scheduled Task stays down; a crashed core task or an explicit
-        # /restart (SIGBREAK) exits non-zero so restart-on-failure relaunches
-        # the bot instead of leaving it dead until the next reboot.
+        # /restart exits non-zero so restart-on-failure relaunches the bot
+        # instead of leaving it dead until the next reboot.
+        #
+        # The restart intent comes from the flag ``restart_command`` sets, not
+        # from the signal number: SIGBREAK exists only on Windows, so on Linux
+        # a signal-derived check can never fire and /restart would exit 0.
         core_task_exited = any(task is not shutdown_task for task in done)
-        restart_requested = shutdown_signal.get("signum") == getattr(
-            signal, "SIGBREAK", None
+        restart_requested = bool(
+            bot.app is not None and bot.app.bot_data.get("restart_requested")
         )
         if core_task_exited:
             logger.error("Core task exited unexpectedly; requesting relaunch")

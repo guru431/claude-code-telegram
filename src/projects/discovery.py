@@ -6,8 +6,9 @@ and adds them automatically.
 
 import os
 import re
+import tempfile
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import structlog
 import yaml
@@ -127,6 +128,49 @@ def _make_display_name(dir_name: str) -> str:
     return dir_name
 
 
+def write_yaml_atomic(
+    config_path: Path,
+    payload: Dict[str, Any],
+    validate: Optional[Callable[[Path], None]] = None,
+) -> None:
+    """Dump ``payload`` to ``config_path`` atomically.
+
+    The candidate goes to a temp file in the same directory and is moved into
+    place with os.replace, so a crash mid-write cannot leave a truncated
+    projects.yaml that fails to load on the next startup (which would take the
+    bot down). ``validate`` gets the temp path before the swap and may raise to
+    abort it.
+
+    The temp name is unique rather than a fixed ``.tmp`` suffix: the bot's
+    auto-discovery and scripts/sync_projects_yaml.py both rewrite this file, and
+    a shared temp path would let one process replace the config with the other's
+    half-written dump. Concurrent runs still resolve last-writer-wins, but each
+    written config is a complete one.
+    """
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(config_path.parent), prefix=f"{config_path.name}.", suffix=".tmp"
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml.dump(
+                payload,
+                f,
+                default_flow_style=False,
+                allow_unicode=True,
+                sort_keys=False,
+            )
+        if validate is not None:
+            validate(tmp_path)
+        os.replace(tmp_path, config_path)
+    except Exception:
+        # A failed dump or a rejected candidate would otherwise leave a
+        # truncated temp file next to projects.yaml, one per failed run.
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def discover_new_projects(
     approved_directory: Path,
     config_path: Path,
@@ -229,22 +273,7 @@ def discover_new_projects(
     existing_projects.extend(new_projects)
     data["projects"] = existing_projects
 
-    # Atomic write: dump to a temp file in the same dir, then os.replace. A crash
-    # mid-write must not leave a truncated projects.yaml that fails to load on the
-    # next startup (which would take the bot down).
-    tmp_path = config_path.with_suffix(".tmp")
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            yaml.dump(
-                data, f, default_flow_style=False, allow_unicode=True, sort_keys=False
-            )
-        os.replace(tmp_path, config_path)
-    except Exception:
-        # A failed dump (e.g. a non-serialisable value in the config) would
-        # otherwise leave a truncated projects.tmp next to projects.yaml, one
-        # per failed run.
-        tmp_path.unlink(missing_ok=True)
-        raise
+    write_yaml_atomic(config_path, data)
 
     logger.info(
         "New projects discovered and added to config",

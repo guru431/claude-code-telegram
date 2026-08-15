@@ -1,6 +1,7 @@
 """Message handlers for non-command inputs."""
 
 import asyncio
+import re
 from typing import Optional
 
 import structlog
@@ -18,12 +19,14 @@ from ...claude.exceptions import (
 from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.rate_limiter import RateLimiter
+from ...security.secret_patterns import redact_secrets
 from ...security.validators import SecurityValidator
 from ..features.file_handler import FileTooLargeError
 from ..middleware.rate_limit import estimate_message_cost
 from ..utils.claude_run import persist_interaction
 from ..utils.html_format import escape_html
 from ..utils.image_extractor import (
+    MAX_IMAGES_PER_RESPONSE,
     ImageAttachment,
     should_send_as_photo,
     validate_image_path,
@@ -31,6 +34,9 @@ from ..utils.image_extractor import (
 from ..utils.upload_limits import exceeds_upload_limit
 
 logger = structlog.get_logger()
+
+# Follow-up suggestion hashes kept per user (roughly the last 5 responses).
+MAX_FOLLOWUP_SUGGESTIONS = 20
 
 
 async def _format_progress_update(update_obj) -> Optional[str]:
@@ -341,6 +347,11 @@ async def handle_text_message(
         "Processing text message", user_id=user_id, message_length=len(message_text)
     )
 
+    # Bound before the try: the outer except deletes it, and a failure in
+    # send_action/reply_text below would otherwise raise UnboundLocalError
+    # there and mask the real error.
+    progress_msg = None
+
     try:
         # Rate limiting was already enforced by rate_limit_middleware (group -1);
         # re-checking here would double-charge the token bucket. Budget for the
@@ -409,7 +420,10 @@ async def handle_text_message(
                         img = validate_image_path(
                             file_path, settings.approved_directory, caption
                         )
-                        if img:
+                        # Cap as the agentic path does: an unbounded stream of
+                        # send_image_to_user calls would otherwise turn into an
+                        # unbounded series of Telegram uploads.
+                        if img and len(mcp_images) < MAX_IMAGES_PER_RESPONSE:
                             mcp_images.append(img)
 
             now = asyncio.get_event_loop().time()
@@ -459,26 +473,42 @@ async def handle_text_message(
             context.user_data["claude_session_id"] = claude_response.session_id
 
             # Settled in the finally below so a later failure cannot leave the
-            # hold outstanding. A run flagged is_error produced nothing usable
-            # and is not charged.
-            if not claude_response.is_error:
-                actual_cost = claude_response.cost
-
-            # Check if Claude changed the working directory and update our tracking
-            _update_working_directory_from_claude_response(
-                claude_response, context, settings, user_id
-            )
+            # hold outstanding. Charge the reported cost even on a run flagged
+            # is_error (same policy as the agentic path): error_max_turns and the
+            # budget cap burn real tokens before failing, and ignoring them lets
+            # a retry loop spend without moving the counter.
+            actual_cost = claude_response.cost
 
             # Log interaction to storage
             await persist_interaction(storage, user_id, message_text, claude_response)
 
-            # Format response
-            from ..utils.formatting import ResponseFormatter
+            from ..utils.formatting import FormattedMessage, ResponseFormatter
 
-            formatter = ResponseFormatter(settings)
-            formatted_messages = formatter.format_claude_response(
-                claude_response.content
-            )
+            if claude_response.is_error:
+                # The run did not raise but the SDK flagged an error; its
+                # content is empty or an error payload, so show the same
+                # explicit message the agentic path does instead of it.
+                formatted_messages = [
+                    FormattedMessage(
+                        _format_error_message(
+                            claude_response.error_type or "Claude returned an error."
+                        ),
+                        parse_mode="HTML",
+                    )
+                ]
+            else:
+                # Check if Claude changed the working directory and update our
+                # tracking
+                _update_working_directory_from_claude_response(
+                    claude_response, context, settings, user_id
+                )
+
+                formatter = ResponseFormatter(settings)
+                # Redact secrets before the response leaves the bot — tool
+                # OUTPUT (e.g. a printenv dump) can land here.
+                formatted_messages = formatter.format_claude_response(
+                    redact_secrets(claude_response.content or "")
+                )
 
         except Exception as e:
             logger.error("Claude integration failed", error=str(e), user_id=user_id)
@@ -665,6 +695,12 @@ async def handle_text_message(
                         # Persist the hash->text mapping so the followup
                         # callback can recover the suggestion the user tapped
                         # (callback_data only carries the 12-char hash).
+                        #
+                        # Keep only the most recent MAX_FOLLOWUP_SUGGESTIONS
+                        # entries: every response used to append up to 4 more and
+                        # nothing ever removed them, so a long-lived chat grew
+                        # user_data without bound. Older buttons then resolve to
+                        # nothing and get the "suggestion has expired" reply.
                         followup_map = context.user_data.setdefault(
                             "followup_suggestions", {}
                         )
@@ -672,6 +708,10 @@ async def handle_text_message(
                             followup_map[
                                 conversation_enhancer.suggestion_hash(suggestion)
                             ] = suggestion
+                        while len(followup_map) > MAX_FOLLOWUP_SUGGESTIONS:
+                            # dicts preserve insertion order, so this drops the
+                            # oldest mapping first.
+                            followup_map.pop(next(iter(followup_map)))
 
                         # Send follow-up suggestions
                         await update.message.reply_text(
@@ -708,10 +748,13 @@ async def handle_text_message(
 
     except Exception as e:
         # Clean up progress message if it exists
-        try:
-            await progress_msg.delete()
-        except Exception as delete_error:
-            logger.debug("Failed to delete progress message", error=str(delete_error))
+        if progress_msg:
+            try:
+                await progress_msg.delete()
+            except Exception as delete_error:
+                logger.debug(
+                    "Failed to delete progress message", error=str(delete_error)
+                )
 
         await update.message.reply_text(_format_error_message(e), parse_mode="HTML")
 
@@ -874,9 +917,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         + "\n... (file truncated for processing)"
                     )
 
-                # Create prompt with file content
+                # Create prompt with file content. The fence must be longer than
+                # any backtick run in the file, otherwise a file containing ```
+                # closes the block early and the rest is read as prompt.
                 caption = update.message.caption or "Please review this file:"
-                prompt = f"{caption}\n\n**File:** `{document.file_name}`\n\n```\n{content}\n```"
+                longest_run = max(
+                    (len(m) for m in re.findall(r"`+", content)), default=0
+                )
+                fence = "`" * max(3, longest_run + 1)
+                prompt = (
+                    f"{caption}\n\n**File:** `{document.file_name}`\n\n"
+                    f"{fence}\n{content}\n{fence}"
+                )
 
             except UnicodeDecodeError:
                 await progress_msg.edit_text(
@@ -918,7 +970,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         # Hold budget for this run, sized from the actual upload; released in
         # the finally below on every path so a failure costs the user nothing.
-        file_cost = _estimate_file_processing_cost(document.file_size)
+        # file_size is optional in Telegram; treat an absent size as 0 rather
+        # than dividing by None.
+        file_cost = _estimate_file_processing_cost(document.file_size or 0)
         reservation_id: Optional[str] = None
         actual_cost = 0.0
         if rate_limiter:
@@ -943,10 +997,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             # Update session ID
             context.user_data["claude_session_id"] = claude_response.session_id
 
-            # Settled in the finally below; a run flagged is_error produced
-            # nothing usable and is not charged.
-            if not claude_response.is_error:
-                actual_cost = claude_response.cost
+            # Settled in the finally below. Charged even on a run flagged
+            # is_error: it still burned tokens (same policy as the agentic path).
+            actual_cost = claude_response.cost
 
             # Same central persistence as the text path: without it the upload's
             # message pair, tool usage and cost row never reach storage.
@@ -954,18 +1007,28 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 context.bot_data.get("storage"), user_id, prompt, claude_response
             )
 
-            # Check if Claude changed the working directory and update our tracking
-            _update_working_directory_from_claude_response(
-                claude_response, context, settings, user_id
-            )
+            from ..utils.formatting import FormattedMessage, ResponseFormatter
 
-            # Format and send response
-            from ..utils.formatting import ResponseFormatter
+            if claude_response.is_error:
+                formatted_messages = [
+                    FormattedMessage(
+                        _format_error_message(
+                            claude_response.error_type or "Claude returned an error."
+                        ),
+                        parse_mode="HTML",
+                    )
+                ]
+            else:
+                # Check if Claude changed the working directory and update our
+                # tracking
+                _update_working_directory_from_claude_response(
+                    claude_response, context, settings, user_id
+                )
 
-            formatter = ResponseFormatter(settings)
-            formatted_messages = formatter.format_claude_response(
-                claude_response.content
-            )
+                formatter = ResponseFormatter(settings)
+                formatted_messages = formatter.format_claude_response(
+                    redact_secrets(claude_response.content or "")
+                )
 
             # Delete progress message
             await claude_progress_msg.delete()
@@ -1114,10 +1177,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 # Update session ID
                 context.user_data["claude_session_id"] = claude_response.session_id
 
-                # Settled in the finally below; a run flagged is_error produced
-                # nothing usable and is not charged.
-                if not claude_response.is_error:
-                    actual_cost = claude_response.cost
+                # Settled in the finally below. Charged even on a run flagged
+                # is_error: it still burned tokens (same policy as the agentic
+                # path).
+                actual_cost = claude_response.cost
 
                 # Same central persistence as the text path.
                 await persist_interaction(
@@ -1127,18 +1190,29 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     claude_response,
                 )
 
-                # Check if Claude changed the working directory and update tracking
-                _update_working_directory_from_claude_response(
-                    claude_response, context, settings, user_id
-                )
+                from ..utils.formatting import FormattedMessage, ResponseFormatter
 
-                # Format and send response
-                from ..utils.formatting import ResponseFormatter
+                if claude_response.is_error:
+                    formatted_messages = [
+                        FormattedMessage(
+                            _format_error_message(
+                                claude_response.error_type
+                                or "Claude returned an error."
+                            ),
+                            parse_mode="HTML",
+                        )
+                    ]
+                else:
+                    # Check if Claude changed the working directory and update
+                    # tracking
+                    _update_working_directory_from_claude_response(
+                        claude_response, context, settings, user_id
+                    )
 
-                formatter = ResponseFormatter(settings)
-                formatted_messages = formatter.format_claude_response(
-                    claude_response.content
-                )
+                    formatter = ResponseFormatter(settings)
+                    formatted_messages = formatter.format_claude_response(
+                        redact_secrets(claude_response.content or "")
+                    )
 
                 # Delete progress message
                 await claude_progress_msg.delete()
@@ -1267,10 +1341,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
             context.user_data["claude_session_id"] = claude_response.session_id
 
-            # Settled in the finally below; a run flagged is_error produced
-            # nothing usable and is not charged.
-            if not claude_response.is_error:
-                actual_cost = claude_response.cost
+            # Settled in the finally below. Charged even on a run flagged
+            # is_error: it still burned tokens (same policy as the agentic path).
+            actual_cost = claude_response.cost
 
             # Same central persistence as the text path.
             await persist_interaction(
@@ -1280,16 +1353,26 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 claude_response,
             )
 
-            _update_working_directory_from_claude_response(
-                claude_response, context, settings, user_id
-            )
+            from ..utils.formatting import FormattedMessage, ResponseFormatter
 
-            from ..utils.formatting import ResponseFormatter
+            if claude_response.is_error:
+                formatted_messages = [
+                    FormattedMessage(
+                        _format_error_message(
+                            claude_response.error_type or "Claude returned an error."
+                        ),
+                        parse_mode="HTML",
+                    )
+                ]
+            else:
+                _update_working_directory_from_claude_response(
+                    claude_response, context, settings, user_id
+                )
 
-            formatter = ResponseFormatter(settings)
-            formatted_messages = formatter.format_claude_response(
-                claude_response.content
-            )
+                formatter = ResponseFormatter(settings)
+                formatted_messages = formatter.format_claude_response(
+                    redact_secrets(claude_response.content or "")
+                )
 
             await progress_msg.delete()
 
@@ -1321,13 +1404,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
 
-def _estimate_file_processing_cost(file_size: int) -> float:
-    """Estimate cost for processing uploaded file."""
+def _estimate_file_processing_cost(file_size: Optional[int]) -> float:
+    """Estimate cost for processing uploaded file.
+
+    ``file_size`` is optional in Telegram; an unknown size estimates as 0 extra
+    rather than raising.
+    """
     # Base cost for file handling
     base_cost = 0.005
 
     # Additional cost based on file size (per KB)
-    size_cost = (file_size / 1024) * 0.0001
+    size_cost = ((file_size or 0) / 1024) * 0.0001
 
     return base_cost + size_cost
 
@@ -1378,15 +1465,14 @@ def _update_working_directory_from_claude_response(
                 else:
                     new_path = re.sub(r"(?<![./])[.,;:!?]+$", "", raw) or raw
 
-                # Handle relative paths
-                if new_path.startswith("./") or new_path.startswith("../"):
-                    new_path = (current_dir / new_path).resolve()
-                elif not new_path.startswith("/"):
-                    # Relative path without ./
-                    new_path = (current_dir / new_path).resolve()
-                else:
-                    # Absolute path
+                # Handle relative paths. Use Path.is_absolute() rather than a
+                # leading "/": on Windows an absolute path looks like C:\... and
+                # a string check would join it onto current_dir, after which
+                # validation drops it and cwd stops tracking entirely.
+                if Path(new_path).is_absolute():
                     new_path = Path(new_path).resolve()
+                else:
+                    new_path = (current_dir / new_path).resolve()
 
                 # Validate that the new path is within the approved directory.
                 # Require a directory — Claude may also mention existing file

@@ -1,5 +1,8 @@
 """Test environment-specific configurations."""
 
+import tempfile
+from pathlib import Path
+
 from src.config.environments import DevelopmentConfig, ProductionConfig, TestingConfig
 
 
@@ -21,7 +24,11 @@ def test_testing_config():
     assert config_dict["debug"] is True
     assert config_dict["development_mode"] is True
     assert config_dict["database_url"] == "sqlite:///:memory:"
-    assert config_dict["approved_directory"] == "/tmp/test_projects"
+    # Platform temp dir, not a hardcoded "/tmp" — the latter does not exist on
+    # Windows, where the suite also runs.
+    assert config_dict["approved_directory"] == str(
+        Path(tempfile.gettempdir()) / "test_projects"
+    )
     assert config_dict["enable_telemetry"] is False
     assert config_dict["claude_timeout_seconds"] == 30
     assert config_dict["rate_limit_requests"] == 1000

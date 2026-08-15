@@ -17,8 +17,14 @@ import yaml
 # canonical slug generator and directory scanner with src/projects/discovery.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.projects.discovery import iter_project_dirs, path_dedupe_key  # noqa: E402
+from src.projects.discovery import (  # noqa: E402
+    iter_project_dirs,
+    path_dedupe_key,
+)
 from src.projects.discovery import slugify as slug_from_path  # noqa: E402
+from src.projects.discovery import (  # noqa: E402
+    write_yaml_atomic,
+)
 from src.projects.registry import load_project_registry, parse_enabled  # noqa: E402
 
 
@@ -198,25 +204,12 @@ def _write_config(config_path: Path, payload: dict, approved_dir: Path) -> None:
     half-written file, if the process dies mid-dump) become the config the bot
     fails to start on.
     """
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = config_path.with_suffix(".tmp")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        yaml.dump(
-            payload,
-            f,
-            default_flow_style=False,
-            sort_keys=False,
-            allow_unicode=True,
-        )
 
-    if payload["projects"]:
-        try:
-            load_project_registry(tmp_path, approved_dir)
-        except Exception:
-            tmp_path.unlink(missing_ok=True)
-            raise
+    def _validate(candidate: Path) -> None:
+        if payload["projects"]:
+            load_project_registry(candidate, approved_dir)
 
-    os.replace(tmp_path, config_path)
+    write_yaml_atomic(config_path, payload, validate=_validate)
 
 
 def main() -> None:
