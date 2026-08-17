@@ -80,7 +80,15 @@ line_length = 88
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = "test_*.py"
-addopts = "-v --cov=src --cov-report=html --cov-report=term-missing"
+# Канон «Тесты — единая политика» (~/.claude/CLAUDE.md): голый `pytest` = быстрый
+# набор, бюджет 60 с. `--cov` из addopts убран — покрытие считается по требованию
+# (`pytest --cov=src --cov-report=term-missing`), а не в каждом прогоне: оно
+# тормозит набор и на каждый запуск переписывает htmlcov/.
+addopts = "-m 'not integration and not manual'"
+markers = [
+    "integration: требует сети, реального Telegram API или живого Claude CLI",
+    "manual: запускается руками, в свипе не участвует",
+]
 asyncio_mode = "auto"
 
 [tool.mypy]
