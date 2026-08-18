@@ -1,6 +1,8 @@
 """Pytest configuration and fixtures."""
 
+import sqlite3
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -46,6 +48,56 @@ def _isolate_dotenv(monkeypatch):
 
     for key in _dotenv_keys():
         monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture(scope="session")
+def _migrated_db_image(tmp_path_factory) -> bytes:
+    """Byte image of a fully migrated database, built once per session.
+
+    ``DatabaseManager.initialize()`` runs nine migrations, each committing on
+    its own; on Windows that costs ~0.4 s per database. Roughly ninety tests
+    build one, which alone blew the 60 s budget for the fast suite. The
+    migration list is replayed here once (synchronously — same SQL, same
+    ``schema_version`` rows as the async path) and the resulting file is handed
+    to those tests as bytes: ``initialize()`` then finds version 9 and runs no
+    migration at all.
+
+    Databases that must start empty or on an *older* schema (the migration
+    tests in ``test_fk_integrity.py``) deliberately do not use this.
+    """
+    from src.storage.database import DatabaseManager
+
+    db_path = tmp_path_factory.mktemp("db-template") / "template.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)"
+        )
+        for version, migration in DatabaseManager(
+            "sqlite:///:memory:"
+        )._get_migrations():
+            conn.executescript(migration)
+            conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path.read_bytes()
+
+
+@pytest.fixture
+def migrated_db(_migrated_db_image) -> Callable[[Path], Path]:
+    """Return a factory that seeds *path* with an already-migrated database.
+
+    Use it right before ``DatabaseManager``/``Storage`` initialization when the
+    test only needs the current schema, not the migration run itself.
+    """
+
+    def _seed(path: Path) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(_migrated_db_image)
+        return path
+
+    return _seed
 
 
 @pytest.fixture

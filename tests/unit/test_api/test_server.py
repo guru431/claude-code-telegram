@@ -170,9 +170,11 @@ class TestWebhookAPI:
         assert response.status_code == 401
 
 
-async def test_recover_unprocessed_webhooks_replays_then_idempotent(tmp_path) -> None:
+async def test_recover_unprocessed_webhooks_replays_then_idempotent(
+    tmp_path, migrated_db
+) -> None:
     """processed=0 rows are replayed once; after processed=1 nothing replays."""
-    storage = Storage(f"sqlite:///{tmp_path / 'wh.db'}")
+    storage = Storage(f"sqlite:///{migrated_db(tmp_path / 'wh.db')}")
     await storage.initialize()
     db = storage.db_manager
 
@@ -210,14 +212,14 @@ async def test_recover_unprocessed_webhooks_replays_then_idempotent(tmp_path) ->
     await storage.close()
 
 
-async def test_webhook_dead_letter_after_max_attempts(tmp_path) -> None:
+async def test_webhook_dead_letter_after_max_attempts(tmp_path, migrated_db) -> None:
     """A webhook is dead-lettered (processed=2) once retry attempts are spent."""
     from pathlib import Path
     from unittest.mock import MagicMock
 
     from src.events.handlers import AgentHandler
 
-    storage = Storage(f"sqlite:///{tmp_path / 'wh.db'}")
+    storage = Storage(f"sqlite:///{migrated_db(tmp_path / 'wh.db')}")
     await storage.initialize()
     db = storage.db_manager
     await _try_record_webhook(
@@ -251,9 +253,9 @@ async def test_webhook_dead_letter_after_max_attempts(tmp_path) -> None:
     await storage.close()
 
 
-async def test_retry_sweep_excludes_dead_letter(tmp_path) -> None:
+async def test_retry_sweep_excludes_dead_letter(tmp_path, migrated_db) -> None:
     """retry_pending_webhooks replays pending rows and skips dead-lettered ones."""
-    storage = Storage(f"sqlite:///{tmp_path / 'wh.db'}")
+    storage = Storage(f"sqlite:///{migrated_db(tmp_path / 'wh.db')}")
     await storage.initialize()
     db = storage.db_manager
     await _try_record_webhook(

@@ -254,13 +254,21 @@ class TestClaudeSDKManager:
         """Test command execution timeout."""
         from src.claude.exceptions import ClaudeTimeoutError
 
+        # 50 ms instead of the fixture's 2 s: what matters is that the hang is
+        # cut off, not how long the suite waits for it. ``model_copy(update=)``
+        # is the way in — ``Settings`` validates assignment and the field is an
+        # ``int``, so a sub-second timeout cannot be set with plain setattr.
+        sdk_manager.config = sdk_manager.config.model_copy(
+            update={"claude_timeout_seconds": 0.05}
+        )
+
         client = AsyncMock()
         client.connect = AsyncMock()
         client.disconnect = AsyncMock()
         client.query = AsyncMock()
 
         async def hanging_receive():
-            await asyncio.sleep(5)  # Exceeds 2s timeout
+            await asyncio.sleep(5)  # Far past the 50 ms timeout above
             yield  # Never reached
 
         query_mock = AsyncMock()

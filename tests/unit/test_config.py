@@ -683,17 +683,22 @@ def test_webhook_listen_defaults_to_loopback(tmp_path):
     assert exposed.webhook_listen == "0.0.0.0"
 
 
-def test_feature_flags():
+def test_feature_flags(tmp_path):
     """Test feature flag system."""
-    # Create test MCP config file with valid structure before creating settings
+    # Create test MCP config file with valid structure before creating settings.
+    # It must live under tmp_path: a fixed path like /tmp/test_mcp.json is shared
+    # by every process on the machine, so two concurrent runs of this suite raced
+    # (one unlinked the file while the other was validating it) and Settings blew
+    # up with "MCP config file does not exist".
     mcp_config = (
         '{"mcpServers": {"test-server": {"command": "echo", "args": ["hello"]}}}'
     )
-    Path("/tmp/test_mcp.json").write_text(mcp_config)
+    mcp_config_file = tmp_path / "test_mcp.json"
+    mcp_config_file.write_text(mcp_config)
 
     settings = create_test_config(
         enable_mcp=True,
-        mcp_config_path="/tmp/test_mcp.json",
+        mcp_config_path=str(mcp_config_file),
         enable_git_integration=True,
         enable_file_uploads=False,
     )
@@ -712,9 +717,6 @@ def test_feature_flags():
     # Test generic feature check
     assert features.is_feature_enabled("git") is True
     assert features.is_feature_enabled("nonexistent") is False
-
-    # Cleanup test file
-    Path("/tmp/test_mcp.json").unlink(missing_ok=True)
 
 
 def test_environment_loading(monkeypatch, tmp_path):

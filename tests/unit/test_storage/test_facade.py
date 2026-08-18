@@ -11,10 +11,10 @@ from src.storage.facade import Storage
 
 
 @pytest.fixture
-async def storage():
+async def storage(migrated_db):
     """Create test storage."""
     with tempfile.TemporaryDirectory() as temp_dir:
-        db_path = Path(temp_dir) / "test.db"
+        db_path = migrated_db(Path(temp_dir) / "test.db")
         storage = Storage(f"sqlite:///{db_path}")
         await storage.initialize()
         yield storage

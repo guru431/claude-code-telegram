@@ -460,7 +460,7 @@ class TestSQLiteAuditStorage:
     """Durable audit storage must round-trip every AuditEvent field."""
 
     @pytest.fixture
-    async def sqlite_storage(self):
+    async def sqlite_storage(self, migrated_db):
         """Create SQLite-backed audit storage over a temporary database."""
         import tempfile
         from pathlib import Path
@@ -469,7 +469,7 @@ class TestSQLiteAuditStorage:
         from src.storage.facade import Storage
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            db_path = Path(temp_dir) / "audit.db"
+            db_path = migrated_db(Path(temp_dir) / "audit.db")
             storage = Storage(f"sqlite:///{db_path}")
             await storage.initialize()
             yield SQLiteAuditStorage(storage)

@@ -12,10 +12,10 @@ from src.storage.session_storage import SQLiteSessionStorage
 
 
 @pytest.fixture
-async def session_storage():
+async def session_storage(migrated_db):
     """Create session storage backed by a temporary file database."""
     with tempfile.TemporaryDirectory() as temp_dir:
-        db_path = Path(temp_dir) / "test.db"
+        db_path = migrated_db(Path(temp_dir) / "test.db")
         db_manager = DatabaseManager(f"sqlite:///{db_path}")
         await db_manager.initialize()
         yield SQLiteSessionStorage(db_manager)

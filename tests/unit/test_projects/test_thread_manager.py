@@ -19,10 +19,10 @@ from src.storage.repositories import ProjectThreadRepository
 
 
 @pytest.fixture
-async def db_manager():
+async def db_manager(migrated_db):
     """Create test database manager."""
     with tempfile.TemporaryDirectory() as temp_dir:
-        db_path = Path(temp_dir) / "test.db"
+        db_path = migrated_db(Path(temp_dir) / "test.db")
         manager = DatabaseManager(f"sqlite:///{db_path}")
         await manager.initialize()
         yield manager

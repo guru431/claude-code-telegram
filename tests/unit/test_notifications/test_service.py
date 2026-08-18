@@ -214,16 +214,28 @@ class TestNotificationService:
         assert service._send_queue.qsize() == 0
 
     async def test_retry_after_sleeps_and_retries(
-        self, service: NotificationService, mock_bot: AsyncMock
+        self, service: NotificationService, mock_bot: AsyncMock, monkeypatch
     ) -> None:
         """RetryAfter (429) sleeps the server delay and retries once, not drops."""
         from telegram.error import RetryAfter
 
+        # The sleep is captured instead of really awaited: sleeping the server
+        # delay for real would put a full second of wall clock into the fast
+        # suite, and asserting the argument checks more than a real sleep does.
+        slept: list[float] = []
+
+        async def fake_sleep(delay: float) -> None:
+            slept.append(delay)
+
+        monkeypatch.setattr("src.notifications.service.asyncio.sleep", fake_sleep)
         mock_bot.send_message = AsyncMock(side_effect=[RetryAfter(1), None])
         event = AgentResponseEvent(chat_id=123, text="hello")
         await service._rate_limited_send(123, event)
 
         assert mock_bot.send_message.call_count == 2
+        # Last sleep before the successful retry is the server-provided delay
+        # (an earlier entry may be the per-chat send interval).
+        assert slept[-1] == 1.0
 
     async def test_retry_after_bounded_to_two_attempts(
         self, service: NotificationService, mock_bot: AsyncMock
