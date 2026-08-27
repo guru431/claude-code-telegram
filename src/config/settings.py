@@ -370,6 +370,10 @@ class Settings(BaseSettings):
         False,
         description="Enable strict routing by Telegram forum project threads",
     )
+    enable_link_intake: bool = Field(
+        False,
+        description="Route messages containing links through link-analysis",
+    )
     project_threads_mode: Literal["private", "group"] = Field(
         "private",
         description="Project thread mode: private chat topics or group forum topics",

@@ -47,6 +47,7 @@ from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
 from ..security.secret_patterns import redact_secrets
+from .features import link_intake
 from .features.file_handler import FileTooLargeError
 from .middleware.rate_limit import estimate_message_cost
 from .utils.claude_run import persist_interaction
@@ -1402,6 +1403,49 @@ class MessageOrchestrator:
             return True
         return message_thread_id is not None and bool(getattr(chat, "is_forum", False))
 
+    async def _route_link_intake(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        message_text: str,
+    ) -> Tuple[bool, str]:
+        """Провести сообщение со ссылкой через разбор материала.
+
+        Возвращает `(обработано, текст для Claude)`. `обработано=True` означает,
+        что владельцу уже всё сказано и запускать Claude не нужно: материал
+        оказался дублем, проект не определился или сама добыча сорвалась.
+        """
+        thread_context = context.user_data.get("_thread_context") or {}
+        hint = thread_context.get("project_slug")
+        try:
+            decision = await link_intake.handle(message_text, project_hint=hint)
+        except Exception as exc:
+            # Сорвавшаяся добыча не должна съедать сообщение: говорим о ней и
+            # отдаём текст Claude как обычный запрос.
+            logger.warning("Link intake failed", error=str(exc))
+            await update.message.reply_text(
+                "Не смог добыть материал по ссылке, отвечаю как на обычный вопрос."
+            )
+            return False, message_text
+
+        await update.message.reply_text(decision["receipt"])
+        if decision["action"] != "analyze":
+            return True, message_text
+
+        # В режиме топиков рабочий каталог уже выставлен по топику проекта —
+        # трогаем его только когда проект определён классификацией.
+        if not thread_context:
+            path = link_intake.project_path(decision["project"])
+            if path is None:
+                await update.message.reply_text(
+                    f"Проект {decision['project']} не найден в реестре — "
+                    "разбор не запускаю."
+                )
+                return True, message_text
+            context.user_data["current_directory"] = Path(path)
+
+        return False, decision["prompt"]
+
     async def agentic_text(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -1420,6 +1464,15 @@ class MessageOrchestrator:
                 user_id=user_id,
                 message_length=len(message_text),
             )
+
+            if self.settings.enable_link_intake and link_intake.looks_like_link_task(
+                message_text
+            ):
+                handled, message_text = await self._route_link_intake(
+                    update, context, message_text
+                )
+                if handled:
+                    return
 
             chat = update.message.chat
             await chat.send_action("typing")
