@@ -1,12 +1,49 @@
 """Pytest configuration and fixtures."""
 
+import asyncio
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Callable
 
 import pytest
 
 _DOTENV_PATH = Path(__file__).resolve().parents[1] / ".env"
+
+
+if sys.platform == "win32":
+
+    @pytest.fixture(scope="session")
+    def event_loop_policy():
+        """Run the suite on the selector loop instead of the proactor loop.
+
+        pytest-asyncio drives one ``asyncio.Runner`` — i.e. one event loop —
+        through several ``run_until_complete()`` calls per test (fixture setup,
+        the test, fixture teardown). ``ProactorEventLoop`` re-arms its self-pipe
+        read on every ``run_forever()``, and the abort of the previous run can
+        land on the re-armed read as ``ConnectionResetError(995)``. That kills
+        the wakeup path: a later ``call_soon_threadsafe()`` from a worker thread
+        queues the callback in ``loop._ready`` but never wakes the loop, which
+        stays parked in ``_poll()`` forever.
+
+        aiosqlite runs every statement on a per-connection worker thread and
+        returns results exactly that way, so the first fixture teardown that
+        awaits ``conn.close()`` after the breakage hangs the whole run — this is
+        what made ``ClaudeTestSweep`` time out at 600 s on 2026-08-20 and leave
+        orphaned pytest processes behind. Reproduced locally at roughly one run
+        in four before this fixture.
+
+        The selector loop registers its self-pipe once, when the loop is
+        created, so the wakeup survives across runs. Nothing in the suite needs
+        the proactor loop: ``asyncio`` subprocesses are used only by
+        ``src/bot/features/git_integration.py``, which no test executes.
+
+        Event-loop policies are deprecated and go away in Python 3.16; the
+        ``DeprecationWarning`` in the run is expected. When they do go, replace
+        this with whatever pytest-asyncio offers for choosing the loop
+        (a loop factory) — the reason for choosing the selector loop stands.
+        """
+        return asyncio.WindowsSelectorEventLoopPolicy()
 
 
 def _dotenv_keys() -> list[str]:
