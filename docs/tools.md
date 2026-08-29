@@ -120,12 +120,21 @@ DISABLE_TOOL_VALIDATION=true
 
 Even when a tool is allowed, additional security checks apply. The exact checks depend on the run mode:
 
-1. **File path validation** (all modes) — `Read`, `Write`, `Edit`, and `MultiEdit` operations must target paths within the `APPROVED_DIRECTORY`. Path traversal attempts are blocked.
+1. **File path validation** (all modes) — `Read`, `Write`, `Edit`, `MultiEdit`, `Grep`, `Glob`, `LS` and the Notebook tools must target paths within the `APPROVED_DIRECTORY`. Path traversal is blocked, and the basename is checked against the secret blocklist (`.env`, `id_rsa`, `*.pem`, …) so an in-boundary secret cannot be read either.
 
-2. **Bash command validation** (classic mode only) — Dangerous patterns (`rm -rf`, `sudo`, `chmod 777`, pipes, redirections, subshells) are blocked by default. Filesystem-modifying commands (`mkdir`, `cp`, `mv`, `rm`, etc.) must target paths within the approved directory. This layer is **not active in agentic mode**, which relies on OS-level sandboxing instead.
+2. **Bash directory boundary checks** (all modes) — `check_bash_directory_boundary` is the only static analysis applied to bash, and it enforces exactly these rules:
 
-3. **Bash directory boundary checks** (all modes) — Filesystem-modifying commands are checked to ensure their target paths stay within the approved directory, regardless of run mode.
+   - a subshell or command substitution (`$(…)`, `` `…` ``, `<(…)`, `>(…)`) — **denied**, because its contents cannot be inspected;
+   - a command that cannot be tokenized (e.g. an unclosed quote) — **denied**, fail-closed;
+   - inline interpreter code (`python3 -c …`, `node -e …`, `eval "…"`) — **denied**, including through `sudo`/`env`/`xargs` wrappers, because a code string is not a path and would falsely "pass" a path check;
+   - a remote URL given to `curl`/`wget`/`fetch` — **denied**, for the same reason;
+   - path operands of filesystem-modifying commands (`mkdir`, `cp`, `mv`, `rm`, `tee`, `chmod`, `tar`, …), of read-only path commands (`cat`, `grep`, `sed`, `head`, …), of `find`, and every redirection target (`> file`, `2>>file`) — resolved and required to stay inside the approved directory, and their basenames checked against the same secret blocklist;
+   - directory flags of sandbox-excluded tooling (`git -C`, `poetry -C`, `npm --prefix`) — boundary-checked.
 
-4. **Audit logging** (all modes) — All tool calls and security violations are recorded for review.
+   There is **no** rule matching "dangerous" command names as such: `rm -rf` inside the approved directory is allowed, `sudo` is not blocked (it is unwrapped so the command it launches gets classified), and pipes are chain separators rather than a violation. Protection against a destructive-but-in-boundary command is the OS sandbox (`SANDBOX_ENABLED`), not this layer.
+
+3. **Message-content validation** (classic mode only) — `SecurityValidator.DANGEROUS_PATTERNS` is applied to the user's *message text* and to path arguments. It is deliberately not applied in agentic mode, where the text is a prompt to Claude rather than a shell command.
+
+4. **Audit logging** (all modes) — Security violations and privileged commands are recorded for review.
 
 See [Security](../SECURITY.md) for the full security model.

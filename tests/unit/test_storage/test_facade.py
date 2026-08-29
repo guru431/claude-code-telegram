@@ -9,6 +9,8 @@ import pytest
 from src.claude.sdk_integration import ClaudeResponse
 from src.storage.facade import Storage
 
+from .helpers import seed_session, seed_user
+
 
 @pytest.fixture
 async def storage(migrated_db):
@@ -32,24 +34,24 @@ class TestStorageFacade:
     async def test_get_or_create_user(self, storage):
         """Test getting or creating user."""
         # Create new user
-        user = await storage.get_or_create_user(12345, "testuser")
+        user = await seed_user(storage, 12345, "testuser")
         assert user.user_id == 12345
         assert user.telegram_username == "testuser"
         assert not user.is_allowed  # Default to not allowed
 
         # Get existing user
-        user2 = await storage.get_or_create_user(12345, "testuser")
+        user2 = await seed_user(storage, 12345, "testuser")
         assert user2.user_id == 12345
         assert user2.telegram_username == "testuser"
 
     async def test_create_session(self, storage):
         """Test creating session."""
         # Create user first
-        await storage.get_or_create_user(12346, "sessionuser")
+        await seed_user(storage, 12346, "sessionuser")
 
         # Create session
-        session = await storage.create_session(
-            12346, "/test/project", "test-session-123"
+        session = await seed_session(
+            storage, 12346, "/test/project", "test-session-123"
         )
         assert session.session_id == "test-session-123"
         assert session.user_id == 12346
@@ -62,8 +64,8 @@ class TestStorageFacade:
     async def test_save_claude_interaction(self, storage):
         """Test saving Claude interaction."""
         # Setup user and session
-        await storage.get_or_create_user(12347, "claudeuser")
-        await storage.create_session(12347, "/test/claude", "claude-session")
+        await seed_user(storage, 12347, "claudeuser")
+        await seed_session(storage, 12347, "/test/claude", "claude-session")
 
         # Create Claude response
         claude_response = ClaudeResponse(
@@ -111,24 +113,24 @@ class TestStorageFacade:
     async def test_is_user_allowed(self, storage):
         """Test checking user permissions."""
         # Create allowed user
-        await storage.get_or_create_user(12348, "alloweduser")
+        await seed_user(storage, 12348, "alloweduser")
         await storage.users.set_user_allowed(12348, True)
 
         # Check permission
         assert await storage.is_user_allowed(12348)
 
         # Create disallowed user
-        await storage.get_or_create_user(12349, "disalloweduser")
+        await seed_user(storage, 12349, "disalloweduser")
         assert not await storage.is_user_allowed(12349)
 
     async def test_get_user_session_summary(self, storage):
         """Test getting user session summary."""
         # Setup user and sessions
-        await storage.get_or_create_user(12350, "summaryuser")
+        await seed_user(storage, 12350, "summaryuser")
 
         # Create multiple sessions
         for i in range(3):
-            await storage.create_session(12350, f"/test/project{i}", f"session-{i}")
+            await seed_session(storage, 12350, f"/test/project{i}", f"session-{i}")
 
             # Add some activity
             claude_response = ClaudeResponse(
@@ -160,8 +162,8 @@ class TestStorageFacade:
     async def test_get_session_history(self, storage):
         """Test getting session history."""
         # Setup user and session
-        await storage.get_or_create_user(12351, "historyuser")
-        await storage.create_session(12351, "/test/history", "history-session")
+        await seed_user(storage, 12351, "historyuser")
+        await seed_session(storage, 12351, "/test/history", "history-session")
 
         # Add some messages
         for i in range(2):
@@ -191,7 +193,7 @@ class TestStorageFacade:
     async def test_log_security_event(self, storage):
         """Test logging security events."""
         # Setup user
-        await storage.get_or_create_user(12352, "securityuser")
+        await seed_user(storage, 12352, "securityuser")
 
         # Log security event
         await storage.log_security_event(
@@ -212,8 +214,8 @@ class TestStorageFacade:
     async def test_cleanup_old_data(self, storage):
         """Test cleaning up old data."""
         # Setup user and old session
-        await storage.get_or_create_user(12353, "cleanupuser")
-        await storage.create_session(12353, "/test/cleanup", "cleanup-session")
+        await seed_user(storage, 12353, "cleanupuser")
+        await seed_session(storage, 12353, "/test/cleanup", "cleanup-session")
 
         # Manually set old timestamp in database
         async with storage.db_manager.get_connection() as conn:
@@ -235,8 +237,8 @@ class TestStorageFacade:
     async def test_get_user_dashboard(self, storage):
         """Test getting user dashboard data."""
         # Setup user with activity
-        await storage.get_or_create_user(12354, "dashboarduser")
-        await storage.create_session(12354, "/test/dashboard", "dashboard-session")
+        await seed_user(storage, 12354, "dashboarduser")
+        await seed_session(storage, 12354, "/test/dashboard", "dashboard-session")
 
         # Add some activity
         claude_response = ClaudeResponse(
@@ -265,8 +267,8 @@ class TestStorageFacade:
     async def test_get_admin_dashboard(self, storage):
         """Test getting admin dashboard data."""
         # Setup some test data
-        await storage.get_or_create_user(12355, "adminuser")
-        await storage.create_session(12355, "/test/admin", "admin-session")
+        await seed_user(storage, 12355, "adminuser")
+        await seed_session(storage, 12355, "/test/admin", "admin-session")
 
         claude_response = ClaudeResponse(
             content="Admin response",

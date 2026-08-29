@@ -1,8 +1,9 @@
 """Message orchestrator — single entry point for all Telegram updates.
 
 Routes messages based on agentic vs classic mode. In agentic mode, provides
-a minimal conversational interface (3 commands, no inline keyboards). In
-classic mode, delegates to existing full-featured handlers.
+a minimal conversational interface (no inline keyboards); see
+``_register_agentic_handlers`` for the command set. In classic mode, delegates
+to existing full-featured handlers.
 """
 
 import asyncio
@@ -10,7 +11,7 @@ import contextlib
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -150,6 +151,11 @@ class MessageOrchestrator:
         # request can't clobber the first's ActiveRequest (orphaning its
         # heartbeat/progress message and stealing its Stop button).
         self._request_locks: Dict[int, asyncio.Lock] = {}
+        # How many of a user's requests are parked on that lock right now. Used
+        # only to tell the waiting user their position — a second message used to
+        # show the same silent "Working..." as the running one, so there was no
+        # way to tell a queued request from a hung bot.
+        self._queued_requests: Dict[int, int] = {}
 
     _MAX_REQUEST_LOCKS = 10_000
 
@@ -387,6 +393,7 @@ class MessageOrchestrator:
             ("start", self.agentic_start),
             ("new", self.agentic_new),
             ("status", self.agentic_status),
+            ("cost", self.agentic_cost),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
             ("sessions", self.agentic_sessions),
@@ -551,7 +558,13 @@ class MessageOrchestrator:
             CallbackQueryHandler(self._inject_deps(callback.handle_callback_query))
         )
 
-        logger.info("Classic handlers registered (13 commands + full handler set)")
+        # Counted, not hardcoded: the literal drifted every time a command was
+        # added and disagreed with both the handler list and the docs.
+        logger.info(
+            "Classic handlers registered",
+            commands=len(handlers),
+            names=[cmd for cmd, _ in handlers],
+        )
 
     async def get_bot_commands(self) -> list:  # type: ignore[type-arg]
         """Return bot commands appropriate for current mode."""
@@ -560,6 +573,7 @@ class MessageOrchestrator:
                 BotCommand("start", "Start the bot"),
                 BotCommand("new", "Start a fresh session"),
                 BotCommand("status", "Show session status"),
+                BotCommand("cost", "Show today's spend and remaining budget"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
                 BotCommand("sessions", "List sessions (local + bot)"),
@@ -684,6 +698,94 @@ class MessageOrchestrator:
         await update.message.reply_text(
             f"📂 {dir_display} · Session: {session_status}{cost_str}"
         )
+
+    @staticmethod
+    def _sparkline(values: List[float]) -> str:
+        """Render *values* as a one-line block-character bar chart."""
+        if not values:
+            return ""
+        blocks = "▁▂▃▄▅▆▇█"
+        peak = max(values)
+        if peak <= 0:
+            return blocks[0] * len(values)
+        return "".join(
+            blocks[min(len(blocks) - 1, int(v / peak * (len(blocks) - 1) + 0.5))]
+            for v in values
+        )
+
+    async def agentic_cost(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Show today's spend, what is left, and where it went.
+
+        Everything shown here was already being collected (``cost_tracking`` per
+        day, ``messages.cost`` per run) but had no way out: the only visible
+        signal was ``· Cost: $X.XX`` in /status, so a user met their budget as a
+        mid-task refusal.
+        """
+        user_id = update.effective_user.id
+        lines: List[str] = []
+
+        rate_limiter = context.bot_data.get("rate_limiter")
+        if rate_limiter:
+            usage = rate_limiter.get_user_status(user_id).get("cost_usage", {})
+            current = usage.get("current", 0.0)
+            limit = usage.get("limit", 0.0)
+            remaining = usage.get("remaining", 0.0)
+            reserved = usage.get("reserved", 0.0)
+            pct = (current / limit * 100) if limit else 0.0
+            lines.append(
+                f"💰 <b>Today:</b> ${current:.2f} / ${limit:.2f} ({pct:.0f}%) · "
+                f"left ${remaining:.2f}"
+            )
+            if reserved:
+                lines.append(f"   (${reserved:.2f} held by a run in flight)")
+        else:
+            lines.append("💰 Cost tracking is not available.")
+
+        storage = context.bot_data.get("storage")
+        if storage:
+            try:
+                daily = await storage.costs.get_user_daily_costs(user_id, days=30)
+                by_day = {row.date: row.daily_cost for row in daily}
+                today = datetime.now(UTC).date()
+                last7 = [
+                    by_day.get((today - timedelta(days=offset)).isoformat(), 0.0)
+                    for offset in range(6, -1, -1)
+                ]
+                last30 = [
+                    by_day.get((today - timedelta(days=offset)).isoformat(), 0.0)
+                    for offset in range(29, -1, -1)
+                ]
+                lines.append("")
+                lines.append(
+                    f"7d  <code>{self._sparkline(last7)}</code>  " f"${sum(last7):.2f}"
+                )
+                lines.append(
+                    f"30d <code>{self._sparkline(last30)}</code>  "
+                    f"${sum(last30):.2f}"
+                )
+
+                top = await storage.messages.get_top_costly_messages(user_id, limit=5)
+                if top:
+                    lines.append("")
+                    lines.append("<b>Most expensive runs today</b>")
+                    for row in top:
+                        first_line = (row.prompt or "").strip().splitlines()
+                        label = first_line[0][:60] if first_line else "(no prompt)"
+                        lines.append(f"· ${row.cost:.2f} — {escape_html(label)}")
+            except Exception as exc:
+                logger.warning("Failed to build cost report", error=str(exc))
+                lines.append("")
+                lines.append("History is unavailable right now.")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id, command="cost", args=[], success=True
+            )
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Return effective verbose level: per-user override or global default."""
@@ -832,6 +934,59 @@ class MessageOrchestrator:
         )
 
     @staticmethod
+    def _build_queued_kb(user_id: int) -> InlineKeyboardMarkup:
+        """Keyboard for a request waiting on the per-user lock.
+
+        The only button that can do anything for a queued request is one that
+        ends the run ahead of it, which is the same ``stop:`` action — labelled
+        for what it means from here.
+        """
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Stop current run", callback_data=f"stop:{user_id}"
+                    )
+                ]
+            ]
+        )
+
+    async def _wait_for_turn(
+        self, user_id: int, progress_msg: Any, stop_kb: InlineKeyboardMarkup
+    ) -> asyncio.Lock:
+        """Acquire the per-user lock, telling the user if they have to wait.
+
+        Returns the acquired lock. While waiting, *progress_msg* shows the queue
+        position and a button that stops the run being waited on; once the turn
+        comes it goes back to the normal working message.
+        """
+        if not self._get_request_lock(user_id).locked():
+            return await self._acquire_request_lock(user_id)
+
+        ahead = self._queued_requests.get(user_id, 0) + 1
+        self._queued_requests[user_id] = ahead
+        try:
+            await progress_msg.edit_text(
+                f"⏳ In queue ({ahead} ahead of you)…",
+                reply_markup=self._build_queued_kb(user_id),
+            )
+        except Exception:
+            pass
+        try:
+            lock = await self._acquire_request_lock(user_id)
+        finally:
+            remaining = self._queued_requests.get(user_id, 1) - 1
+            if remaining > 0:
+                self._queued_requests[user_id] = remaining
+            else:
+                self._queued_requests.pop(user_id, None)
+        try:
+            await progress_msg.edit_text("Working...", reply_markup=stop_kb)
+        except Exception:
+            pass
+        return lock
+
+    @staticmethod
     def _error_with_ref(message: str, request_id: str) -> str:
         """Append a short correlation id to a user-facing error for log grep."""
         return f"{message}\n\n<code>ref: {request_id[:8]}</code>"
@@ -843,6 +998,7 @@ class MessageOrchestrator:
         user_id: int,
         chat: Any,
         progress_msg: Any,
+        stop_kb: Optional[InlineKeyboardMarkup] = None,
     ) -> AsyncIterator[asyncio.Event]:
         """Own the lifecycle of one in-flight Claude run.
 
@@ -861,7 +1017,9 @@ class MessageOrchestrator:
         because those two paths differ in how the progress message is made.
         """
         interrupt_event = asyncio.Event()
-        request_lock = await self._acquire_request_lock(user_id)
+        request_lock = await self._wait_for_turn(
+            user_id, progress_msg, stop_kb or self._build_stop_kb(user_id)
+        )
         self._active_requests[user_id] = ActiveRequest(
             user_id=user_id,
             interrupt_event=interrupt_event,
@@ -1011,7 +1169,10 @@ class MessageOrchestrator:
         If *caption* is provided and fits (≤1024 chars), it is attached to the
         photo / first album item so text + images appear as one message.
 
-        Returns True if the caption was successfully embedded in the photo message.
+        Returns True if the caption was embedded in the photo message. This says
+        nothing about whether the images were delivered — they always are, in
+        every branch — so callers must not read a ``False`` return as "nothing
+        was sent, send them again". See ``_deliver_response``.
         """
         animations: List[ImageAttachment] = []
         photos: List[ImageAttachment] = []
@@ -1156,12 +1317,22 @@ class MessageOrchestrator:
         then a delivery-error notice) followed by the images. The messages are
         assumed to already have secrets redacted by the caller.
         """
-        caption_sent = False
+        # Two independent facts, previously conflated into one flag: whether the
+        # images have already gone out, and whether the response text rode along
+        # as their caption. ``_send_images`` delivers the images in every branch
+        # but only embeds the caption for a single photo with no per-image
+        # caption of its own — so reading its ``False`` as "images not sent"
+        # delivered every GIF, SVG and MCP-captioned photo twice.
+        images_sent = False
+        caption_embedded = False
         if images and len(formatted_messages) == 1:
             msg = formatted_messages[0]
             if msg.text and len(msg.text) <= 1024:
+                # Set before awaiting: a partial failure inside _send_images must
+                # not cause a second full pass over the same attachments.
+                images_sent = True
                 try:
-                    caption_sent = await self._send_images(
+                    caption_embedded = await self._send_images(
                         update,
                         images,
                         reply_to_message_id=update.message.message_id,
@@ -1171,7 +1342,7 @@ class MessageOrchestrator:
                 except Exception as img_err:
                     logger.warning("Image+caption send failed", error=str(img_err))
 
-        if not caption_sent:
+        if not caption_embedded:
             for i, message in enumerate(formatted_messages):
                 if not message.text or not message.text.strip():
                     continue
@@ -1210,7 +1381,7 @@ class MessageOrchestrator:
                 if i < len(formatted_messages) - 1:
                     await asyncio.sleep(0.5)
 
-            if images:
+            if images and not images_sent:
                 try:
                     await self._send_images(
                         update,
@@ -1248,10 +1419,7 @@ class MessageOrchestrator:
         *progress_msg* (integration missing, budget refused) — the caller must
         leave that message alone and stop.
         """
-        from .handlers.message import (
-            _format_error_message,
-            _update_working_directory_from_claude_response,
-        )
+        from .handlers.message import _format_error_message
         from .utils.formatting import FormattedMessage, ResponseFormatter
 
         claude_integration = context.bot_data.get("claude_integration")
@@ -1335,7 +1503,14 @@ class MessageOrchestrator:
             # The run completed without raising but the SDK flagged an error
             # (e.g. no ResultMessage / budget cap). Surface it explicitly and
             # keep force_new set so the next message still starts fresh.
-            if claude_response.is_error:
+            #
+            # ``interrupted`` is checked first: a Stop cancels the run before any
+            # ResultMessage arrives, so the SDK layer also sets
+            # is_error/error_type="no_result_message". Testing is_error first threw
+            # away the partial text the SDK carefully preserved and showed a
+            # generic "Claude returned an error" instead — the interrupted branch
+            # below was unreachable for a real Stop.
+            if claude_response.is_error and not claude_response.interrupted:
                 return [
                     FormattedMessage(
                         self._error_with_ref(
@@ -1353,9 +1528,16 @@ class MessageOrchestrator:
             if force_new:
                 context.user_data["force_new_session"] = False
 
-            _update_working_directory_from_claude_response(
-                claude_response, context, self.settings, user_id
-            )
+            # Settle here rather than only in the finally: the near-limit warning
+            # is derived from the post-settlement total, and the reply is composed
+            # just below. The finally still runs — settling an already-settled id
+            # is a documented no-op.
+            budget_notice: Optional[str] = None
+            if rate_limiter and reservation_id:
+                budget_notice = await rate_limiter.settle_reservation(
+                    reservation_id, actual_cost
+                )
+                reservation_id = None
 
             formatter = ResponseFormatter(self.settings)
             # Redact secrets from the response body before it leaves the bot —
@@ -1363,6 +1545,8 @@ class MessageOrchestrator:
             response_content = redact_secrets(claude_response.content or "")
             if claude_response.interrupted:
                 response_content = response_content + "\n\n_(Interrupted by user)_"
+            if budget_notice:
+                response_content = f"{response_content}\n\n⚠️ {budget_notice}"
             return formatter.format_claude_response(response_content), True
 
         except Exception as e:
@@ -1417,8 +1601,11 @@ class MessageOrchestrator:
         """
         thread_context = context.user_data.get("_thread_context") or {}
         hint = thread_context.get("project_slug")
+        intake_config = link_intake.LinkIntakeConfig.from_settings(self.settings)
         try:
-            decision = await link_intake.handle(message_text, project_hint=hint)
+            decision = await link_intake.handle(
+                message_text, project_hint=hint, config=intake_config
+            )
         except Exception as exc:
             # Сорвавшаяся добыча не должна съедать сообщение: говорим о ней и
             # отдаём текст Claude как обычный запрос.
@@ -1435,7 +1622,9 @@ class MessageOrchestrator:
         # В режиме топиков рабочий каталог уже выставлен по топику проекта —
         # трогаем его только когда проект определён классификацией.
         if not thread_context:
-            path = link_intake.project_path(decision["project"])
+            path = link_intake.project_path(
+                decision["project"], registry=intake_config.registry
+            )
             if path is None:
                 await update.message.reply_text(
                     f"Проект {decision['project']} не найден в реестре — "
@@ -1491,7 +1680,10 @@ class MessageOrchestrator:
             formatted_messages: List["FormattedMessage"] = []
             try:
                 async with self._claude_run(
-                    user_id=user_id, chat=chat, progress_msg=progress_msg
+                    user_id=user_id,
+                    chat=chat,
+                    progress_msg=progress_msg,
+                    stop_kb=stop_kb,
                 ) as interrupt_event:
                     # Drafts in private chats and in forum topics (the
                     # multi-project layout). A topic that rejects drafts falls
@@ -1818,7 +2010,10 @@ class MessageOrchestrator:
             formatted_messages: List["FormattedMessage"] = []
 
             async with self._claude_run(
-                user_id=user_id, chat=chat, progress_msg=progress_msg
+                user_id=user_id,
+                chat=chat,
+                progress_msg=progress_msg,
+                stop_kb=stop_kb,
             ) as interrupt_event:
                 # Same single implementation as the text path: reservation,
                 # is_error handling, cost settlement, persistence and formatting.

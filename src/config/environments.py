@@ -27,7 +27,6 @@ class DevelopmentConfig:
     log_level: str = "DEBUG"
     rate_limit_requests: int = 100  # More lenient for testing
     claude_timeout_seconds: int = 600  # Longer timeout for debugging
-    enable_telemetry: bool = False
 
     @classmethod
     def as_dict(cls) -> Dict[str, Any]:
@@ -45,7 +44,6 @@ class TestingConfig:
     # directly (rather than going through create_test_config) would otherwise
     # point at a non-existent path on Windows.
     approved_directory: str = str(Path(tempfile.gettempdir()) / "test_projects")
-    enable_telemetry: bool = False
     claude_timeout_seconds: int = 30  # Faster timeout for tests
     rate_limit_requests: int = 1000  # No rate limiting in tests
     session_timeout_hours: int = 1  # Short session timeout for testing
@@ -62,7 +60,6 @@ class ProductionConfig:
     debug: bool = False
     development_mode: bool = False
     log_level: str = "INFO"
-    enable_telemetry: bool = True
     # Use stricter defaults for production
     claude_max_cost_per_user: float = 5.0  # Lower cost limit
     claude_max_cost_per_request: float = 2.0  # Per-request SDK cap

@@ -34,11 +34,6 @@ class FeatureFlags:
         return self.settings.enable_quick_actions
 
     @property
-    def telemetry_enabled(self) -> bool:
-        """Check if telemetry is enabled."""
-        return self.settings.enable_telemetry
-
-    @property
     def webhook_enabled(self) -> bool:
         """Check if webhook mode is enabled."""
         return self.settings.webhook_url is not None
@@ -87,7 +82,6 @@ class FeatureFlags:
             "git": self.git_enabled,
             "file_uploads": self.file_uploads_enabled,
             "quick_actions": self.quick_actions_enabled,
-            "telemetry": self.telemetry_enabled,
             "webhook": self.webhook_enabled,
             "development": self.development_features_enabled,
             "api_server": self.api_server_enabled,

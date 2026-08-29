@@ -92,6 +92,33 @@ class UserRepository:
                 )
             return user
 
+    async def record_identity(self, user_id: int, username: Optional[str]) -> None:
+        """Create or refresh the user row's Telegram username.
+
+        ``telegram_username`` was never written by any live code path: the only
+        producer of ``users`` rows called ``_ensure_user_exists`` without a
+        username, so the admin dashboard, the ``user_stats`` view and the audit
+        log could only ever show numeric IDs. This is the single place that fills
+        it, called once per authenticated session.
+
+        ``is_allowed`` stays FALSE on insert: authorization is granted by
+        ``AuthenticationManager``, never by the act of recording an identity.
+        """
+        now = datetime.now(UTC)
+        async with self.db.get_connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO users
+                (user_id, telegram_username, first_seen, last_active, is_allowed)
+                VALUES (?, ?, ?, ?, FALSE)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    telegram_username = excluded.telegram_username,
+                    last_active = excluded.last_active
+                """,
+                (user_id, username, now, now),
+            )
+            await conn.commit()
+
     async def update_user(self, user: UserModel):
         """Update user data."""
         async with self.db.get_connection() as conn:
@@ -538,6 +565,33 @@ class MessageRepository:
                 LIMIT ?
             """,
                 (user_id, limit),
+            )
+            rows = await cursor.fetchall()
+            return [MessageModel.from_row(row) for row in rows]
+
+    async def get_top_costly_messages(
+        self, user_id: int, limit: int = 5, day: Optional[str] = None
+    ) -> List[MessageModel]:
+        """Return *user_id*'s most expensive runs on *day* (today, UTC, by default).
+
+        Compares the leading ``YYYY-MM-DD`` of the stored ISO timestamp rather
+        than calling ``date()``, so it does not depend on how the adapter spells
+        the separator or the UTC offset. The day boundary matches the one the
+        cost budget resets on.
+        """
+        if not day:
+            day = datetime.now(UTC).strftime("%Y-%m-%d")
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT * FROM messages
+                WHERE user_id = ?
+                  AND substr(CAST(timestamp AS TEXT), 1, 10) = ?
+                  AND cost > 0
+                ORDER BY cost DESC
+                LIMIT ?
+                """,
+                (user_id, day, limit),
             )
             rows = await cursor.fetchall()
             return [MessageModel.from_row(row) for row in rows]

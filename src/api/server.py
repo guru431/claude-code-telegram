@@ -38,7 +38,10 @@ def create_api_app(
     app = FastAPI(
         title="Claude Code Telegram - Webhook API",
         version="0.1.0",
-        docs_url="/docs" if settings.development_mode else None,
+        # Opt-in explicitly rather than riding on development_mode: the docs page
+        # enumerates the webhook surface and should not appear just because
+        # ENVIRONMENT happened to be left unset or set to development.
+        docs_url="/docs" if settings.api_docs_enabled else None,
         redoc_url=None,
     )
 

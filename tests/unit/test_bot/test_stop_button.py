@@ -216,12 +216,9 @@ class TestStopButtonOnProgress:
             mock_task.cancel = MagicMock()
             mock_hb.return_value = mock_task
 
-            with patch(
-                "src.bot.handlers.message._update_working_directory_from_claude_response"
-            ):
-                with patch("src.bot.utils.formatting.ResponseFormatter") as MockFmt:
-                    MockFmt.return_value.format_claude_response.return_value = []
-                    await orchestrator.agentic_text(update, context)
+            with patch("src.bot.utils.formatting.ResponseFormatter") as MockFmt:
+                MockFmt.return_value.format_claude_response.return_value = []
+                await orchestrator.agentic_text(update, context)
 
         # First reply_text call should be the progress message with Stop button
         first_call = update.message.reply_text.call_args_list[0]
@@ -278,12 +275,9 @@ class TestStopButtonOnProgress:
             mock_task = AsyncMock()
             mock_task.cancel = MagicMock()
             mock_hb.return_value = mock_task
-            with patch(
-                "src.bot.handlers.message._update_working_directory_from_claude_response"
-            ):
-                with patch("src.bot.utils.formatting.ResponseFormatter") as MockFmt:
-                    MockFmt.return_value.format_claude_response.return_value = []
-                    await orchestrator.agentic_text(update, context)
+            with patch("src.bot.utils.formatting.ResponseFormatter") as MockFmt:
+                MockFmt.return_value.format_claude_response.return_value = []
+                await orchestrator.agentic_text(update, context)
 
         assert user_id not in orchestrator._active_requests
 
@@ -449,3 +443,55 @@ class TestClaudeResponseInterruptedField:
             interrupted=True,
         )
         assert resp.interrupted is True
+
+
+class TestQueuedRequestVisibility:
+    """A second message while the first runs must say it is queued.
+
+    It used to get the same silent "Working..." as the running request and then
+    park on the per-user lock, so the user saw two identical messages and no way
+    to tell a queued request from a hung bot. The Stop button on the progress
+    message belongs to the *running* request, so the queued message offers the
+    only action that helps it: ending the run ahead of it.
+    """
+
+    async def test_waiting_message_shows_position_and_stop_button(self, orchestrator):
+        user_id = 42
+        progress_msg = AsyncMock()
+
+        # Hold the user's lock the way an in-flight run would.
+        held = orchestrator._get_request_lock(user_id)
+        await held.acquire()
+
+        stop_kb = orchestrator._build_stop_kb(user_id)
+        waiter = asyncio.create_task(
+            orchestrator._wait_for_turn(user_id, progress_msg, stop_kb)
+        )
+        await asyncio.sleep(0)  # let the waiter reach the lock
+
+        assert orchestrator._queued_requests[user_id] == 1
+        queued_text = progress_msg.edit_text.await_args.args[0]
+        assert "queue" in queued_text.lower()
+        assert "1 ahead" in queued_text
+        markup = progress_msg.edit_text.await_args.kwargs["reply_markup"]
+        assert markup.inline_keyboard[0][0].callback_data == f"stop:{user_id}"
+
+        held.release()
+        lock = await waiter
+        lock.release()
+
+        # Back to the normal working message once the turn comes.
+        assert progress_msg.edit_text.await_args.args[0] == "Working..."
+        assert user_id not in orchestrator._queued_requests
+
+    async def test_no_queue_message_when_lock_is_free(self, orchestrator):
+        user_id = 43
+        progress_msg = AsyncMock()
+
+        lock = await orchestrator._wait_for_turn(
+            user_id, progress_msg, orchestrator._build_stop_kb(user_id)
+        )
+        lock.release()
+
+        progress_msg.edit_text.assert_not_awaited()
+        assert user_id not in orchestrator._queued_requests

@@ -1,0 +1,85 @@
+# Bash boundary corpus — one case per line: VERDICT<TAB>command
+#
+# VERDICT is ALLOW or DENY as returned by check_bash_directory_boundary with
+# approved=/root/projects and cwd=/root/projects/myapp. Blank lines and lines
+# starting with '#' are ignored.
+#
+# The rule this corpus enforces: a command and its "canonical" spelling must get
+# the same verdict. Every spacing variant, fd prefix and launcher wrapper of a
+# denied form must also be denied — that symmetry is what the hand-rolled
+# tokenizer kept losing.
+
+# --- redirection: every spelling of the same write ---
+DENY	echo pwn > /etc/cron.d/x
+DENY	echo pwn >/etc/cron.d/x
+DENY	echo pwn >> /etc/cron.d/x
+DENY	echo pwn >>/etc/cron.d/x
+DENY	echo pwn 2> /etc/cron.d/x
+DENY	echo pwn 2>/etc/cron.d/x
+DENY	echo pwn 1>/etc/cron.d/x
+DENY	echo pwn &> /etc/cron.d/x
+DENY	echo pwn &>/etc/cron.d/x
+DENY	echo pwn >| /etc/cron.d/x
+DENY	cat < /etc/shadow
+DENY	cat </etc/shadow
+ALLOW	echo x > out.txt
+ALLOW	echo x >out.txt
+ALLOW	echo x >> logs/app.log
+
+# --- redirection to secrets, both spellings ---
+DENY	echo hi > .env
+DENY	echo hi >.env
+DENY	echo hi >> .ssh/id_rsa
+
+# --- /dev sinks are not boundary escapes ---
+ALLOW	ls foo 2>/dev/null
+ALLOW	ls foo 2> /dev/null
+ALLOW	ls foo > /dev/null 2>&1
+ALLOW	cat /dev/urandom
+
+# --- chain separators glued to words ---
+DENY	echo hi&&rm -rf /etc
+DENY	echo hi && rm -rf /etc
+DENY	echo hi;rm -rf /etc
+DENY	echo hi|tee /etc/cron.d/x
+ALLOW	echo hi&&ls
+ALLOW	echo a | grep b
+
+# --- inline interpreter code, bare and wrapped ---
+DENY	python3 -c 'import os'
+DENY	sudo python3 -c 'import os'
+DENY	env python3 -c 'import os'
+DENY	env -i python3 -c 'import os'
+DENY	env FOO=bar python3 -c 'import os'
+DENY	xargs python3 -c 'import os'
+DENY	xargs -n 1 python3 -c 'import os'
+DENY	nohup node -e 'x'
+DENY	timeout 5 perl -e 'x'
+DENY	eval 'rm -rf /etc'
+ALLOW	python3 script.py
+ALLOW	env python3 script.py
+
+# --- launcher wrappers over path-taking commands ---
+DENY	nohup rm -rf /etc
+DENY	sudo cat /etc/shadow
+DENY	env cat /etc/shadow
+DENY	xargs rm -rf /etc
+ALLOW	env cat notes.txt
+
+# --- project tooling: directory flags checked, operands not ---
+DENY	git -C /etc log
+DENY	git --git-dir=/etc/x log
+DENY	npm --prefix /etc install
+DENY	poetry -C /etc install
+ALLOW	git -C ./sub log
+ALLOW	git commit -m "/etc/hosts: fix parsing"
+ALLOW	npm install left-pad
+ALLOW	poetry add httpx
+
+# --- quoting must not be reinterpreted as operators ---
+ALLOW	grep 'a|b' file.txt
+ALLOW	grep "a>b" file.txt
+ALLOW	echo 'a && b'
+
+# --- unparseable input fails closed ---
+DENY	echo 'unterminated

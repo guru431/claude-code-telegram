@@ -236,12 +236,13 @@ class TestMiddlewareBlocksSubsequentGroups:
         bot.deps["auth_manager"] = auth_manager
         bot.deps["audit_logger"] = AsyncMock()
 
-        auth_mod._last_rejection_reply.clear()
+        auth_mod._rejection_state.clear()
         # Seed entries that are already older than the window.
         stale_now = time.monotonic()
         for uid in range(1000, 1050):
-            auth_mod._last_rejection_reply[uid] = (
-                stale_now - auth_mod._REJECTION_REPLY_WINDOW - 10
+            auth_mod._rejection_state[uid] = (
+                stale_now - auth_mod._REJECTION_REPLY_WINDOW - 10,
+                0,
             )
         # Force the throttled sweep to be due on the next rejection.
         auth_mod._last_rejection_gc = 0.0
@@ -251,7 +252,7 @@ class TestMiddlewareBlocksSubsequentGroups:
             await wrapper(mock_update, mock_context)
 
         # All 50 stale entries swept; only the current rejecting user remains.
-        assert set(auth_mod._last_rejection_reply) == {mock_update.effective_user.id}
+        assert set(auth_mod._rejection_state) == {mock_update.effective_user.id}
 
     async def test_rejection_reply_sweep_is_throttled(
         self, bot, mock_update, mock_context
@@ -265,7 +266,7 @@ class TestMiddlewareBlocksSubsequentGroups:
         bot.deps["auth_manager"] = auth_manager
         bot.deps["audit_logger"] = AsyncMock()
 
-        auth_mod._last_rejection_reply.clear()
+        auth_mod._rejection_state.clear()
         wrapper = bot._create_middleware_handler(auth_mod.auth_middleware)
 
         with pytest.raises(ApplicationHandlerStop):
@@ -274,12 +275,12 @@ class TestMiddlewareBlocksSubsequentGroups:
 
         # A stale entry added after the sweep survives the next rejection,
         # proving the second call did not run another sweep.
-        auth_mod._last_rejection_reply[4242] = 0.0
+        auth_mod._rejection_state[4242] = (0.0, 0)
         with pytest.raises(ApplicationHandlerStop):
             await wrapper(mock_update, mock_context)
 
         assert auth_mod._last_rejection_gc == gc_after_first
-        assert 4242 in auth_mod._last_rejection_reply
+        assert 4242 in auth_mod._rejection_state
 
     async def test_dependencies_injected_before_middleware_runs(
         self, bot, mock_update, mock_context
@@ -359,3 +360,79 @@ def test_estimate_message_cost_handles_none_text() -> None:
     cost = estimate_message_cost(event)
 
     assert cost >= 0.01
+
+
+class TestRejectionAuditIsAggregated:
+    """One audit row per throttle window, not one per spam message.
+
+    The rejection *reply* was already throttled, but ``log_auth_attempt`` ran
+    before the throttle — so a stream of messages from an unauthorized sender to
+    the bot's public @username produced an unbounded stream of identical INSERTs
+    into ``audit_log``, a table pruned once a year.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_state(self):
+        from src.bot.middleware import auth as auth_mod
+
+        auth_mod._rejection_state.clear()
+        yield
+        auth_mod._rejection_state.clear()
+
+    async def test_repeat_rejections_write_one_row_with_a_count(
+        self, bot, mock_update, mock_context
+    ):
+        from src.bot.middleware import auth as auth_mod
+
+        auth_manager = MagicMock()
+        auth_manager.is_authenticated.return_value = False
+        auth_manager.authenticate_user = AsyncMock(return_value=False)
+        bot.deps["auth_manager"] = auth_manager
+        audit = AsyncMock()
+        bot.deps["audit_logger"] = audit
+
+        wrapper = bot._create_middleware_handler(auth_mod.auth_middleware)
+        for _ in range(5):
+            with pytest.raises(ApplicationHandlerStop):
+                await wrapper(mock_update, mock_context)
+
+        assert audit.log_auth_attempt.await_count == 1
+
+        # The window's suppressed attempts are not lost: they ride along on the
+        # next window's row.
+        user_id = mock_update.effective_user.id
+        window_start, suppressed = auth_mod._rejection_state[user_id]
+        auth_mod._rejection_state[user_id] = (
+            window_start - auth_mod._REJECTION_REPLY_WINDOW - 1,
+            suppressed,
+        )
+        with pytest.raises(ApplicationHandlerStop):
+            await wrapper(mock_update, mock_context)
+
+        assert audit.log_auth_attempt.await_count == 2
+        assert audit.log_auth_attempt.await_args.kwargs["suppressed_attempts"] == 4
+
+    async def test_successful_auth_records_the_username(
+        self, bot, mock_update, mock_context
+    ):
+        """users.telegram_username was NULL in every deployment before this."""
+        from src.bot.middleware import auth as auth_mod
+
+        auth_mod._identity_recorded.clear()
+        auth_manager = MagicMock()
+        auth_manager.is_authenticated.return_value = False
+        auth_manager.authenticate_user = AsyncMock(return_value=True)
+        auth_manager.get_session.return_value = None
+        bot.deps["auth_manager"] = auth_manager
+        bot.deps["audit_logger"] = AsyncMock()
+        storage = MagicMock()
+        storage.users = AsyncMock()
+        bot.deps["storage"] = storage
+        mock_update.effective_user.username = "someone"
+
+        wrapper = bot._create_middleware_handler(auth_mod.auth_middleware)
+        await wrapper(mock_update, mock_context)
+
+        storage.users.record_identity.assert_awaited_once_with(
+            mock_update.effective_user.id, "someone"
+        )

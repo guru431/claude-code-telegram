@@ -1,63 +1,58 @@
-"""Event bus audit middleware.
+"""Audit logging for webhook events on the bus.
 
-Logs bus events for audit purposes. This is log-only and not an
-enforcement gate -- see ``EventSecurityMiddleware`` for why, and for where
-the real signature/tool-level enforcement lives.
+Log-only. This module holds no enforcement gate, and its name says so: the
+previous ``EventSecurityMiddleware`` promised one it never had — it took a
+``SecurityValidator`` and an ``AuthenticationManager``, used neither, and wrote a
+single info line. SECURITY.md read that name and claimed webhook events were
+"validated before handler processing", so an operator believed a control was on
+that did not exist.
 """
 
 import structlog
 
-from ..security.auth import AuthenticationManager
-from ..security.validators import SecurityValidator
 from .bus import Event, EventBus
 from .types import WebhookEvent
 
 logger = structlog.get_logger()
 
 
-class EventSecurityMiddleware:
-    """Audit logger for bus events; not an enforcement gate.
+class WebhookAuditLogger:
+    """Records webhook events reaching the bus. Not an enforcement gate.
 
-    This is deliberately log-only. Webhook payloads carry no user identity
-    or filesystem path to authenticate or validate, so ``SecurityValidator``
-    and ``AuthenticationManager`` have nothing meaningful to check here.
-    The bus also dispatches all matching handlers concurrently with
-    ``return_exceptions=True`` (see ``EventBus._dispatch``), so even a raised
-    error would not veto ``AgentHandler``. Actual enforcement lives upstream
-    and downstream of this audit point:
+    Nothing here can veto a run even in principle: ``EventBus._dispatch``
+    dispatches matching handlers concurrently with ``return_exceptions=True``, so
+    a raised error would not stop ``AgentHandler``. Webhook payloads also carry no
+    user identity or filesystem path there would be anything to authenticate or
+    validate. The real enforcement sits upstream and downstream of this log line:
 
-    - API layer: GitHub HMAC-SHA256 signature / Bearer-token verification
-      and atomic deduplication before an event is ever published.
+    - API layer: GitHub HMAC-SHA256 signature / Bearer-token verification and
+      atomic deduplication before an event is ever published.
     - Agent layer: webhook-driven runs use a read-only tool set
-      (``_WEBHOOK_READONLY_TOOLS`` in ``events.handlers``), and tool calls
-      are gated by the SDK ``can_use_tool`` callback and
+      (``_WEBHOOK_READONLY_TOOLS`` in ``events.handlers``), and every tool call is
+      gated by the SDK ``can_use_tool`` callback and
       ``check_bash_directory_boundary``.
 
-    ``security`` and ``auth`` are retained for future per-user/path events
-    (e.g. authenticated bus sources) that would carry validatable fields.
+    If a bus source ever carries validatable fields, give this class the
+    dependencies it needs *then* — holding unused ones "for the future" is what
+    made the gap invisible.
     """
 
-    def __init__(
-        self,
-        event_bus: EventBus,
-        security_validator: SecurityValidator,
-        auth_manager: AuthenticationManager,
-    ) -> None:
+    def __init__(self, event_bus: EventBus) -> None:
         self.event_bus = event_bus
-        self.security = security_validator
-        self.auth = auth_manager
 
     def register(self) -> None:
-        """Subscribe as a global handler to validate all events."""
-        self.event_bus.subscribe(WebhookEvent, self.validate_webhook)
+        """Subscribe to webhook events for audit logging.
 
-    async def validate_webhook(self, event: Event) -> None:
-        """Validate webhook events (signature verified upstream in API layer)."""
+        Note that ``ScheduledEvent`` is not covered: scheduled jobs originate
+        from persisted local config rather than an external caller.
+        """
+        self.event_bus.subscribe(WebhookEvent, self.log_webhook)
+
+    async def log_webhook(self, event: Event) -> None:
+        """Write the audit line for one webhook event."""
         if not isinstance(event, WebhookEvent):
             return
 
-        # Webhooks are signature-verified in the API layer.
-        # Here we just log for audit purposes.
         logger.info(
             "Webhook event passed to bus",
             provider=event.provider,

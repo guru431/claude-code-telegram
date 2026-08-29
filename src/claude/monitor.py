@@ -139,12 +139,33 @@ _NETWORK_OR_INTERP_COMMANDS: Set[str] = {
     # path operand must stay inside the boundary (e.g. ``source /etc/passwd``).
     "source",
     ".",
-    # Command launchers / evaluators: they run another command whose path we
-    # cannot statically see, so force a boundary check rather than waving them
-    # through as "unknown".
-    "xargs",
+    # ``eval`` runs a code string assembled at runtime; it is denied outright
+    # below (see ``_CODE_STRING_COMMANDS``) rather than path-checked.
     "eval",
-    "env",
+}
+
+# Commands whose *positional operand* is a shell code string, not a path.
+# Resolving that string against the working directory falsely "passes" the
+# boundary check (``eval "rm -rf /etc"`` resolves to a literal name inside the
+# approved dir), so an invocation carrying any operand is denied outright — the
+# same reasoning as ``_INTERP_COMMANDS``/``_INLINE_CODE_FLAGS`` below.
+_CODE_STRING_COMMANDS: Set[str] = {"eval"}
+
+# Commands whose *explicit path flags* are boundary-checked, but whose
+# positional operands are not paths (``git commit -m "…"``, ``npm install pkg``,
+# ``poetry add pkg``). They are excluded from the OS sandbox by default (see
+# ``sandbox_excluded_commands``), so their path-bearing flags — ``git -C DIR``,
+# ``npm --prefix DIR`` — are the one static check standing between them and a
+# write outside the approved root.
+_FLAG_PATH_ONLY_COMMANDS: Set[str] = {
+    "git",
+    "npm",
+    "npx",
+    "yarn",
+    "pnpm",
+    "poetry",
+    "pip",
+    "pip3",
 }
 
 # Interpreters that can execute an inline code string / opaque module supplied
@@ -214,6 +235,13 @@ _LAUNCHER_WRAPPERS: Set[str] = {
     # numeric/value operands, so strip it and re-classify the real command
     # (``exec cat /etc/passwd`` must check ``cat``'s path).
     "exec",
+    # ``env``/``xargs`` also run *another* command. Classifying only the wrapper
+    # left the wrapped command unchecked, so ``env python3 -c '…'`` and
+    # ``xargs python3 -c '…'`` bypassed the inline-code denial that catches the
+    # bare ``python3 -c '…'`` (and ``sudo python3 -c '…'``, which was caught only
+    # because ``sudo`` is a wrapper). Strip them and classify what they launch.
+    "env",
+    "xargs",
 }
 
 # Wrappers that take a numeric/value operand of their own *before* the wrapped
@@ -229,6 +257,27 @@ _WRAPPERS_WITH_NUMERIC_OPERAND: Set[str] = {"timeout", "nice", "ionice", "chrt"}
 _WRAPPER_OPERAND_FLAGS: dict[str, Set[str]] = {
     "sudo": {"-u", "-g", "-C", "-h", "-p", "-r", "-t", "-U", "-c"},
     "doas": {"-u", "-C"},
+    "env": {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"},
+    "xargs": {
+        "-I",
+        "-i",
+        "-n",
+        "-P",
+        "-a",
+        "-d",
+        "-E",
+        "-e",
+        "-L",
+        "-s",
+        "--replace",
+        "--max-args",
+        "--max-procs",
+        "--arg-file",
+        "--delimiter",
+        "--eof",
+        "--max-lines",
+        "--max-chars",
+    },
 }
 
 
@@ -283,8 +332,127 @@ _COMMAND_SEPARATORS: Set[str] = {"&&", "||", ";", "|", "&"}
 # Redirection operators. The token *following* one of these is a filesystem
 # path the command writes to / reads from (e.g. ``echo x > /etc/cron.d/y``),
 # and must be boundary-checked even when the lead command takes no path of its
-# own (``echo``). shlex.split keeps these as standalone tokens.
-_REDIRECTION_OPERATORS: Set[str] = {">", ">>", "<", "<>", ">|", "&>", "&>>"}
+# own (``echo``).
+_REDIRECTION_OPERATORS: Set[str] = {
+    ">",
+    ">>",
+    "<",
+    "<>",
+    ">|",
+    "&>",
+    "&>>",
+    # fd duplication (``2>&1``): the operand is a file descriptor number, which
+    # resolves inside the working directory and passes; a filename operand
+    # (``>& /etc/x``, legal bash) is caught.
+    ">&",
+    "<&",
+}
+
+# Shell metacharacters that ``shlex.split`` does *not* separate on its own.
+# ``shlex`` in whitespace-split mode keeps ``>/etc/x``, ``2>``, and ``hi&&rm``
+# as single words, so the redirection scan below (which looks for a standalone
+# operator token) never fired for the no-space forms and the chain splitter
+# never saw a separator glued to a word. Both are the common way these are
+# written, so normalize by inserting whitespace around every operator before
+# tokenizing. Longest match first: ``&&`` must not be read as ``&`` + ``&``,
+# ``>>`` not as ``>`` + ``>``.
+_SHELL_OPERATORS: Tuple[str, ...] = (
+    "&>>",
+    "<<<",
+    "&&",
+    "||",
+    "&>",
+    ">>",
+    "<<",
+    ">|",
+    "<>",
+    ">&",
+    "<&",
+    ">",
+    "<",
+    "|",
+    ";",
+    "&",
+)
+
+# Character devices that are legitimate redirection targets even though they sit
+# outside the approved root. ``2>/dev/null`` appears in a large share of ordinary
+# commands and discarding output is not a boundary escape; block devices and
+# everything else under /dev stay denied.
+_ALLOWED_DEVICE_TARGETS: Set[str] = {
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/stdin",
+    "/dev/stdout",
+    "/dev/stderr",
+    "/dev/tty",
+}
+
+
+def _normalize_shell_operators(line: str) -> str:
+    """Insert whitespace around unquoted shell operators.
+
+    ``echo pwn >/etc/cron.d/x`` and ``echo hi&&rm -rf /etc`` are single words to
+    ``shlex.split``; after normalization they tokenize as the spaced forms do, so
+    the redirection scan and the chain splitter see them. Quoted and
+    backslash-escaped operators are left alone (``grep 'a|b' f`` keeps its pipe
+    inside the pattern). An unterminated quote is left as-is for ``shlex`` to
+    reject, which the caller turns into a denial.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(line)
+    in_single = False
+    in_double = False
+    while i < n:
+        ch = line[i]
+        if in_single:
+            out.append(ch)
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            if ch == "\\" and i + 1 < n:
+                out.append(ch)
+                out.append(line[i + 1])
+                i += 2
+                continue
+            out.append(ch)
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(ch)
+            out.append(line[i + 1])
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            out.append(ch)
+            i += 1
+            continue
+        for op in _SHELL_OPERATORS:
+            if line.startswith(op, i):
+                out.append(" ")
+                out.append(op)
+                out.append(" ")
+                i += len(op)
+                break
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
 
 # Path-bearing option flags per command. Their value is a filesystem path the
 # utility writes to / reads from, but it hides behind a ``-`` so the generic
@@ -300,6 +468,16 @@ _PATH_BEARING_FLAGS: dict[str, dict[str, str]] = {
     "curl": {"-o": "--output"},
     "tar": {"-C": "--directory", "-f": "--file"},
     "sort": {"-o": "--output"},
+    # Project tooling excluded from the OS sandbox: their directory flags are the
+    # only thing that can point the tool at a tree outside the approved root.
+    "git": {"-C": "--git-dir", "--work-tree": "--work-tree"},
+    "npm": {"--prefix": "--prefix"},
+    "npx": {"--prefix": "--prefix"},
+    "yarn": {"--cwd": "--cwd"},
+    "pnpm": {"-C": "--dir"},
+    "poetry": {"-C": "--directory"},
+    "pip": {"-t": "--target"},
+    "pip3": {"-t": "--target"},
 }
 
 # Bash subshell / command-substitution patterns. shlex.split silently absorbs
@@ -341,7 +519,7 @@ def check_bash_directory_boundary(
         if not line.strip():
             continue
         try:
-            line_tokens = shlex.split(line)
+            line_tokens = shlex.split(_normalize_shell_operators(line))
         except ValueError:
             # A command we cannot tokenize (e.g. an unclosed quote) cannot be
             # boundary-checked at all. Deny by default rather than fail open —
@@ -378,6 +556,8 @@ def check_bash_directory_boundary(
 
     def _path_escapes(path_token: str) -> bool:
         """Return True if *path_token* resolves outside the approved directory."""
+        if path_token in _ALLOWED_DEVICE_TARGETS:
+            return False
         try:
             # Expand ``~`` / ``~user`` the way bash does before resolving — shlex
             # leaves the tilde literal, so without this ``> ~/.ssh/authorized_keys``
@@ -475,9 +655,22 @@ def check_bash_directory_boundary(
             needs_check = True
         elif base_command in _NETWORK_OR_INTERP_COMMANDS:
             needs_check = True
+        elif base_command in _FLAG_PATH_ONLY_COMMANDS:
+            # Only their explicit directory flags are paths; the positional
+            # operands are subcommands, package names and commit messages.
+            needs_check = True
 
         if not needs_check:
             continue
+
+        # ``eval <string>`` executes a shell string that no path check can
+        # analyze — resolving it against the working directory lands it inside
+        # the boundary and falsely passes. Deny any invocation with an operand.
+        if base_command in _CODE_STRING_COMMANDS and len(cmd_tokens) > 1:
+            return False, (
+                f"Inline-code execution via '{base_command}' cannot be validated "
+                "against the directory boundary and is not allowed"
+            )
 
         # Interpreters invoked with an inline-code/opaque-module flag execute a
         # code string that no filesystem-path check can analyze. Resolving that
@@ -511,6 +704,12 @@ def check_bash_directory_boundary(
         while idx < len(rest_tokens):
             token = rest_tokens[idx]
             idx += 1
+            # For flag-path-only tooling the positional operands are subcommands,
+            # package names and commit messages, not paths — checking them would
+            # deny ``git commit -m "/etc/hosts: fix"``. Only the directory flags
+            # handled below are boundary-checked.
+            if base_command in _FLAG_PATH_ONLY_COMMANDS and not token.startswith("-"):
+                continue
             # ``--`` marks the end of options; everything after is a positional
             # argument and must be path-checked even if it starts with ``-``.
             if token == "--" and not seen_double_dash:
@@ -606,6 +805,8 @@ def check_bash_directory_boundary(
             # caught instead of being silently allowed. Expand ``~``/``~user``
             # first (bash does, shlex doesn't) so ``cat ~/.ssh/id_rsa`` is not
             # treated as a literal ``~`` subdir inside the boundary.
+            if token in _ALLOWED_DEVICE_TARGETS:
+                continue
             try:
                 expanded_token = os.path.expanduser(token)
                 if expanded_token.startswith("/"):
@@ -645,6 +846,11 @@ def _is_forbidden_secret_basename(name: str) -> Tuple[bool, Optional[str]]:
     read/modify of an in-boundary secret (``cat .env``, ``head .ssh/id_rsa``) is
     denied just like the Read/Write/Edit tools are — the bash path must not
     bypass the ``is_forbidden_secret_file`` gate.
+
+    Only ever called on tokens the caller has already proved to be inside the
+    approved directory, so ``SYSTEM_ONLY_FORBIDDEN_FILENAMES`` (``hosts``,
+    ``passwd``, …) is deliberately not applied: those are ordinary project files
+    here, and the ``/etc`` originals are stopped by the boundary check.
     """
     if not name:
         return False, None

@@ -12,7 +12,7 @@ import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterator, List, Optional, Tuple, Union
+from typing import Any, AsyncIterator, List, Optional, Tuple, Union
 
 import aiosqlite
 import structlog
@@ -149,6 +149,17 @@ class DatabaseManager:
     def __init__(self, database_url: str):
         """Initialize database manager."""
         self.database_path = self._parse_database_url(database_url)
+        # A plain ``:memory:`` database is private to the connection that opened
+        # it: migrations would run on a throwaway connection and every pooled
+        # connection would then see an empty database ("no such table" on the
+        # first query). Map the in-memory form onto a named shared-cache URI so
+        # all connections attach to the *same* database, and keep an anchor
+        # connection open for the manager's lifetime — the shared database is
+        # destroyed the moment its last connection closes.
+        self._memory_uri: Optional[str] = None
+        self._memory_anchor: Optional[aiosqlite.Connection] = None
+        if self.database_path == ":memory:":
+            self._memory_uri = f"file:ccbot_mem_{id(self):x}?mode=memory&cache=shared"
         self._connection_pool: List[aiosqlite.Connection] = []
         self._pool_size = 5
         self._pool_lock = asyncio.Lock()
@@ -179,6 +190,16 @@ class DatabaseManager:
             return ":memory:"
         return Path(path)
 
+    def _connect(self, **kwargs: Any) -> Any:
+        """Open a connection to this manager's database.
+
+        Single place that knows about the shared-cache in-memory URI, so no call
+        site can accidentally open a private ``:memory:`` database of its own.
+        """
+        if self._memory_uri is not None:
+            return aiosqlite.connect(self._memory_uri, uri=True, **kwargs)
+        return aiosqlite.connect(self.database_path, **kwargs)
+
     async def initialize(self):
         """Initialize database and run migrations."""
         logger.info("Initializing database", path=str(self.database_path))
@@ -187,6 +208,12 @@ class DatabaseManager:
         # backing file and therefore no parent directory to create).
         if isinstance(self.database_path, Path):
             self.database_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Open the anchor first: an in-memory shared database lives exactly as
+        # long as one connection to it is open, so without this the schema would
+        # vanish between the migration connection closing and the pool opening.
+        if self._memory_uri is not None and self._memory_anchor is None:
+            self._memory_anchor = await self._connect()
 
         # Run migrations
         await self._run_migrations()
@@ -198,9 +225,7 @@ class DatabaseManager:
 
     async def _run_migrations(self):
         """Run database migrations."""
-        async with aiosqlite.connect(
-            self.database_path, detect_types=sqlite3.PARSE_DECLTYPES
-        ) as conn:
+        async with self._connect(detect_types=sqlite3.PARSE_DECLTYPES) as conn:
             conn.row_factory = aiosqlite.Row
 
             # Enable foreign keys
@@ -482,7 +507,7 @@ class DatabaseManager:
         # WAL must be set OUTSIDE any open transaction and persists across
         # opens, so we set it once via a one-shot connection here.
         try:
-            async with aiosqlite.connect(self.database_path) as conn:
+            async with self._connect() as conn:
                 await conn.execute("PRAGMA journal_mode=WAL")
         except Exception as e:
             # Non-fatal: fall back to default journal_mode (DELETE).
@@ -491,9 +516,7 @@ class DatabaseManager:
         self._pool_semaphore = asyncio.Semaphore(self._pool_size)
         async with self._pool_lock:
             for _ in range(self._pool_size):
-                conn = await aiosqlite.connect(
-                    self.database_path, detect_types=sqlite3.PARSE_DECLTYPES
-                )
+                conn = await self._connect(detect_types=sqlite3.PARSE_DECLTYPES)
                 conn.row_factory = aiosqlite.Row
                 await conn.execute("PRAGMA foreign_keys = ON")
                 # busy_timeout is per-connection (not persisted): make a
@@ -522,9 +545,7 @@ class DatabaseManager:
         if self._pool_semaphore is None:
             # Pool not yet initialised; emulate sequential behaviour by opening
             # a transient connection. Should only happen during early startup.
-            transient_conn = await aiosqlite.connect(
-                self.database_path, detect_types=sqlite3.PARSE_DECLTYPES
-            )
+            transient_conn = await self._connect(detect_types=sqlite3.PARSE_DECLTYPES)
             transient_conn.row_factory = aiosqlite.Row
             await transient_conn.execute("PRAGMA foreign_keys = ON")
             await transient_conn.execute("PRAGMA busy_timeout=5000")
@@ -545,9 +566,7 @@ class DatabaseManager:
                 if self._connection_pool:
                     conn = self._connection_pool.pop()
             if conn is None:
-                conn = await aiosqlite.connect(
-                    self.database_path, detect_types=sqlite3.PARSE_DECLTYPES
-                )
+                conn = await self._connect(detect_types=sqlite3.PARSE_DECLTYPES)
                 conn.row_factory = aiosqlite.Row
                 await conn.execute("PRAGMA foreign_keys = ON")
                 await conn.execute("PRAGMA busy_timeout=5000")
@@ -595,6 +614,11 @@ class DatabaseManager:
             for conn in self._connection_pool:
                 await conn.close()
             self._connection_pool.clear()
+            # Released last: closing the anchor discards a shared in-memory
+            # database, so it must outlive every pooled connection.
+            if self._memory_anchor is not None:
+                await self._memory_anchor.close()
+                self._memory_anchor = None
 
     async def health_check(self) -> bool:
         """Check database health.

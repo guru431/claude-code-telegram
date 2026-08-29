@@ -1,15 +1,15 @@
-"""Tests for progress-update HTML escaping and cd-path extraction."""
+"""Tests for progress-update HTML escaping.
 
-from pathlib import Path
-from types import SimpleNamespace
+The cd-path extraction tests that used to live here were removed together with
+``_update_working_directory_from_claude_response``: the working directory is no
+longer inferred by regex from Claude's prose. See ``TestCwdIsNotInferred`` below
+for the property that replaced them.
+"""
+
 from typing import Optional
 
-import pytest
-
-from src.bot.handlers.message import (
-    _format_progress_update,
-    _update_working_directory_from_claude_response,
-)
+from src.bot.handlers import message as message_handlers
+from src.bot.handlers.message import _format_progress_update
 
 
 class FakeUpdateObj:
@@ -78,60 +78,17 @@ class TestProgressUpdateEscaping:
         assert "step &lt;1&gt;" in result
 
 
-@pytest.fixture
-def approved_dir(tmp_path: Path) -> Path:
-    root = tmp_path / "approved"
-    root.mkdir()
-    return root
+class TestCwdIsNotInferred:
+    """The bot must not change its working directory by reading Claude's text.
 
+    The old heuristic matched any line starting with ``cd `` — including install
+    instructions Claude quoted from a README ("cd my-app && npm install") — and
+    silently moved the user into another directory with another auto-resumed
+    session, with no notification. The working directory now changes only through
+    explicit actions (/repo, the ``cd:`` callback, resume).
+    """
 
-def _run(content: str, approved_dir: Path, current: Optional[Path] = None) -> Path:
-    """Run the extractor and return the resulting current_directory."""
-    context = SimpleNamespace(user_data={"current_directory": current or approved_dir})
-    settings = SimpleNamespace(approved_directory=approved_dir)
-    claude_response = SimpleNamespace(content=content)
-    _update_working_directory_from_claude_response(
-        claude_response, context, settings, user_id=1
-    )
-    return context.user_data["current_directory"]
-
-
-class TestCdExtraction:
-    """The cd heuristic must handle quoted paths and trailing punctuation."""
-
-    def test_quoted_path_with_spaces(self, approved_dir: Path) -> None:
-        target = approved_dir / "path with spaces"
-        target.mkdir()
-        assert _run(f'\ncd "{target}"\n', approved_dir) == target
-
-    def test_single_quoted_path_with_spaces(self, approved_dir: Path) -> None:
-        target = approved_dir / "my project"
-        target.mkdir()
-        assert _run(f"\ncd '{target}'\n", approved_dir) == target
-
-    def test_trailing_period_is_stripped(self, approved_dir: Path) -> None:
-        target = approved_dir / "src"
-        target.mkdir()
-        assert _run("\ncd src.\n", approved_dir) == target
-
-    def test_trailing_comma_is_stripped(self, approved_dir: Path) -> None:
-        target = approved_dir / "src"
-        target.mkdir()
-        assert _run("\ncd src, then run the tests\n", approved_dir) == target
-
-    def test_dot_dot_is_not_mangled(self, approved_dir: Path) -> None:
-        child = approved_dir / "child"
-        child.mkdir()
-        assert _run("\ncd ..\n", approved_dir, current=child) == approved_dir
-
-    def test_plain_relative_path_still_works(self, approved_dir: Path) -> None:
-        target = approved_dir / "src"
-        target.mkdir()
-        assert _run("\ncd src\n", approved_dir) == target
-
-    def test_path_outside_approved_dir_is_ignored(
-        self, approved_dir: Path, tmp_path: Path
-    ) -> None:
-        outside = tmp_path / "outside"
-        outside.mkdir()
-        assert _run(f'\ncd "{outside}"\n', approved_dir) == approved_dir
+    def test_extractor_is_gone(self) -> None:
+        assert not hasattr(
+            message_handlers, "_update_working_directory_from_claude_response"
+        )

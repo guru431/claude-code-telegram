@@ -1,9 +1,10 @@
 """Claude Code Python SDK integration."""
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Literal, Optional
 
 import structlog
 from claude_agent_sdk import (
@@ -55,6 +56,46 @@ class ClaudeResponse:
     interrupted: bool = False
 
 
+def _last_streamed_cost(messages: List[Any]) -> float:
+    """Best-effort cost for a run cancelled before its ``ResultMessage``.
+
+    A user Stop always lands before the ``ResultMessage`` that carries
+    ``total_cost_usd``, so the budget reservation would settle at 0 while real
+    tokens were burned. Take the last running cost any streamed message reported.
+    When nothing reported one the run still settles at 0 — no other number exists.
+    """
+    cost = 0.0
+    for message in messages:
+        value: Any = getattr(message, "total_cost_usd", None)
+        if value is None:
+            event = getattr(message, "event", None)
+            if isinstance(event, dict):
+                value = event.get("total_cost_usd")
+                if value is None:
+                    usage = event.get("usage")
+                    if isinstance(usage, dict):
+                        value = usage.get("total_cost_usd")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            cost = float(value)
+    return cost
+
+
+def _declared_hook_names(working_directory: Path) -> List[str]:
+    """List hook event names declared by ``<cwd>/.claude/settings.json``.
+
+    Logged when project settings are trusted so the operator can see what a
+    repository just registered. Best effort: an unreadable or malformed file
+    yields an empty list rather than blocking the run.
+    """
+    settings_path = Path(working_directory) / ".claude" / "settings.json"
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    return sorted(hooks) if isinstance(hooks, dict) else []
+
+
 @dataclass
 class StreamUpdate:
     """Streaming update from Claude SDK."""
@@ -69,12 +110,20 @@ def _make_can_use_tool_callback(
     security_validator: SecurityValidator,
     working_directory: Path,
     approved_directory: Path,
+    boundary_is_working_directory: bool = False,
 ) -> Any:
     """Create a can_use_tool callback for SDK-level tool permission validation.
 
     The callback validates file path boundaries and bash directory boundaries
     *before* the SDK executes the tool, providing preventive security enforcement.
+
+    With *boundary_is_working_directory* the boundary is the current project
+    directory instead of the approved root (``TOOL_PATH_BOUNDARY=working``). In a
+    single-project install the two coincide; in project-thread mode they do not,
+    and without this the topic's promise of project isolation held only in the
+    UI — tools could freely read and write a sibling project under the same root.
     """
+    tool_boundary = working_directory if boundary_is_working_directory else None
     # File tools whose input carries a path. NotebookRead/NotebookEdit use
     # "notebook_path", and MultiEdit (like Edit) uses "file_path"; without them
     # those default-allowed tools would bypass the boundary + secret checks.
@@ -118,7 +167,7 @@ def _make_can_use_tool_callback(
                     return PermissionResultAllow()
 
                 valid, _resolved, error = security_validator.validate_path(
-                    file_path, working_directory
+                    file_path, working_directory, boundary=tool_boundary
                 )
                 if not valid:
                     logger.warning(
@@ -136,8 +185,11 @@ def _make_can_use_tool_callback(
                 # still denied. We deliberately use is_forbidden_secret_file
                 # (not validate_filename) so legitimate in-repo files such as
                 # .editorconfig / config.cfg are not over-blocked.
+                # validate_path above already proved the path is inside the
+                # approved directory, so system-only names (hosts, passwd) are
+                # ordinary project files here, not the /etc originals.
                 forbidden, name_error = security_validator.is_forbidden_secret_file(
-                    Path(file_path).name
+                    Path(file_path).name, within_approved=True
                 )
                 if forbidden:
                     logger.warning(
@@ -155,7 +207,7 @@ def _make_can_use_tool_callback(
             command = tool_input.get("command", "")
             if command:
                 valid, error = check_bash_directory_boundary(
-                    command, working_directory, approved_directory
+                    command, working_directory, tool_boundary or approved_directory
                 )
                 if not valid:
                     logger.warning(
@@ -330,6 +382,22 @@ class ClaudeSDKManager:
                         path=str(claude_md_path),
                     )
 
+            # ``.claude/settings.json`` in the working directory is a far more
+            # direct vector than the CLAUDE.md wrapped above as untrusted data:
+            # its hooks execute arbitrary commands and its permissions/env change
+            # how the agent behaves. Loading it unconditionally while treating the
+            # repo's markdown as hostile was internally inconsistent, so project
+            # settings are opt-in.
+            setting_sources: List[Literal["user", "project", "local"]] = (
+                ["project"] if self.config.trust_project_settings else []
+            )
+            if setting_sources:
+                logger.warning(
+                    "Loading project settings from the working directory",
+                    path=str(Path(working_directory) / ".claude" / "settings.json"),
+                    hooks=_declared_hook_names(working_directory),
+                )
+
             # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
             # tools so the SDK does not restrict tool usage (e.g. MCP tools).
             # An explicit allowed_tools_override (e.g. the read-only set used for
@@ -367,7 +435,7 @@ class ClaudeSDKManager:
                     "excludedCommands": self.config.sandbox_excluded_commands or [],
                 },
                 system_prompt=base_prompt,
-                setting_sources=["project"],
+                setting_sources=setting_sources,
                 stderr=_stderr_callback,
                 env=sdk_env,
             )
@@ -386,6 +454,9 @@ class ClaudeSDKManager:
                     security_validator=self.security_validator,
                     working_directory=working_directory,
                     approved_directory=self.config.approved_directory,
+                    boundary_is_working_directory=(
+                        self.config.tool_path_boundary == "working"
+                    ),
                 )
 
             # Resume previous session if we have a session_id
@@ -624,13 +695,26 @@ class ClaudeSDKManager:
             # If no ResultMessage ever arrived (e.g. the final one hit a
             # MessageParseError and was skipped), cost/session_id are lost and
             # the run would otherwise look successful. Make the failure visible.
-            if not saw_result_message:
+            if not saw_result_message and not interrupted:
                 logger.warning(
                     "No ResultMessage received; cost and session_id may be lost",
                     message_count=len(messages),
                 )
                 is_error = True
                 error_type = error_type or "no_result_message"
+
+            if not saw_result_message and interrupted:
+                # A user Stop always cancels before the ResultMessage — that is
+                # the normal outcome of pressing the button, not a failure, and
+                # flagging it as one makes callers discard the partial text
+                # collected below. The tokens were still burned, so recover the
+                # last cost the stream reported instead of settling at 0.
+                cost = _last_streamed_cost(messages)
+                logger.info(
+                    "Run interrupted by user before completion",
+                    message_count=len(messages),
+                    recovered_cost=cost,
+                )
 
             # Calculate duration
             duration_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
@@ -824,8 +908,6 @@ class ClaudeSDKManager:
 
         The new claude-agent-sdk expects mcp_servers as a dict, not a file path.
         """
-        import json
-
         try:
             with open(config_path) as f:
                 config_data = json.load(f)

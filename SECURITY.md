@@ -17,7 +17,7 @@ The Claude Code Telegram Bot implements a defense-in-depth security model with m
 ### 2. Directory Boundaries
 - **Approved Directory**: All operations confined to a pre-configured directory tree
 - **Path Validation**: Prevents directory traversal attacks (../../../etc/passwd)
-- **Permission Checks**: Validates file system permissions before operations
+- **Startup Readability Check**: `APPROVED_DIRECTORY` is checked for read/execute access once at startup; the bot refuses to start otherwise. There is no per-operation permission check — the boundary is enforced by path resolution and the OS sandbox
 
 ### 3. Input Validation
 - **Command Sanitization**: All user inputs sanitized to prevent injection attacks
@@ -51,7 +51,7 @@ The Claude Code Telegram Bot implements a defense-in-depth security model with m
 - **GitHub HMAC-SHA256**: Webhook payloads verified against `X-Hub-Signature-256` header using a shared secret
 - **Generic Bearer Token**: Non-GitHub providers authenticated via `Authorization: Bearer <token>` header
 - **Deduplication**: Atomic `INSERT OR IGNORE` on delivery ID prevents replay attacks
-- **Event Security Middleware**: Validates webhook events before handler processing
+- **Audit Logging (log-only)**: `WebhookAuditLogger` records every webhook event reaching the bus. It is **not** an enforcement gate and cannot veto a run — the bus dispatches handlers concurrently with `return_exceptions=True`. Enforcement for webhook-driven runs is the signature check above plus the read-only tool set (`_WEBHOOK_READONLY_TOOLS`), `can_use_tool` and `check_bash_directory_boundary`
 
 ## Current Security Status
 
@@ -64,7 +64,8 @@ All planned security features are implemented and active:
 - Security audit logging with risk assessment and event tracking
 - Bot middleware framework (auth, rate limit, security), wired for both messages and callback queries
 - Webhook signature verification (GitHub HMAC-SHA256, generic Bearer token)
-- Event security middleware for webhook and scheduled event validation
+- Read-only tool set for unattended webhook runs, plus a separate daily budget for all bus-driven runs (`AUTOMATION_MAX_COST_PER_DAY`)
+- Audit logging of webhook events on the bus (log-only; see the note above)
 - Configuration security via Pydantic validators and SecretStr
 
 ## Security Configuration
@@ -103,10 +104,12 @@ RATE_LIMIT_BURST=10
 
 # Cost controls
 CLAUDE_MAX_COST_PER_USER=5.0
+AUTOMATION_MAX_COST_PER_DAY=2.0   # Webhook/cron runs, budgeted separately
 
 # Security features
-ENABLE_TELEMETRY=true  # For security monitoring
-LOG_LEVEL=INFO         # Capture security events
+LOG_LEVEL=INFO                    # Capture security events
+API_DOCS_ENABLED=false            # Keep the webhook surface unlisted
+TRUST_PROJECT_SETTINGS=false      # Ignore a repo's .claude/settings.json hooks
 
 # Environment
 ENVIRONMENT=production  # Enables strict security defaults
@@ -147,7 +150,6 @@ ENVIRONMENT=production  # Enables strict security defaults
    ```bash
    # Enable logging and monitoring
    export LOG_LEVEL=INFO
-   export ENABLE_TELEMETRY=true
 
    # Monitor logs for security events
    tail -f bot.log | grep -i "security\|auth\|violation"

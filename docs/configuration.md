@@ -13,12 +13,18 @@ The bot uses a configuration system built with Pydantic Settings v2 that provide
 
 ## Configuration Sources
 
-Configuration is loaded in this order (later sources override earlier ones):
+Highest precedence first:
 
-1. **Default values** defined in the Settings class
-2. **Environment variables**
-3. **`.env` file** (if present)
-4. **Environment-specific overrides** (development/testing/production)
+1. **Environment variables** — an explicitly set variable always wins. It beats
+   the `.env` file (pydantic-settings ranks the process environment above the
+   dotenv source) *and* the environment profile: `_apply_environment_overrides`
+   skips every field present in `model_fields_set`, so `RATE_LIMIT_REQUESTS=20`
+   survives `ENVIRONMENT=production`.
+2. **`.env` file** (if present) — loaded into the process environment at
+   startup, so values there are also "set" for the rule above.
+3. **Environment-specific overrides** (development/testing/production) — applied
+   only to fields nobody set explicitly.
+4. **Default values** defined in the Settings class.
 
 ## Environment Variables
 
@@ -115,8 +121,10 @@ AUDIT_LOG_RETENTION_DAYS=365     # Days to keep audit logs
 
 ```bash
 # Agentic mode (default: true)
-# true = conversational mode with 3 commands (/start, /new, /status)
-# false = classic terminal mode with 13 commands and inline keyboards
+# true  = conversational mode: /start, /new, /status, /verbose, /repo,
+#         /sessions, /schedule, /events, /restart (+ /sync_threads when
+#         ENABLE_PROJECT_THREADS=true)
+# false = classic terminal mode with the full command set and inline keyboards
 AGENTIC_MODE=true
 ```
 
@@ -200,18 +208,69 @@ When `ENABLE_PROJECT_THREADS=true`:
 - `PROJECT_THREADS_MODE=group`:
   - behavior remains forum-topic based using `PROJECT_THREADS_CHAT_ID`.
 
+#### Automation Budget
+
+```bash
+# Daily budget for runs the event bus starts on its own (webhooks, scheduled
+# jobs). These runs are attributed to a synthetic automation subject, not to
+# ALLOWED_USERS[0], so they neither spend a person's budget nor evict their
+# sessions — and they are no longer unmetered.
+AUTOMATION_MAX_COST_PER_DAY=5.0
+```
+
+#### Uploads
+
+```bash
+# Extra extensions accepted for uploads, on top of the built-in allowlist.
+# With or without the leading dot.
+UPLOAD_EXTRA_EXTENSIONS=.parquet,svg
+```
+
+#### Tool Path Boundary
+
+```bash
+# What file tools and bash path checks are confined to.
+#   approved (default) — APPROVED_DIRECTORY, as before
+#   working            — the run's own project directory, so in project-thread
+#                        mode a topic cannot read or write a sibling project
+TOOL_PATH_BOUNDARY=approved
+```
+
+#### Project Settings Trust
+
+```bash
+# Load <working_directory>/.claude/settings.json as trusted agent configuration.
+# Off by default: hooks declared there execute arbitrary commands, which makes
+# the file a stronger vector than the CLAUDE.md the same run already wraps as
+# untrusted data. When on, the bot logs the load and the hook names it found.
+TRUST_PROJECT_SETTINGS=false
+```
+
+#### Link Intake
+
+```bash
+# Route messages containing links through an external link-analysis pipeline.
+# All four paths are REQUIRED when enabled — the fetcher lives outside this
+# repository, so there is no portable default and startup fails without them
+# (and if LINK_INTAKE_FETCH_SCRIPT does not exist).
+ENABLE_LINK_INTAKE=false
+LINK_INTAKE_PYTHON=/usr/bin/python3
+LINK_INTAKE_FETCH_SCRIPT=/opt/link-analysis/fetch_source.py
+LINK_INTAKE_WORK_ROOT=/var/lib/link-analysis/incoming
+LINK_INTAKE_REGISTRY=/opt/link-analysis/project-registry.json
+```
+
 #### Monitoring & Logging
 
 ```bash
 # Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 LOG_LEVEL=INFO
-
-# Enable anonymous telemetry
-ENABLE_TELEMETRY=false
-
-# Sentry DSN for error tracking
-SENTRY_DSN=https://your-sentry-dsn@sentry.io/project
 ```
+
+There is no telemetry or error-reporting integration. `ENABLE_TELEMETRY` and
+`SENTRY_DSN` existed as settings that nothing ever read — no Sentry
+initialization, no metrics — and were removed rather than left to imply a
+monitoring control that was not there.
 
 #### Development
 
@@ -222,7 +281,10 @@ DEBUG=false
 # Enable development features
 DEVELOPMENT_MODE=false
 
-# Environment override (development, testing, production)
+# Environment override (development, testing, production).
+# Defaults to "production" when unset — every difference in the development
+# profile is a relaxation (open /docs, ALLOW_ALL_USERS honoured, 10x looser
+# rate limit), so an unconfigured deployment must not land there.
 ENVIRONMENT=development
 ```
 
@@ -268,14 +330,16 @@ The bot automatically applies different settings based on the environment:
 
 ### Development Environment
 
-Activated when `ENVIRONMENT=development` or when `DEBUG=true`:
+Activated when `ENVIRONMENT=development`. (`DEBUG=true` alone does *not* select
+this profile — only `ENVIRONMENT` chooses one.) Note that `production` is the
+default when `ENVIRONMENT` is unset, and every difference below is a relaxation,
+so the bot logs a warning listing them when this profile is active:
 
 - `debug = true`
 - `development_mode = true`
 - `log_level = "DEBUG"`
 - `rate_limit_requests = 100` (more lenient)
 - `claude_timeout_seconds = 600` (longer timeout)
-- `enable_telemetry = false`
 
 ### Testing Environment
 
@@ -283,17 +347,17 @@ Activated when `ENVIRONMENT=testing`:
 
 - `debug = true`
 - `database_url = "sqlite:///:memory:"` (in-memory database)
-- `approved_directory = "/tmp/test_projects"`
+- `approved_directory = <platform temp dir>/test_projects` (`tempfile.gettempdir()`, not a hardcoded `/tmp` — the suite also runs on Windows)
 - `claude_timeout_seconds = 30` (faster timeout)
 - `rate_limit_requests = 1000` (no effective rate limiting)
 
 ### Production Environment
 
-Activated when `ENVIRONMENT=production`:
+Activated when `ENVIRONMENT=production`, and the default when `ENVIRONMENT` is
+unset:
 
 - `debug = false`
 - `log_level = "INFO"`
-- `enable_telemetry = true`
 - `claude_max_cost_per_user = 5.0` (stricter cost limit)
 - `claude_max_cost_per_request = 2.0` (per-request SDK cap)
 - `rate_limit_requests = 5` (stricter rate limiting)
@@ -327,7 +391,6 @@ Available feature flags:
 - `git_enabled`: Git integration commands
 - `file_uploads_enabled`: File upload handling
 - `quick_actions_enabled`: Quick action buttons
-- `telemetry_enabled`: Anonymous usage telemetry
 - `webhook_enabled`: Telegram webhook mode (vs polling)
 - `voice_messages_enabled`: Voice message transcription (default: true)
 - `development_features_enabled`: Development-only features

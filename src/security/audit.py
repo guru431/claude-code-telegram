@@ -276,16 +276,27 @@ class AuditLogger:
         method: str,
         reason: Optional[str] = None,
         ip_address: Optional[str] = None,
+        suppressed_attempts: int = 0,
     ) -> None:
-        """Log authentication attempt."""
+        """Log authentication attempt.
+
+        ``suppressed_attempts`` reports how many further attempts by the same
+        user were absorbed by the caller's throttle window since the previous
+        recorded row, so one row still conveys the volume of a flood without
+        writing a row per message.
+        """
         risk_level = "medium" if not success else "low"
+
+        details: Dict[str, Any] = {"method": method, "reason": reason}
+        if suppressed_attempts:
+            details["suppressed_attempts"] = suppressed_attempts
 
         event = AuditEvent(
             timestamp=datetime.now(UTC),
             user_id=user_id,
             event_type="auth_attempt",
             success=success,
-            details={"method": method, "reason": reason},
+            details=details,
             ip_address=ip_address,
             risk_level=risk_level,
         )
@@ -298,6 +309,7 @@ class AuditLogger:
             method=method,
             success=success,
             reason=reason,
+            suppressed_attempts=suppressed_attempts,
         )
 
     async def log_session_event(

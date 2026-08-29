@@ -11,9 +11,11 @@ from typing import Any, Coroutine, Dict, List, Optional, Set
 
 import structlog
 
+from ..bot.utils.claude_run import run_claude_for_user
 from ..bot.utils.html_format import markdown_to_telegram_html
 from ..claude.facade import ClaudeIntegration
 from ..storage.database import DatabaseManager
+from ..utils.constants import AUTOMATION_USER_ID
 from .bus import Event, EventBus
 from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
 
@@ -59,14 +61,22 @@ class AgentHandler:
         event_bus: EventBus,
         claude_integration: ClaudeIntegration,
         default_working_directory: Path,
-        default_user_id: int = 0,
+        default_user_id: int = AUTOMATION_USER_ID,
         db_manager: Optional[DatabaseManager] = None,
+        storage: Optional[Any] = None,
+        rate_limiter: Optional[Any] = None,
     ) -> None:
         self.event_bus = event_bus
         self.claude = claude_integration
         self.default_working_directory = default_working_directory
         self.default_user_id = default_user_id
         self.db_manager = db_manager
+        # ``src/bot/utils/claude_run.py`` states the invariant: every Claude run
+        # holds a budget reservation and persists its interaction. The bus used
+        # to call run_command directly and did neither, so automation spent
+        # unmetered money and left no history, cost or audit trail behind.
+        self.storage = storage
+        self.rate_limiter = rate_limiter
         # Bound concurrent agent runs; keep references so shutdown can drain them.
         self._semaphore = asyncio.Semaphore(_MAX_CONCURRENT_AGENT_RUNS)
         self._tasks: Set[asyncio.Task[None]] = set()
@@ -112,15 +122,24 @@ class AgentHandler:
 
         try:
             async with self._semaphore:
-                response = await self.claude.run_command(
+                response, budget_error = await self._run_agent(
                     prompt=prompt,
                     working_directory=self.default_working_directory,
-                    user_id=self.default_user_id,
-                    force_new=True,
                     allowed_tools_override=_WEBHOOK_READONLY_TOOLS,
                 )
+            if budget_error:
+                # Out of automation budget: this is a refusal, not a transient
+                # failure, so do not burn a retry attempt replaying it.
+                logger.warning(
+                    "Webhook agent run refused by budget",
+                    provider=event.provider,
+                    event_id=event.id,
+                    reason=budget_error,
+                )
+                await self._mark_webhook_processed(event.delivery_id)
+                return
 
-            if response.content:
+            if response is not None and response.content:
                 # We don't know which chat to send to from a webhook alone.
                 # The notification service needs configured target chats.
                 # Publish with chat_id=0 — the NotificationService
@@ -203,14 +222,30 @@ class AgentHandler:
 
         try:
             async with self._semaphore:
-                response = await self.claude.run_command(
+                response, budget_error = await self._run_agent(
                     prompt=prompt,
                     working_directory=working_dir,
-                    user_id=self.default_user_id,
-                    force_new=True,
                 )
+            if budget_error:
+                logger.warning(
+                    "Scheduled agent run refused by budget",
+                    job_id=event.job_id,
+                    reason=budget_error,
+                )
+                for chat_id in event.target_chat_ids or [0]:
+                    await self.event_bus.publish(
+                        AgentResponseEvent(
+                            chat_id=chat_id,
+                            text=markdown_to_telegram_html(
+                                f"⚠️ Scheduled job `{event.job_name}` skipped: "
+                                f"{budget_error}"
+                            ),
+                            originating_event_id=event.id,
+                        )
+                    )
+                return
 
-            if response.content:
+            if response is not None and response.content:
                 text = markdown_to_telegram_html(response.content)
                 targets = event.target_chat_ids or [0]
                 for chat_id in targets:
@@ -251,6 +286,39 @@ class AgentHandler:
                         originating_event_id=event.id,
                     )
                 )
+
+    async def _run_agent(
+        self,
+        *,
+        prompt: str,
+        working_directory: Path,
+        allowed_tools_override: Optional[List[str]] = None,
+    ) -> tuple[Optional[Any], Optional[str]]:
+        """Run one bus-driven prompt with the same guarantees a user run gets.
+
+        Budget reservation, cost settlement and history persistence all happen
+        here, against ``AUTOMATION_USER_ID`` rather than a person. The run is
+        ``ephemeral``: it leaves no row in ``sessions``, so a busy webhook or a
+        five-minute cron cannot evict the owner's working sessions through
+        ``max_sessions_per_user``.
+
+        Returns ``(response, budget_error)``; ``budget_error`` is set only when
+        the automation budget refused the run.
+        """
+        return await run_claude_for_user(
+            run=lambda: self.claude.run_command(
+                prompt=prompt,
+                working_directory=working_directory,
+                user_id=self.default_user_id,
+                force_new=True,
+                ephemeral=True,
+                allowed_tools_override=allowed_tools_override,
+            ),
+            prompt=prompt,
+            user_id=self.default_user_id,
+            rate_limiter=self.rate_limiter,
+            storage=self.storage,
+        )
 
     def _is_within_default(self, candidate: Path) -> bool:
         """Return True when ``candidate`` is inside the default working dir.

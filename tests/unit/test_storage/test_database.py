@@ -193,3 +193,62 @@ class TestMigrationAtomicity:
         await recovered.initialize()
         assert await recovered.health_check()
         await recovered.close()
+
+
+class TestInMemoryDatabase:
+    """``sqlite:///:memory:`` is documented and used by TestingConfig.
+
+    A bare ``:memory:`` database is private to the connection that opened it, so
+    migrations ran on a throwaway connection and the five pooled connections each
+    opened their own empty database — the first query failed with "no such
+    table" and nothing was shared between connections.
+    """
+
+    async def test_schema_visible_from_pooled_connection(self):
+        manager = DatabaseManager("sqlite:///:memory:")
+        await manager.initialize()
+        try:
+            async with manager.get_connection() as conn:
+                cursor = await conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+                tables = {row[0] for row in await cursor.fetchall()}
+            assert "users" in tables
+            assert "sessions" in tables
+        finally:
+            await manager.close()
+
+    async def test_writes_are_shared_between_connections(self):
+        manager = DatabaseManager("sqlite:///:memory:")
+        await manager.initialize()
+        try:
+            async with manager.get_connection() as conn:
+                await conn.execute(
+                    "INSERT INTO users (user_id, telegram_username) VALUES (7, 'me')"
+                )
+                await conn.commit()
+            async with manager.get_connection() as other:
+                cursor = await other.execute(
+                    "SELECT telegram_username FROM users WHERE user_id = 7"
+                )
+                row = await cursor.fetchone()
+            assert row is not None and row[0] == "me"
+        finally:
+            await manager.close()
+
+    async def test_two_managers_do_not_share_memory(self):
+        """Each manager gets its own in-memory database, not a global one."""
+        first = DatabaseManager("sqlite:///:memory:")
+        second = DatabaseManager("sqlite:///:memory:")
+        await first.initialize()
+        await second.initialize()
+        try:
+            async with first.get_connection() as conn:
+                await conn.execute("INSERT INTO users (user_id) VALUES (1)")
+                await conn.commit()
+            async with second.get_connection() as conn:
+                cursor = await conn.execute("SELECT COUNT(*) FROM users")
+                assert (await cursor.fetchone())[0] == 0
+        finally:
+            await first.close()
+            await second.close()

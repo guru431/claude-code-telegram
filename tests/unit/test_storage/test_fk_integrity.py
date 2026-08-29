@@ -9,6 +9,8 @@ import pytest
 from src.security.audit import AuditEvent, AuditLogger, SQLiteAuditStorage
 from src.storage.facade import Storage
 
+from .helpers import seed_session, seed_user
+
 
 @pytest.fixture
 async def storage(migrated_db):
@@ -173,8 +175,8 @@ class TestRetentionCleanupOrdering:
     """Retention purge must delete child rows before their parents."""
 
     async def _make_old_message_with_tool_usage(self, storage) -> int:
-        await storage.get_or_create_user(999010, "retentionuser")
-        await storage.create_session(999010, "/test/retention", "retention-session")
+        await seed_user(storage, 999010, "retentionuser")
+        await seed_session(storage, 999010, "/test/retention", "retention-session")
 
         async with storage.db_manager.get_connection() as conn:
             cursor = await conn.execute(
@@ -224,8 +226,8 @@ class TestRetentionCleanupOrdering:
 
     async def test_cleanup_keeps_recent_rows(self, storage):
         """Rows inside the retention window survive the purge."""
-        await storage.get_or_create_user(999011, "recentuser")
-        await storage.create_session(999011, "/test/recent", "recent-session")
+        await seed_user(storage, 999011, "recentuser")
+        await seed_session(storage, 999011, "/test/recent", "recent-session")
 
         async with storage.db_manager.get_connection() as conn:
             cursor = await conn.execute(

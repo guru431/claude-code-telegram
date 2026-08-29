@@ -10,7 +10,7 @@ Features:
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import structlog
 
@@ -100,6 +100,31 @@ class SecurityValidator:
         ".vue",
         ".svelte",
         ".lock",
+        # Plain-text formats people routinely send with "look at this". Their
+        # absence produced a bare "File type not allowed: .csv" with no hint
+        # about where the list lives, for content that is no more dangerous than
+        # the .txt right above it.
+        ".csv",
+        ".tsv",
+        ".log",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".properties",
+        ".env.example",
+        ".example",
+        ".sample",
+        ".dist",
+        ".diff",
+        ".patch",
+        ".rst",
+        ".adoc",
+        ".tf",
+        ".tfvars",
+        ".gradle",
+        ".proto",
+        ".graphql",
+        ".ipynb",
     }
 
     # Forbidden filenames and patterns
@@ -114,14 +139,22 @@ class SecurityValidator:
         "id_rsa",
         "id_dsa",
         "id_ecdsa",
-        "shadow",
-        "passwd",
-        "hosts",
-        "sudoers",
         ".bash_history",
         ".zsh_history",
         ".mysql_history",
         ".psql_history",
+    }
+
+    # Basenames that are sensitive only as *system* files. Inside a project tree
+    # they are ordinary content — ``hosts`` is an Ansible inventory, ``passwd``
+    # and ``shadow`` are fixtures — so blocking them by basename alone made the
+    # bot refuse to read legitimate repository files. They stay blocked whenever
+    # the caller cannot vouch that the path is inside the approved directory.
+    SYSTEM_ONLY_FORBIDDEN_FILENAMES = {
+        "shadow",
+        "passwd",
+        "hosts",
+        "sudoers",
     }
 
     # Dangerous file patterns
@@ -146,9 +179,17 @@ class SecurityValidator:
     ]
 
     def __init__(
-        self, approved_directory: Path, disable_security_patterns: bool = False
+        self,
+        approved_directory: Path,
+        disable_security_patterns: bool = False,
+        extra_upload_extensions: Optional[Iterable[str]] = None,
     ):
-        """Initialize validator with approved directory."""
+        """Initialize validator with approved directory.
+
+        *extra_upload_extensions* widens the upload allowlist without editing
+        this file (``UPLOAD_EXTRA_EXTENSIONS``); entries may be given with or
+        without the leading dot.
+        """
         # Keep the raw configured path so we can re-resolve on every check —
         # this prevents the cached value from going stale if the directory is
         # replaced with a symlink, or moved/recreated at runtime.
@@ -165,10 +206,18 @@ class SecurityValidator:
                 "so path isolation can be enforced."
             )
         self.disable_security_patterns = disable_security_patterns
+        self.allowed_extensions = set(self.ALLOWED_EXTENSIONS)
+        for ext in extra_upload_extensions or ():
+            ext = ext.strip().lower()
+            if ext:
+                self.allowed_extensions.add(ext if ext.startswith(".") else f".{ext}")
         logger.info(
             "Security validator initialized",
             approved_directory=str(self.approved_directory),
             disable_security_patterns=self.disable_security_patterns,
+            extra_upload_extensions=sorted(
+                self.allowed_extensions - self.ALLOWED_EXTENSIONS
+            ),
         )
 
     def _current_approved_directory(self) -> Path:
@@ -181,9 +230,18 @@ class SecurityValidator:
             return self.approved_directory
 
     def validate_path(
-        self, user_path: str, current_dir: Optional[Path] = None
+        self,
+        user_path: str,
+        current_dir: Optional[Path] = None,
+        boundary: Optional[Path] = None,
     ) -> Tuple[bool, Optional[Path], Optional[str]]:
         """Validate and resolve user-provided path.
+
+        *current_dir* only resolves relative paths. *boundary* is what the
+        result must stay inside; it defaults to ``APPROVED_DIRECTORY``. Passing
+        the current project directory narrows tool access to that project — see
+        ``TOOL_PATH_BOUNDARY``. A boundary outside the approved directory is
+        ignored, so this can only ever tighten the check, never widen it.
 
         Returns:
             Tuple of (is_valid, resolved_path, error_message)
@@ -215,6 +273,15 @@ class SecurityValidator:
             # silently broaden the allow-list. (Stale-value mitigation.)
             current_approved = self._current_approved_directory()
 
+            # A caller-supplied boundary may only narrow the approved root.
+            if boundary is not None:
+                try:
+                    resolved_boundary = boundary.resolve()
+                except (OSError, ValueError):
+                    resolved_boundary = current_approved
+                if self._is_within_directory(resolved_boundary, current_approved):
+                    current_approved = resolved_boundary
+
             # Handle path resolution
             current_dir = current_dir or current_approved
 
@@ -242,7 +309,11 @@ class SecurityValidator:
                     resolved_path=str(target),
                     approved_directory=str(current_approved),
                 )
-                return False, None, "Access denied: path outside approved directory"
+                return (
+                    False,
+                    None,
+                    ("Access denied: path outside " f"'{current_approved}'"),
+                )
 
             # Defense-in-depth: cross-check via os.path.realpath in case
             # any intermediate symlink was not fully resolved (e.g. due to
@@ -265,7 +336,11 @@ class SecurityValidator:
                     resolved_path=str(target),
                     real_path=str(real_target),
                 )
-                return False, None, "Access denied: path outside approved directory"
+                return (
+                    False,
+                    None,
+                    ("Access denied: path outside " f"'{current_approved}'"),
+                )
 
             logger.debug(
                 "Path validation successful",
@@ -328,11 +403,14 @@ class SecurityValidator:
         path_obj = Path(filename)
         ext = path_obj.suffix.lower()
 
-        if ext and ext not in self.ALLOWED_EXTENSIONS:
+        if ext and ext not in self.allowed_extensions:
             logger.warning(
                 "File extension not allowed", filename=filename, extension=ext
             )
-            return False, f"File type not allowed: {ext}"
+            return False, (
+                f"File type not allowed: {ext}. Add it to UPLOAD_EXTRA_EXTENSIONS "
+                "to accept this type."
+            )
 
         # Check for hidden files (starting with .)
         if filename.startswith(".") and filename not in ALLOWED_HIDDEN_FILES:
@@ -346,7 +424,9 @@ class SecurityValidator:
         logger.debug("Filename validation successful", filename=filename)
         return True, None
 
-    def is_forbidden_secret_file(self, filename: str) -> Tuple[bool, Optional[str]]:
+    def is_forbidden_secret_file(
+        self, filename: str, *, within_approved: bool = False
+    ) -> Tuple[bool, Optional[str]]:
         """Check only the secret/credential blocklist for a basename.
 
         Unlike :meth:`validate_filename` (built for *uploads*: extension
@@ -355,6 +435,13 @@ class SecurityValidator:
         can gate Claude tool calls (Read/Write/Edit) without over-blocking
         legitimate in-repo files like ``.editorconfig`` or ``config.cfg``.
 
+        Set *within_approved* when the caller has already established that the
+        path lies inside the approved directory. System-only names
+        (``hosts``, ``passwd``, …) are then treated as ordinary project files;
+        the system copies they protect live outside that boundary and are
+        rejected by the path check before reaching here. Left at its
+        fail-closed default, they stay blocked.
+
         Returns:
             Tuple of (is_forbidden, reason). ``is_forbidden`` is True when the
             basename matches a secret/credential rule.
@@ -362,8 +449,14 @@ class SecurityValidator:
         if not filename:
             return False, None
         name = filename.strip()
+        lowered = name.lower()
 
-        if name.lower() in {n.lower() for n in self.FORBIDDEN_FILENAMES}:
+        if lowered in {n.lower() for n in self.FORBIDDEN_FILENAMES}:
+            return True, f"Forbidden filename: {name}"
+
+        if not within_approved and lowered in {
+            n.lower() for n in self.SYSTEM_ONLY_FORBIDDEN_FILENAMES
+        }:
             return True, f"Forbidden filename: {name}"
 
         for pattern in self.DANGEROUS_FILE_PATTERNS:

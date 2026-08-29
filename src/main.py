@@ -21,7 +21,7 @@ from src.config.features import FeatureFlags
 from src.config.settings import Settings
 from src.events.bus import EventBus
 from src.events.handlers import AgentHandler
-from src.events.middleware import EventSecurityMiddleware
+from src.events.middleware import WebhookAuditLogger
 from src.exceptions import ConfigurationError
 from src.notifications.service import NotificationService
 from src.projects import (
@@ -215,6 +215,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     security_validator = SecurityValidator(
         config.approved_directory,
         disable_security_patterns=config.disable_security_patterns,
+        extra_upload_extensions=config.upload_extra_extensions,
     )
     # The daily cost budget must survive a restart: the limiter keeps its
     # tracker in memory, so it seeds each user's already-spent amount from the
@@ -244,21 +245,23 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     # --- Event bus and agentic platform components ---
     event_bus = EventBus()
 
-    # Event security middleware
-    event_security = EventSecurityMiddleware(
-        event_bus=event_bus,
-        security_validator=security_validator,
-        auth_manager=auth_manager,
-    )
-    event_security.register()
+    # Audit log for webhook events reaching the bus (log-only; enforcement is
+    # the API layer's signature check and the agent layer's read-only tool set)
+    webhook_audit = WebhookAuditLogger(event_bus=event_bus)
+    webhook_audit.register()
 
     # Agent handler — translates events into Claude executions
+    # Bus runs are attributed to AUTOMATION_USER_ID, not to ALLOWED_USERS[0]:
+    # they draw on their own daily budget and never touch the owner's session
+    # quota. storage/rate_limiter make them visible in cost reporting and history
+    # like any other run.
     agent_handler = AgentHandler(
         event_bus=event_bus,
         claude_integration=claude_integration,
         default_working_directory=config.approved_directory,
-        default_user_id=config.allowed_users[0] if config.allowed_users else 0,
         db_manager=storage.db_manager,
+        storage=storage,
+        rate_limiter=rate_limiter,
     )
     agent_handler.register()
 
@@ -482,6 +485,14 @@ async def run_application(app: Dict[str, Any]) -> int:
                     await rate_limiter_ref.cleanup_inactive_users()
                 except Exception:
                     _log.exception("Rate-limiter eviction failed")
+            # SessionManager.active_sessions grows on every run and was only ever
+            # swept from claude_integration.shutdown() — i.e. once, at process
+            # exit. Sweep it here alongside the other idle-state eviction.
+            try:
+                expired = await claude_integration.cleanup_expired_sessions()
+                _log.info("Expired session cleanup complete", removed=expired)
+            except Exception:
+                _log.exception("Session cleanup failed")
 
         # misfire_grace_time survives the process being suspended (Windows
         # sleep) across the fire time: without it APScheduler's ~1s default

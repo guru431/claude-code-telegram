@@ -38,6 +38,11 @@ class ClaudeSession:
     message_count: int = 0
     tools_used: List[str] = field(default_factory=list)
     is_new_session: bool = False  # True if session hasn't been sent to Claude Code yet
+    # Ephemeral sessions belong to a single bus-driven run (webhook, cron). They
+    # are never written to storage and never counted against
+    # ``max_sessions_per_user``, so automation cannot evict a person's working
+    # sessions or fill their /sessions list with one-shot rows.
+    ephemeral: bool = False
 
     def is_expired(self, timeout_hours: int) -> bool:
         """Check if session has expired."""
@@ -128,14 +133,32 @@ class SessionManager:
         user_id: int,
         project_path: Path,
         session_id: Optional[str] = None,
+        ephemeral: bool = False,
     ) -> ClaudeSession:
-        """Get existing session or create new one."""
+        """Get existing session or create new one.
+
+        With *ephemeral* set the session exists only for the duration of one run:
+        it is not persisted, not cached, and does not consume a slot in the
+        user's ``max_sessions_per_user`` quota.
+        """
         logger.info(
             "Getting or creating session",
             user_id=user_id,
             project_path=str(project_path),
             session_id=session_id,
+            ephemeral=ephemeral,
         )
+
+        if ephemeral:
+            return ClaudeSession(
+                session_id="",
+                user_id=user_id,
+                project_path=project_path,
+                created_at=datetime.now(UTC),
+                last_used=datetime.now(UTC),
+                is_new_session=True,
+                ephemeral=True,
+            )
 
         # Check for existing session
         if session_id and session_id in self.active_sessions:
@@ -221,6 +244,13 @@ class SessionManager:
 
         session.update_usage(response)
 
+        if session.ephemeral:
+            # One-shot bus run: nothing to persist, nothing to cache. Keeping it
+            # would put an automation session into the owner's /sessions list and
+            # into the quota that evicts their real work.
+            logger.debug("Ephemeral session not persisted")
+            return
+
         # Persist to storage and track as active
         if session.session_id:
             self.active_sessions[session.session_id] = session
@@ -245,6 +275,12 @@ class SessionManager:
         """
         old_session_id = session.session_id
         if not new_session_id or new_session_id == old_session_id:
+            return
+
+        if session.ephemeral:
+            # Re-key in place only: an ephemeral session has no storage row and
+            # no cache entry to move.
+            session.session_id = new_session_id
             return
 
         if old_session_id in self.active_sessions:
@@ -282,7 +318,24 @@ class SessionManager:
                 await self.remove_session(session.session_id)
                 expired_count += 1
 
-        logger.info("Session cleanup completed", expired_sessions=expired_count)
+        # ``active_sessions`` is a cache, not a mirror of storage: an entry whose
+        # row was deleted elsewhere (quota eviction, /new, a forked id) is not
+        # reached by the loop above and would sit in the dict until the process
+        # restarts. Sweep expired entries directly so it cannot grow unbounded on
+        # a long-lived instance.
+        stale_ids = [
+            session_id
+            for session_id, session in self.active_sessions.items()
+            if session.is_expired(self.config.session_timeout_hours)
+        ]
+        for session_id in stale_ids:
+            del self.active_sessions[session_id]
+
+        logger.info(
+            "Session cleanup completed",
+            expired_sessions=expired_count,
+            evicted_from_cache=len(stale_ids),
+        )
         return expired_count
 
     async def _get_user_sessions(self, user_id: int) -> List[ClaudeSession]:

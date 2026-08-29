@@ -39,9 +39,26 @@ def load_config(
     else:
         logger.warning("No .env file found", path=str(env_file))
 
-    # Determine environment
-    env = env or os.getenv("ENVIRONMENT", "development")
+    # Determine environment.
+    #
+    # The default is "production" because every difference between the profiles
+    # is a *relaxation*: DevelopmentConfig turns on development_mode (which opens
+    # FastAPI's /docs, drops the security middleware's fail-closed behaviour and
+    # unlocks the ALLOW_ALL_USERS path), debug logging, and a 10x looser rate
+    # limit. A deployment that simply never set ENVIRONMENT must not silently get
+    # the loosest profile.
+    env = env or os.getenv("ENVIRONMENT", "production")
     logger.info("Loading configuration", environment=env)
+    if env == "development":
+        logger.warning(
+            "Development environment active — security settings are relaxed",
+            relaxations=[
+                "development_mode=True (API /docs exposed, ALLOW_ALL_USERS honoured)",
+                "debug=True, log_level=DEBUG",
+                f"rate_limit_requests={DevelopmentConfig.rate_limit_requests}",
+                f"claude_timeout_seconds={DevelopmentConfig.claude_timeout_seconds}",
+            ],
+        )
 
     try:
         # Debug: Log key environment variables before Settings creation

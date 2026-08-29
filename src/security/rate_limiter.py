@@ -122,6 +122,9 @@ class RateLimiter:
     # Sweep it after this long so a leaked hold cannot block a user forever.
     RESERVATION_MAX_AGE = timedelta(hours=1)
 
+    # Fraction of the daily budget at which the user gets one heads-up.
+    BUDGET_WARN_FRACTION = 0.8
+
     def __init__(
         self,
         config: Settings,
@@ -144,6 +147,9 @@ class RateLimiter:
         self.reservations: Dict[str, CostReservation] = {}
         self.user_reservations: Dict[int, Set[str]] = defaultdict(set)
         self.locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # Users already told they are near the daily cap, so the warning fires
+        # once per daily window rather than on every run past the line.
+        self._budget_warned: Set[int] = set()
 
         # Calculate refill rate from config
         self.refill_rate = (
@@ -257,13 +263,18 @@ class RateLimiter:
 
     async def settle_reservation(
         self, reservation_id: str, actual_cost: float = 0.0
-    ) -> None:
+    ) -> Optional[str]:
         """Release a specific hold and charge that run's real cost.
 
         ``actual_cost`` of ``0.0`` is a valid outcome (cancelled run, cached
         reply, failed run) and releases the hold **in full**. Unknown or
         already-settled ids are ignored, so a ``finally`` block may call this
         unconditionally without guarding against double-settlement.
+
+        Returns a human-readable warning the first time this settlement pushes
+        the user past ``BUDGET_WARN_FRACTION`` of the daily cap, and ``None``
+        otherwise — so the first sign of an exhausted budget is not a refusal
+        in the middle of a task.
         """
         reservation = self.reservations.get(reservation_id)
         if reservation is None:
@@ -271,7 +282,7 @@ class RateLimiter:
                 "Unknown or already-settled cost reservation",
                 reservation_id=reservation_id,
             )
-            return
+            return None
 
         user_id = reservation.user_id
         async with self.locks[user_id]:
@@ -281,7 +292,7 @@ class RateLimiter:
             self._maybe_reset_cost_tracker(user_id)
             reservation = self.reservations.pop(reservation_id, None)
             if reservation is None:
-                return
+                return None
             self.user_reservations[user_id].discard(reservation_id)
 
             # Back out exactly this run's hold, then charge what it really
@@ -300,6 +311,29 @@ class RateLimiter:
                 actual_cost=actual_cost,
                 total_usage=self.cost_tracker[user_id],
             )
+
+            return self._budget_warning(user_id)
+
+    def _budget_warning(self, user_id: int) -> Optional[str]:
+        """Return a near-limit warning once per user per daily window.
+
+        Caller must hold ``self.locks[user_id]``.
+        """
+        limit = self.config.daily_cost_limit_for(user_id)
+        if limit <= 0:
+            return None
+        used = self.cost_tracker[user_id]
+        if used < limit * self.BUDGET_WARN_FRACTION:
+            # Back below the line (a settled hold can lower the total): re-arm.
+            self._budget_warned.discard(user_id)
+            return None
+        if user_id in self._budget_warned:
+            return None
+        self._budget_warned.add(user_id)
+        return (
+            f"Budget warning: ${used:.2f} of ${limit:.2f} used today "
+            f"(${max(0.0, limit - used):.2f} left)."
+        )
 
     async def _ensure_cost_hydrated(self, user_id: int) -> None:
         """Seed this user's daily tracker from storage, once per process.
@@ -397,13 +431,15 @@ class RateLimiter:
         # Reset cost tracker if enough time has passed
         self._maybe_reset_cost_tracker(user_id)
 
+        # Automation draws from its own daily budget, not the owner's.
+        limit = self.config.daily_cost_limit_for(user_id)
         current_cost = self.cost_tracker[user_id]
-        if current_cost + cost > self.config.claude_max_cost_per_user:
-            remaining = max(0, self.config.claude_max_cost_per_user - current_cost)
+        if current_cost + cost > limit:
+            remaining = max(0, limit - current_cost)
             message = (
                 f"Cost limit exceeded. Remaining budget: ${remaining:.2f}. "
                 f"Current usage: ${current_cost:.2f}/"
-                f"${self.config.claude_max_cost_per_user:.2f}"
+                f"${limit:.2f}"
             )
             return False, message
 
@@ -456,6 +492,7 @@ class RateLimiter:
             old_cost = self.cost_tracker[user_id]
             self.cost_tracker[user_id] = 0
             self.cost_reset_time[user_id] = now
+            self._budget_warned.discard(user_id)
             # Holds charged before the reset are no longer in the (now zeroed)
             # tracker. Keep the reservations so a late settle still charges the
             # real cost, but zero their amounts so settling cannot back out
@@ -544,7 +581,7 @@ class RateLimiter:
 
         # Get cost status (computed without mutating the tracker)
         current_cost, effective_reset = self._effective_cost(user_id)
-        cost_limit = self.config.claude_max_cost_per_user
+        cost_limit = self.config.daily_cost_limit_for(user_id)
         cost_remaining = max(0, cost_limit - current_cost)
         # Portion of ``current`` that is an in-flight hold rather than spend.
         reserved = sum(
@@ -613,6 +650,7 @@ class RateLimiter:
             # Forget the hydration marker too: the tracker this user's spend
             # lived in is gone, so a later request must re-read it from storage.
             self._hydrated_users.discard(user_id)
+            self._budget_warned.discard(user_id)
             evicted.append(user_id)
 
         inactive_users = evicted

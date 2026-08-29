@@ -497,12 +497,6 @@ async def handle_text_message(
                     )
                 ]
             else:
-                # Check if Claude changed the working directory and update our
-                # tracking
-                _update_working_directory_from_claude_response(
-                    claude_response, context, settings, user_id
-                )
-
                 formatter = ResponseFormatter(settings)
                 # Redact secrets before the response leaves the bot — tool
                 # OUTPUT (e.g. a printenv dump) can land here.
@@ -1019,12 +1013,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     )
                 ]
             else:
-                # Check if Claude changed the working directory and update our
-                # tracking
-                _update_working_directory_from_claude_response(
-                    claude_response, context, settings, user_id
-                )
-
                 formatter = ResponseFormatter(settings)
                 formatted_messages = formatter.format_claude_response(
                     redact_secrets(claude_response.content or "")
@@ -1203,12 +1191,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                         )
                     ]
                 else:
-                    # Check if Claude changed the working directory and update
-                    # tracking
-                    _update_working_directory_from_claude_response(
-                        claude_response, context, settings, user_id
-                    )
-
                     formatter = ResponseFormatter(settings)
                     formatted_messages = formatter.format_claude_response(
                         redact_secrets(claude_response.content or "")
@@ -1365,10 +1347,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     )
                 ]
             else:
-                _update_working_directory_from_claude_response(
-                    claude_response, context, settings, user_id
-                )
-
                 formatter = ResponseFormatter(settings)
                 formatted_messages = formatter.format_claude_response(
                     redact_secrets(claude_response.content or "")
@@ -1417,83 +1395,3 @@ def _estimate_file_processing_cost(file_size: Optional[int]) -> float:
     size_cost = ((file_size or 0) / 1024) * 0.0001
 
     return base_cost + size_cost
-
-
-def _update_working_directory_from_claude_response(
-    claude_response, context, settings, user_id
-):
-    """Update the working directory based on Claude's response content."""
-    import re
-    from pathlib import Path
-
-    # Look for directory changes in Claude's response.
-    # NOTE: This is a best-effort heuristic to keep the bot's notion of cwd
-    # in sync with what Claude told the user. It is not authoritative —
-    # Claude's actual cwd is tracked by the SDK. The patterns are anchored
-    # tightly to reduce false-positive parsing (e.g. words like "racd" or
-    # "I'd love to acd" no longer match).
-    # A path is either quoted (may contain spaces) or an unquoted run of
-    # non-space characters.
-    quoted_or_bare = "(\"[^\"\\n\\r]+\"|'[^'\\n\\r]+'|`[^`\\n\\r]+`|\\S+)"
-    patterns = [
-        rf"(?:^|[\n\r])\s*cd\s+{quoted_or_bare}",  # cd command at start of a line
-        rf"(?:^|[\n\r])(?:```|\$)\s*cd\s+{quoted_or_bare}",  # cd in a shell block
-        rf"(?:^|[\n\r])\s*Changed directory to:?\s*{quoted_or_bare}",
-        rf"(?:^|[\n\r])\s*Current directory:?\s*{quoted_or_bare}",
-        rf"(?:^|[\n\r])\s*Working directory:?\s*{quoted_or_bare}",
-    ]
-
-    # Match against the original-case content — the patterns already use
-    # IGNORECASE, and lowercasing would corrupt the extracted paths
-    # (mixed-case dirs never resolve / .exists() fails).
-    content = claude_response.content
-    current_dir = context.user_data.get(
-        "current_directory", settings.approved_directory
-    )
-
-    for pattern in patterns:
-        matches = re.findall(pattern, content, re.MULTILINE | re.IGNORECASE)
-        for match in matches:
-            try:
-                # Clean up the path: drop surrounding quotes, then trailing
-                # prose punctuation ("cd src." / "cd src, then ..."). The
-                # lookbehind keeps dot-segments intact ("..", "../.."), and the
-                # `or` guard restores the path if it was punctuation-only.
-                raw = match.strip()
-                if raw[:1] in ('"', "'", "`") and raw[-1:] == raw[:1]:
-                    new_path = raw[1:-1]
-                else:
-                    new_path = re.sub(r"(?<![./])[.,;:!?]+$", "", raw) or raw
-
-                # Handle relative paths. Use Path.is_absolute() rather than a
-                # leading "/": on Windows an absolute path looks like C:\... and
-                # a string check would join it onto current_dir, after which
-                # validation drops it and cwd stops tracking entirely.
-                if Path(new_path).is_absolute():
-                    new_path = Path(new_path).resolve()
-                else:
-                    new_path = (current_dir / new_path).resolve()
-
-                # Validate that the new path is within the approved directory.
-                # Require a directory — Claude may also mention existing file
-                # paths (e.g. "Working directory: .../file.txt"); storing a file
-                # as current_directory breaks subsequent file operations.
-                if (
-                    new_path.is_relative_to(settings.approved_directory)
-                    and new_path.is_dir()
-                ):
-                    context.user_data["current_directory"] = new_path
-                    logger.info(
-                        "Updated working directory from Claude response",
-                        old_dir=str(current_dir),
-                        new_dir=str(new_path),
-                        user_id=user_id,
-                    )
-                    return  # Take the first valid match
-
-            except (ValueError, OSError) as e:
-                # Invalid path, skip this match
-                logger.debug(
-                    "Invalid path in Claude response", path=match, error=str(e)
-                )
-                continue

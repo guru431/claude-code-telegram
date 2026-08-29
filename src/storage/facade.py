@@ -10,13 +10,7 @@ import structlog
 
 from ..claude.sdk_integration import ClaudeResponse
 from .database import DatabaseManager
-from .models import (
-    AuditLogModel,
-    MessageModel,
-    SessionModel,
-    ToolUsageModel,
-    UserModel,
-)
+from .models import AuditLogModel, MessageModel, ToolUsageModel
 from .repositories import (
     AnalyticsRepository,
     AuditLogRepository,
@@ -179,84 +173,6 @@ class Storage:
             except Exception:
                 await conn.rollback()
                 raise
-
-    async def get_or_create_user(
-        self, user_id: int, username: Optional[str] = None
-    ) -> UserModel:
-        """Get or create user."""
-        user = await self.users.get_user(user_id)
-
-        if not user:
-            logger.info("Creating new user", user_id=user_id, username=username)
-            user = UserModel(
-                user_id=user_id,
-                telegram_username=username,
-                first_seen=datetime.now(UTC),
-                last_active=datetime.now(UTC),
-                is_allowed=False,  # Default to not allowed
-            )
-            await self.users.create_user(user)
-            # create_user is INSERT ON CONFLICT DO NOTHING and returns the
-            # passed-in (stale) object; re-read to reflect actual DB state
-            # (e.g. an existing row when a concurrent insert won the race).
-            user = await self.users.get_user(user_id) or user
-
-        return user
-
-    async def create_session(
-        self, user_id: int, project_path: str, session_id: str
-    ) -> SessionModel:
-        """Create new session."""
-        now = datetime.now(UTC)
-        session = SessionModel(
-            session_id=session_id,
-            user_id=user_id,
-            project_path=project_path,
-            created_at=now,
-            last_used=now,
-        )
-
-        # Insert the session row and bump the user's session counter in a single
-        # transaction on one borrowed connection, committing both together. Two
-        # independent commits (SessionRepository.create_session then
-        # UserRepository.increment_session_count) can desync users.session_count
-        # if the process crashes or the second write hits "database is locked"
-        # in between. The UPDATE only touches the create_session-owned columns
-        # (session_count/last_active), so it still cannot clobber a concurrent
-        # increment_stats (which owns total_cost/message_count).
-        async with self.db_manager.get_connection() as conn:
-            try:
-                await conn.execute(
-                    """
-                    INSERT INTO sessions
-                    (session_id, user_id, project_path, created_at, last_used)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        session.session_id,
-                        session.user_id,
-                        session.project_path,
-                        session.created_at,
-                        session.last_used,
-                    ),
-                )
-                await conn.execute(
-                    """
-                    UPDATE users
-                    SET session_count = session_count + 1,
-                        last_active = ?
-                    WHERE user_id = ?
-                    """,
-                    (now, user_id),
-                )
-                await conn.commit()
-            except Exception:
-                await conn.rollback()
-                raise
-
-        logger.info("Created session", session_id=session.session_id, user_id=user_id)
-
-        return session
 
     async def log_security_event(
         self,

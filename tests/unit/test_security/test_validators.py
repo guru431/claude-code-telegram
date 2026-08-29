@@ -171,12 +171,15 @@ class TestSecurityValidator:
             assert "path separators" in error
 
     def test_filename_forbidden_names(self, validator):
-        """Test rejection of forbidden filenames."""
+        """Test rejection of forbidden filenames.
+
+        ``passwd``/``hosts``/``shadow`` are deliberately absent: they are
+        sensitive as *system* files, and an upload or a project file can never be
+        one — see ``SYSTEM_ONLY_FORBIDDEN_FILENAMES``.
+        """
         forbidden_filenames = [
             ".env",
             ".ssh",
-            "passwd",
-            "shadow",
             "id_rsa",
             ".bash_history",
         ]
@@ -281,7 +284,6 @@ class TestSecurityValidator:
             "dir; rm -rf /",
             "a" * 101,  # Too long
             ".env",
-            "passwd",
         ]
 
         for name in invalid_names:
@@ -354,3 +356,85 @@ class TestSecurityValidator:
         assert "  " not in sanitized  # No double spaces
         assert not sanitized.startswith(" ")  # No leading space
         assert not sanitized.endswith(" ")  # No trailing space
+
+
+class TestUploadAllowlistCoversOrdinaryDocuments:
+    """Extensions people actually send with "look at this" must be accepted.
+
+    ``.csv``/``.log``/``.diff`` and friends were absent from the allowlist, so a
+    natural attachment came back as a bare "File type not allowed: .csv" with no
+    hint where the list lives and no way to widen it from configuration.
+    """
+
+    @pytest.fixture
+    def validator(self, tmp_path):
+        approved = tmp_path / "approved"
+        approved.mkdir()
+        return SecurityValidator(approved)
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "data.csv",
+            "rows.tsv",
+            "app.log",
+            "setup.cfg",
+            "tox.ini",
+            "fix.diff",
+            "change.patch",
+            "README.rst",
+            "main.tf",
+            "notebook.ipynb",
+        ],
+    )
+    def test_plain_text_documents_are_accepted(self, validator, filename):
+        valid, error = validator.validate_filename(filename)
+        assert valid, error
+
+    def test_unknown_extension_names_the_setting_to_change(self, validator):
+        valid, error = validator.validate_filename("archive.parquet")
+        assert not valid
+        assert "UPLOAD_EXTRA_EXTENSIONS" in error
+
+    def test_extra_extensions_widen_the_allowlist(self, tmp_path):
+        approved = tmp_path / "approved"
+        approved.mkdir()
+        validator = SecurityValidator(
+            approved, extra_upload_extensions=["parquet", ".avro"]
+        )
+        assert validator.validate_filename("archive.parquet")[0]
+        assert validator.validate_filename("events.avro")[0]
+
+
+class TestSystemOnlyForbiddenNames:
+    """``hosts``/``passwd`` inside a project are ordinary files.
+
+    Blocking them by basename alone made the bot refuse to Read an Ansible
+    inventory. The system copies they exist to protect live outside the approved
+    directory and are stopped by the path check long before the name check.
+    """
+
+    @pytest.fixture
+    def validator(self, tmp_path):
+        approved = tmp_path / "approved"
+        approved.mkdir()
+        return SecurityValidator(approved)
+
+    def test_blocked_without_a_boundary_guarantee(self, validator):
+        forbidden, reason = validator.is_forbidden_secret_file("passwd")
+        assert forbidden
+        assert "passwd" in reason
+
+    def test_allowed_inside_the_approved_directory(self, validator):
+        for name in ("hosts", "passwd", "shadow"):
+            forbidden, _ = validator.is_forbidden_secret_file(
+                name, within_approved=True
+            )
+            assert not forbidden, name
+
+    def test_real_secrets_stay_blocked_inside_the_boundary(self, validator):
+        for name in (".env", "id_rsa", "server.pem"):
+            forbidden, _ = validator.is_forbidden_secret_file(
+                name, within_approved=True
+            )
+            assert forbidden, name

@@ -1004,7 +1004,9 @@ class TestCanUseToolCallback:
         result = await callback("Read", {"file_path": ".env"}, context)
         assert isinstance(result, PermissionResultDeny)
         assert "Forbidden filename" in result.message
-        security_validator.is_forbidden_secret_file.assert_called_once_with(".env")
+        security_validator.is_forbidden_secret_file.assert_called_once_with(
+            ".env", within_approved=True
+        )
 
     async def test_wired_into_sdk_manager(self, tmp_path):
         """SecurityValidator is wired into options.can_use_tool by execute_command."""
@@ -1301,8 +1303,12 @@ class TestClaudeMdLoading:
         assert "Use relative paths." in opts.system_prompt
         assert "# Project Rules" not in opts.system_prompt
 
-    async def test_setting_sources_includes_project(self, sdk_manager, tmp_path):
-        """setting_sources=['project'] is passed to ClaudeAgentOptions."""
+    async def test_project_settings_not_trusted_by_default(self, sdk_manager, tmp_path):
+        """<cwd>/.claude/settings.json is not loaded unless explicitly trusted.
+
+        Its hooks execute arbitrary commands, which makes it a stronger vector
+        than the CLAUDE.md the same run already wraps as untrusted data.
+        """
         captured: list = []
         mock_factory = _mock_client_factory(
             _make_assistant_message("ok"),
@@ -1315,5 +1321,84 @@ class TestClaudeMdLoading:
         ):
             await sdk_manager.execute_command(prompt="test", working_directory=tmp_path)
 
-        opts = captured[0]
-        assert opts.setting_sources == ["project"]
+        assert captured[0].setting_sources == []
+
+    async def test_project_settings_loaded_when_trusted(self, sdk_manager, tmp_path):
+        """TRUST_PROJECT_SETTINGS=true opts back in to ['project']."""
+        sdk_manager.config.trust_project_settings = True
+        captured: list = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("ok"),
+            _make_result_message(),
+            capture_options=captured,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await sdk_manager.execute_command(prompt="test", working_directory=tmp_path)
+
+        assert captured[0].setting_sources == ["project"]
+
+
+class TestToolPathBoundary:
+    """TOOL_PATH_BOUNDARY=working confines tools to the run's own project.
+
+    ``validate_path``'s second argument only resolves relative paths — the
+    boundary was always APPROVED_DIRECTORY. In project-thread mode that made the
+    per-topic project isolation UI-deep: a run pinned to one project could read
+    and write a sibling project under the same approved root.
+    """
+
+    @staticmethod
+    def _callback(tmp_path, *, working: bool):
+        from src.claude.sdk_integration import _make_can_use_tool_callback
+        from src.security.validators import SecurityValidator
+
+        approved = tmp_path / "projects"
+        (approved / "mine").mkdir(parents=True)
+        (approved / "theirs").mkdir(parents=True)
+        return (
+            _make_can_use_tool_callback(
+                security_validator=SecurityValidator(approved),
+                working_directory=approved / "mine",
+                approved_directory=approved,
+                boundary_is_working_directory=working,
+            ),
+            approved,
+        )
+
+    async def test_sibling_project_allowed_under_approved_boundary(self, tmp_path):
+        callback, approved = self._callback(tmp_path, working=False)
+        result = await callback(
+            "Read", {"file_path": str(approved / "theirs" / "notes.md")}, None
+        )
+        assert isinstance(result, PermissionResultAllow)
+
+    async def test_sibling_project_denied_under_working_boundary(self, tmp_path):
+        callback, approved = self._callback(tmp_path, working=True)
+        result = await callback(
+            "Read", {"file_path": str(approved / "theirs" / "notes.md")}, None
+        )
+        assert isinstance(result, PermissionResultDeny)
+
+    async def test_own_project_still_allowed_under_working_boundary(self, tmp_path):
+        callback, approved = self._callback(tmp_path, working=True)
+        result = await callback(
+            "Read", {"file_path": str(approved / "mine" / "notes.md")}, None
+        )
+        assert isinstance(result, PermissionResultAllow)
+
+    async def test_bash_boundary_narrows_too(self, tmp_path):
+        callback, approved = self._callback(tmp_path, working=True)
+        # POSIX separators: shlex treats a backslash as an escape, exactly as the
+        # shell does, so a Windows-style path is not a meaningful input here.
+        target = (approved / "theirs" / "notes.md").as_posix()
+        result = await callback("Bash", {"command": f"cat {target}"}, None)
+        assert isinstance(result, PermissionResultDeny)
+
+    async def test_bash_inside_own_project_still_allowed(self, tmp_path):
+        callback, approved = self._callback(tmp_path, working=True)
+        target = (approved / "mine" / "notes.md").as_posix()
+        result = await callback("Bash", {"command": f"cat {target}"}, None)
+        assert isinstance(result, PermissionResultAllow)

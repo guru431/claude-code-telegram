@@ -87,6 +87,7 @@ class ClaudeIntegration:
         allowed_tools_override: Optional[List[str]] = None,
         images: Optional[List[Dict[str, str]]] = None,
         interrupt_event: Optional["asyncio.Event"] = None,
+        ephemeral: bool = False,
     ) -> ClaudeResponse:
         """Run Claude Code command with full integration.
 
@@ -94,6 +95,11 @@ class ClaudeIntegration:
         run, overriding ``claude_allowed_tools`` (and ignoring
         ``DISABLE_TOOL_VALIDATION``). Used to run untrusted, unattended
         triggers (e.g. webhooks) with a read-only tool set.
+
+        *ephemeral* runs without a persistent session: nothing is written to the
+        ``sessions`` table and the run does not consume a slot in the subject's
+        session quota. Used by the bus (webhooks, cron), whose one-shot runs
+        would otherwise evict the owner's real sessions.
         """
         logger.info(
             "Running Claude command",
@@ -122,7 +128,7 @@ class ClaudeIntegration:
 
         # Get or create session
         session = await self.session_manager.get_or_create_session(
-            user_id, working_directory, session_id
+            user_id, working_directory, session_id, ephemeral=ephemeral
         )
 
         # Execute command
@@ -167,7 +173,7 @@ class ClaudeIntegration:
 
                     # Create a fresh session and retry
                     session = await self.session_manager.get_or_create_session(
-                        user_id, working_directory
+                        user_id, working_directory, ephemeral=ephemeral
                     )
                     response = await self._execute(
                         prompt=prompt,
@@ -266,10 +272,16 @@ class ClaudeIntegration:
     ) -> Optional["ClaudeSession"]:  # noqa: F821
         """Find the most recent resumable session for a user in a directory.
 
-        First checks the bot's own SQLite storage. If nothing is found, falls
-        back to scanning ``~/.claude/projects/`` for sessions started in
-        VS Code or the CLI, so the user can seamlessly continue them via the
-        bot.
+        First checks the bot's own SQLite storage. If nothing is found and the
+        user is an admin, falls back to scanning ``~/.claude/projects/`` for
+        sessions started in VS Code or the CLI, so the operator can seamlessly
+        continue them via the bot.
+
+        The admin gate matches ``/sessions`` and the ``resume:`` callback:
+        sessions discovered on disk carry no Telegram owner, so resuming one
+        replays whatever another operator (or the local CLI) was doing into this
+        user's context. Auto-resume used to skip that check entirely, which made
+        the silent path more permissive than the explicit one.
 
         Returns the session if one exists that is non-expired and has a real
         (non-temporary) session ID from Claude. Returns None otherwise.
@@ -290,6 +302,11 @@ class ClaudeIntegration:
             return max(matching_sessions, key=lambda s: s.last_used)
 
         # Fallback: discover sessions from ~/.claude/projects/ (VS Code / CLI).
+        # Admins only — see the docstring. A non-admin with no session of their
+        # own simply starts a new one.
+        if not self.config.is_admin(user_id):
+            return None
+
         # Synchronous JSONL filesystem scan — offload to a thread so it does not
         # block the event loop.
         known_ids = {s.session_id for s in sessions if s.session_id}

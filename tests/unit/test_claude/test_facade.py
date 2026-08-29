@@ -294,3 +294,57 @@ class TestEmptySessionIdWarning:
 
         # Session ID should be empty on the response
         assert not result.session_id
+
+
+class TestLocalSessionDiscoveryIsAdminOnly:
+    """Auto-resume must not hand a non-admin a session found on disk.
+
+    ``/sessions`` and the ``resume:`` callback already refuse disk-discovered
+    sessions to non-admins ("Sessions discovered on disk carry no Telegram
+    owner"). The silent auto-resume path must apply the same rule, or a user's
+    first message in a directory quietly inherits another operator's history.
+    """
+
+    @staticmethod
+    def _local_session():
+        stub = MagicMock()
+        stub.session_id = "local-cli-session"
+        stub.cwd = str(Path("/test/project"))
+        stub.timestamp = datetime.now()
+        return stub
+
+    async def test_non_admin_does_not_get_local_session(self, config, tmp_path):
+        config.allowed_users = [111, 222]
+        config.admin_users = [111]
+        facade = ClaudeIntegration(
+            config=config,
+            sdk_manager=MagicMock(),
+            session_manager=SessionManager(config, InMemorySessionStorage()),
+        )
+
+        with patch(
+            "src.claude.facade.find_latest_local_session",
+            return_value=self._local_session(),
+        ) as finder:
+            found = await facade._find_resumable_session(222, Path("/test/project"))
+
+        assert found is None
+        finder.assert_not_called()
+
+    async def test_admin_still_gets_local_session(self, config, tmp_path):
+        config.allowed_users = [111, 222]
+        config.admin_users = [111]
+        facade = ClaudeIntegration(
+            config=config,
+            sdk_manager=MagicMock(),
+            session_manager=SessionManager(config, InMemorySessionStorage()),
+        )
+
+        with patch(
+            "src.claude.facade.find_latest_local_session",
+            return_value=self._local_session(),
+        ):
+            found = await facade._find_resumable_session(111, Path("/test/project"))
+
+        assert found is not None
+        assert found.session_id == "local-cli-session"

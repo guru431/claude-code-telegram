@@ -17,6 +17,8 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.utils.constants import (
+    AUTOMATION_USER_ID,
+    DEFAULT_AUTOMATION_MAX_COST_PER_DAY,
     DEFAULT_CLAUDE_MAX_COST_PER_REQUEST,
     DEFAULT_CLAUDE_MAX_COST_PER_USER,
     DEFAULT_CLAUDE_MAX_TURNS,
@@ -77,6 +79,32 @@ class Settings(BaseSettings):
         False,
         description="Allow all Claude tools by bypassing tool validation checks",
     )
+    upload_extra_extensions: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Extra file extensions accepted for uploads, on top of the built-in "
+            "allowlist (e.g. UPLOAD_EXTRA_EXTENSIONS=.parquet,.svg). With or "
+            "without the leading dot."
+        ),
+    )
+    tool_path_boundary: Literal["approved", "working"] = Field(
+        "approved",
+        description=(
+            "What file tools and bash path checks are confined to. 'approved' "
+            "(default, backwards compatible) uses APPROVED_DIRECTORY; 'working' "
+            "narrows it to the run's own project directory, so in project-thread "
+            "mode a topic cannot read or write a sibling project."
+        ),
+    )
+    trust_project_settings: bool = Field(
+        False,
+        description=(
+            "Load <working_directory>/.claude/settings.json as trusted agent "
+            "configuration. Off by default: a repository's settings file can "
+            "register hooks that run arbitrary commands, so it is a stronger "
+            "vector than the CLAUDE.md that is already treated as untrusted data."
+        ),
+    )
 
     # Claude settings
     claude_binary_path: Optional[str] = Field(
@@ -104,6 +132,15 @@ class Settings(BaseSettings):
     claude_max_cost_per_request: float = Field(
         DEFAULT_CLAUDE_MAX_COST_PER_REQUEST,
         description="Max cost per individual request (SDK budget cap)",
+    )
+    automation_max_cost_per_day: float = Field(
+        DEFAULT_AUTOMATION_MAX_COST_PER_DAY,
+        gt=0,
+        description=(
+            "Daily budget for runs started by the bus (webhooks, scheduled "
+            "jobs). Kept separate from claude_max_cost_per_user so unattended "
+            "automation neither spends a person's budget nor runs unmetered."
+        ),
     )
     # NOTE: When changing this list, also update docs/tools.md,
     # docs/configuration.md, .env.example,
@@ -168,11 +205,18 @@ class Settings(BaseSettings):
         True,
         description="Enable OS-level bash sandboxing for approved dir",
     )
-    # NOTE: pip/make/docker are deliberately NOT excluded — they can execute
-    # arbitrary code outside the sandbox (pip runs setup.py, make runs recipes,
-    # docker can bind-mount the host fs). Run them inside the sandbox instead.
+    # NOTE: pip/npm/make/docker are deliberately NOT excluded — they can execute
+    # arbitrary code outside the sandbox (pip runs setup.py, npm runs a package's
+    # preinstall/postinstall scripts, make runs recipes, docker can bind-mount the
+    # host fs). Run them inside the sandbox instead.
+    #
+    # Anything listed here loses the OS sandbox, so its explicit path flags must
+    # also be boundary-checked statically: ``git``/``poetry`` are declared in
+    # ``_FLAG_PATH_ONLY_COMMANDS`` / ``_PATH_BEARING_FLAGS`` in
+    # ``src/claude/monitor.py``. Adding a command here without that pairing puts
+    # it outside *both* layers.
     sandbox_excluded_commands: Optional[List[str]] = Field(
-        default=["git", "npm", "poetry"],
+        default=["git", "poetry"],
         description="Commands that run outside the sandbox (need system access)",
     )
 
@@ -316,8 +360,6 @@ class Settings(BaseSettings):
 
     # Monitoring
     log_level: str = Field("INFO", description="Logging level")
-    enable_telemetry: bool = Field(False, description="Enable anonymous telemetry")
-    sentry_dsn: Optional[str] = Field(None, description="Sentry DSN for error tracking")
 
     # Development
     debug: bool = Field(False, description="Enable debug mode")
@@ -350,6 +392,13 @@ class Settings(BaseSettings):
         description="Bind address for the webhook API server (use 0.0.0.0 to expose)",
     )
     api_server_port: int = Field(8080, description="Webhook API server port")
+    api_docs_enabled: bool = Field(
+        False,
+        description=(
+            "Expose the interactive OpenAPI docs at /docs. Off by default: the "
+            "page enumerates the webhook surface to unauthenticated callers."
+        ),
+    )
     enable_scheduler: bool = Field(False, description="Enable job scheduler")
     github_webhook_secret: Optional[SecretStr] = Field(
         None, description="GitHub webhook HMAC secret"
@@ -373,6 +422,24 @@ class Settings(BaseSettings):
     enable_link_intake: bool = Field(
         False,
         description="Route messages containing links through link-analysis",
+    )
+    # No defaults on purpose. These point at a fetch pipeline that lives outside
+    # this repository; hardcoding one deployment's layout both leaked internal
+    # paths into a public repo and made the feature silently dead everywhere else
+    # (every link fell through to "could not fetch" after a subprocess call to a
+    # nonexistent script). Required when enable_link_intake is on — see
+    # validate_cross_field_dependencies.
+    link_intake_python: Optional[Path] = Field(
+        None, description="Python interpreter that runs the link-analysis fetcher"
+    )
+    link_intake_fetch_script: Optional[Path] = Field(
+        None, description="Path to the link-analysis fetch_source.py script"
+    )
+    link_intake_work_root: Optional[Path] = Field(
+        None, description="Directory the fetcher writes incoming material into"
+    )
+    link_intake_registry: Optional[Path] = Field(
+        None, description="JSON project registry used to map a project to its dir"
     )
     project_threads_mode: Literal["private", "group"] = Field(
         "private",
@@ -602,6 +669,31 @@ class Settings(BaseSettings):
                     "projects_config_path required when enable_project_threads is True"
                 )
 
+        if self.enable_link_intake:
+            missing = [
+                name
+                for name, value in (
+                    ("link_intake_python", self.link_intake_python),
+                    ("link_intake_fetch_script", self.link_intake_fetch_script),
+                    ("link_intake_work_root", self.link_intake_work_root),
+                    ("link_intake_registry", self.link_intake_registry),
+                )
+                if value is None
+            ]
+            if missing:
+                raise ValueError(
+                    "enable_link_intake is True but "
+                    f"{', '.join(missing)} {'are' if len(missing) > 1 else 'is'} "
+                    "not configured; the fetch pipeline lives outside this "
+                    "repository and has no portable default"
+                )
+            # Fail at startup rather than on the first link the user sends: a
+            # missing script only surfaced as "could not fetch the material"
+            # after a subprocess call, with nothing pointing at the config.
+            script = self.link_intake_fetch_script
+            if script is not None and not script.exists():
+                raise ValueError(f"link_intake_fetch_script not found: {script}")
+
         return self
 
     @property
@@ -627,6 +719,19 @@ class Settings(BaseSettings):
             self.admin_users if self.admin_users is not None else self.allowed_users
         )
         return bool(admins) and user_id in admins
+
+    def daily_cost_limit_for(self, user_id: int) -> float:
+        """Return the daily spend cap that applies to *user_id*.
+
+        Bus-driven runs are attributed to ``AUTOMATION_USER_ID`` and draw from
+        ``automation_max_cost_per_day`` instead of a person's budget: a busy
+        webhook or a five-minute cron would otherwise either exhaust the owner's
+        limit or — as it did before these runs were metered at all — spend with
+        no cap in sight.
+        """
+        if user_id == AUTOMATION_USER_ID:
+            return self.automation_max_cost_per_day
+        return self.claude_max_cost_per_user
 
     @property
     def database_path(self) -> Optional[Path]:

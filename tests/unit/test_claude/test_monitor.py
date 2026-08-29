@@ -3,6 +3,8 @@
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from src.claude.monitor import (
     _is_claude_internal_path,
     check_bash_directory_boundary,
@@ -481,3 +483,30 @@ class TestIsClaudeInternalPath:
             bad_file = tmp_path / ".claude" / "secrets" / "key.pem"
             bad_file.touch()
             assert _is_claude_internal_path(str(bad_file)) is False
+
+
+def _load_corpus() -> list[tuple[str, str]]:
+    """Parse ``bash_boundary_corpus.txt`` into ``(verdict, command)`` pairs."""
+    corpus_path = Path(__file__).parent / "bash_boundary_corpus.txt"
+    cases: list[tuple[str, str]] = []
+    for line in corpus_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        verdict, command = line.split("\t", 1)
+        cases.append((verdict.strip(), command))
+    return cases
+
+
+@pytest.mark.parametrize("verdict,command", _load_corpus())
+def test_bash_boundary_corpus(verdict: str, command: str) -> None:
+    """Every spelling of a command must get the same verdict as its canonical form.
+
+    The corpus file is the regression surface for tokenizer bypasses: no-space
+    redirections (``>/etc/x``), fd prefixes (``2>``), glued separators
+    (``a&&b``) and launcher wrappers (``env``/``xargs``) each used to flip a DENY
+    into a silent ALLOW.
+    """
+    approved = Path("/root/projects")
+    cwd = approved / "myapp"
+    valid, error = check_bash_directory_boundary(command, cwd, approved)
+    assert valid is (verdict == "ALLOW"), f"{command!r} -> valid={valid} ({error})"
