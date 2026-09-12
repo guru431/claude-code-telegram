@@ -419,28 +419,6 @@ class Settings(BaseSettings):
         False,
         description="Enable strict routing by Telegram forum project threads",
     )
-    enable_link_intake: bool = Field(
-        False,
-        description="Route messages containing links through link-analysis",
-    )
-    # No defaults on purpose. These point at a fetch pipeline that lives outside
-    # this repository; hardcoding one deployment's layout both leaked internal
-    # paths into a public repo and made the feature silently dead everywhere else
-    # (every link fell through to "could not fetch" after a subprocess call to a
-    # nonexistent script). Required when enable_link_intake is on — see
-    # validate_cross_field_dependencies.
-    link_intake_python: Optional[Path] = Field(
-        None, description="Python interpreter that runs the link-analysis fetcher"
-    )
-    link_intake_fetch_script: Optional[Path] = Field(
-        None, description="Path to the link-analysis fetch_source.py script"
-    )
-    link_intake_work_root: Optional[Path] = Field(
-        None, description="Directory the fetcher writes incoming material into"
-    )
-    link_intake_registry: Optional[Path] = Field(
-        None, description="JSON project registry used to map a project to its dir"
-    )
     project_threads_mode: Literal["private", "group"] = Field(
         "private",
         description="Project thread mode: private chat topics or group forum topics",
@@ -668,31 +646,6 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "projects_config_path required when enable_project_threads is True"
                 )
-
-        if self.enable_link_intake:
-            missing = [
-                name
-                for name, value in (
-                    ("link_intake_python", self.link_intake_python),
-                    ("link_intake_fetch_script", self.link_intake_fetch_script),
-                    ("link_intake_work_root", self.link_intake_work_root),
-                    ("link_intake_registry", self.link_intake_registry),
-                )
-                if value is None
-            ]
-            if missing:
-                raise ValueError(
-                    "enable_link_intake is True but "
-                    f"{', '.join(missing)} {'are' if len(missing) > 1 else 'is'} "
-                    "not configured; the fetch pipeline lives outside this "
-                    "repository and has no portable default"
-                )
-            # Fail at startup rather than on the first link the user sends: a
-            # missing script only surfaced as "could not fetch the material"
-            # after a subprocess call, with nothing pointing at the config.
-            script = self.link_intake_fetch_script
-            if script is not None and not script.exists():
-                raise ValueError(f"link_intake_fetch_script not found: {script}")
 
         return self
 
