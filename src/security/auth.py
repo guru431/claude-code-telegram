@@ -98,13 +98,25 @@ class WhitelistAuthProvider(AuthProvider):
 class AuthenticationManager:
     """Main authentication manager supporting multiple providers."""
 
-    def __init__(self, providers: List[AuthProvider]):
+    def __init__(
+        self,
+        providers: List[AuthProvider],
+        session_timeout: Optional[timedelta] = None,
+    ):
         if not providers:
             raise SecurityError("At least one authentication provider is required")
 
         self.providers = providers
         self.sessions: Dict[int, UserSession] = {}
-        logger.info("Authentication manager initialized", providers=len(self.providers))
+        # Without this the sessions kept here always used the UserSession
+        # dataclass default (24h) and SESSION_TIMEOUT_HOURS — 12 in the
+        # production profile — had no effect on anything.
+        self.session_timeout = session_timeout or timedelta(hours=24)
+        logger.info(
+            "Authentication manager initialized",
+            providers=len(self.providers),
+            session_timeout_hours=self.session_timeout.total_seconds() / 3600,
+        )
 
     async def authenticate_user(
         self, user_id: int, credentials: Optional[Dict[str, Any]] = None
@@ -146,6 +158,7 @@ class AuthenticationManager:
             created_at=datetime.now(UTC),
             last_activity=datetime.now(UTC),
             user_info=user_info,
+            session_timeout=self.session_timeout,
         )
 
         logger.info(

@@ -71,11 +71,16 @@ def create_api_app(
             if declared > _MAX_WEBHOOK_BODY_BYTES:
                 raise HTTPException(status_code=413, detail="Payload too large")
 
-        body = b""
+        # Collect chunks and join once: repeated ``body += chunk`` copies the
+        # whole buffer on every iteration (O(n²) for a multi-MB payload).
+        chunks: list[bytes] = []
+        received = 0
         async for chunk in request.stream():
-            body += chunk
-            if len(body) > _MAX_WEBHOOK_BODY_BYTES:
+            received += len(chunk)
+            if received > _MAX_WEBHOOK_BODY_BYTES:
                 raise HTTPException(status_code=413, detail="Payload too large")
+            chunks.append(chunk)
+        body = b"".join(chunks)
 
         # Verify signature based on provider
         if provider == "github":

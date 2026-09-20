@@ -252,3 +252,38 @@ class TestInMemoryDatabase:
         finally:
             await first.close()
             await second.close()
+
+
+class TestUserStatsView:
+    """``user_stats`` must not multiply messages by the user's session count.
+
+    The original view joined users -> sessions -> messages in one query, so
+    every message row was duplicated once per session and both COUNT and SUM
+    came out N times too large.
+    """
+
+    async def test_counts_are_not_multiplied_by_sessions(self, db_manager):
+        async with db_manager.get_connection() as conn:
+            await conn.execute("INSERT INTO users (user_id) VALUES (1)")
+            for i in range(3):
+                await conn.execute(
+                    "INSERT INTO sessions (session_id, user_id, project_path) "
+                    "VALUES (?, 1, '/p')",
+                    (f"s{i}",),
+                )
+            for i in range(2):
+                await conn.execute(
+                    "INSERT INTO messages (session_id, user_id, prompt, cost) "
+                    "VALUES ('s0', 1, 'hi', 0.5)",
+                )
+            await conn.commit()
+
+            cursor = await conn.execute(
+                "SELECT total_sessions, total_messages, total_cost "
+                "FROM user_stats WHERE user_id = 1"
+            )
+            row = await cursor.fetchone()
+
+        assert row["total_sessions"] == 3
+        assert row["total_messages"] == 2
+        assert row["total_cost"] == pytest.approx(1.0)

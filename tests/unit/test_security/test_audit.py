@@ -344,6 +344,27 @@ class TestAuditLogger:
         low_risk_event = events[0]  # Most recent
         assert low_risk_event.risk_level == "low"
 
+    async def test_command_risk_matches_whole_tokens_only(self, audit_logger, storage):
+        """Risk is assessed per token, never by substring.
+
+        A substring test put "rm" inside "terraform", "su" inside "assume" and
+        "dd" inside "add", so `terraform plan` and `git add` were filed as
+        high risk and skewed the dashboard's risk distribution.
+        """
+        for command, expected in [
+            ("terraform plan", "low"),
+            ("git add", "medium"),  # medium because of "git", not "dd"
+            ("assume-role", "low"),
+            ("confirm", "low"),
+            ("sudo rm -rf /", "high"),
+            ("rm -rf /tmp/x", "high"),
+        ]:
+            await audit_logger.log_command(
+                user_id=123, command=command, args=[], success=True
+            )
+            events = await storage.get_events()
+            assert events[0].risk_level == expected, command
+
     async def test_log_file_access(self, audit_logger, storage):
         """Test logging file access."""
         await audit_logger.log_file_access(

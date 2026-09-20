@@ -436,3 +436,58 @@ class TestRejectionAuditIsAggregated:
         storage.users.record_identity.assert_awaited_once_with(
             mock_update.effective_user.id, "someone"
         )
+
+
+class TestCaptionIsValidatedLikeText:
+    """A photo/document caption reaches Claude's prompt exactly as text does.
+
+    Classic mode validated only ``message.text``, so the same command-injection
+    and path-traversal patterns sailed through when sent as a caption on a file.
+    """
+
+    def _event(self, text=None, caption=None):
+        event = MagicMock()
+        event.callback_query = None
+        event.effective_user = MagicMock()
+        event.effective_user.id = 1
+        event.effective_user.username = "u"
+        message = MagicMock()
+        message.text = text
+        message.caption = caption
+        message.document = None
+        message.reply_text = AsyncMock()
+        event.effective_message = message
+        return event
+
+    def _data(self):
+        settings = MagicMock()
+        settings.agentic_mode = False
+        settings.development_mode = False
+        validator = MagicMock()
+        validator.sanitize_command_input = lambda t: t
+        return {
+            "security_validator": validator,
+            "audit_logger": None,
+            "settings": settings,
+        }
+
+    async def test_dangerous_caption_is_blocked(self):
+        from src.bot.middleware.security import security_middleware
+
+        handler = AsyncMock()
+        event = self._event(caption="look; rm -rf /etc")
+
+        result = await security_middleware(handler, event, self._data())
+
+        assert result is None
+        handler.assert_not_awaited()
+        event.effective_message.reply_text.assert_awaited_once()
+
+    async def test_ordinary_caption_passes(self):
+        from src.bot.middleware.security import security_middleware
+
+        handler = AsyncMock(return_value="ok")
+        event = self._event(caption="please review this screenshot")
+
+        assert await security_middleware(handler, event, self._data()) == "ok"
+        handler.assert_awaited_once()

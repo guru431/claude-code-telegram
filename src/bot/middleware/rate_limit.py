@@ -4,6 +4,8 @@ from typing import Any, Callable, Dict
 
 import structlog
 
+from ...security.rate_limiter import COST_LIMIT_MESSAGE_PREFIX
+
 logger = structlog.get_logger()
 
 
@@ -78,10 +80,11 @@ async def rate_limit_middleware(
 
         # Log rate limit violation with the real measurement. check_rate_limit
         # only returns (bool, message); infer which limit tripped from the
-        # message text and pull the matching numbers from get_user_status.
+        # message's shared prefix constant and pull the matching numbers from
+        # get_user_status.
         if audit_logger:
             status = rate_limiter.get_user_status(user_id)
-            if message and message.startswith("Cost limit exceeded"):
+            if message and message.startswith(COST_LIMIT_MESSAGE_PREFIX):
                 limit_type = "cost"
                 cost_usage = status["cost_usage"]
                 current_usage = float(cost_usage["current"])

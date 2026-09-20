@@ -220,16 +220,21 @@ class FileHandler:
         file_name = Path(file_name).name or f"file_{uuid.uuid4()}"
         file_path = download_dir / file_name
 
-        # Download to path
-        await file.download_to_drive(str(file_path))
+        # Download to path. The caller's ``finally`` only cleans up once this
+        # returns a path, so a failed download (network, disk) has to remove its
+        # own directory or the partial file leaks for the life of the host.
+        try:
+            await file.download_to_drive(str(file_path))
 
-        actual_size = file_path.stat().st_size
-        if actual_size > max_bytes:
+            actual_size = file_path.stat().st_size
+            if actual_size > max_bytes:
+                raise FileTooLargeError(
+                    f"File too large ({actual_size / 1024 / 1024:.1f}MB). "
+                    f"Max: {max_mb}MB."
+                )
+        except BaseException:
             shutil.rmtree(download_dir, ignore_errors=True)
-            raise FileTooLargeError(
-                f"File too large ({actual_size / 1024 / 1024:.1f}MB). "
-                f"Max: {max_mb}MB."
-            )
+            raise
 
         return file_path
 
@@ -584,8 +589,17 @@ class FileHandler:
         return self.language_map.get(extension.lower(), "text")
 
     async def analyze_codebase(self, directory: Path) -> CodebaseAnalysis:
-        """Analyze entire codebase"""
+        """Analyze entire codebase.
 
+        The scan is a full ``rglob`` + ``read_text`` walk of the tree, so it
+        runs in a worker thread for the same reason ``_process_archive`` does:
+        on the event loop it freezes the typing heartbeat and every other
+        chat the bot is serving.
+        """
+        return await asyncio.to_thread(self._analyze_codebase_sync, directory)
+
+    def _analyze_codebase_sync(self, directory: Path) -> CodebaseAnalysis:
+        """Blocking body of :meth:`analyze_codebase` (worker thread)."""
         analysis = CodebaseAnalysis(
             languages={},
             frameworks=[],
@@ -618,7 +632,7 @@ class FileHandler:
         analysis.frameworks = self._detect_frameworks(directory)
 
         # Find TODOs and FIXMEs
-        analysis.todo_count = await self._find_todos(directory)
+        analysis.todo_count = self._find_todos(directory)
 
         # Check for tests
         test_files = self._find_test_files(directory)
@@ -691,7 +705,7 @@ class FileHandler:
 
         return list(set(frameworks))  # Remove duplicates
 
-    async def _find_todos(self, directory: Path) -> int:
+    def _find_todos(self, directory: Path) -> int:
         """Count TODO and FIXME comments"""
         todo_count = 0
 

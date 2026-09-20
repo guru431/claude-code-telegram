@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 import structlog
 import yaml
 
-from .registry import canonical_path_key
+from .registry import canonical_path_key, load_project_registry
 
 logger = structlog.get_logger()
 
@@ -197,7 +197,10 @@ def discover_new_projects(
     else:
         data = {}
 
-    existing_projects: List[Dict[str, str]] = data.get("projects", [])
+    # ``or []`` and not a ``get`` default: a file with a bare ``projects:`` key
+    # parses to None, which the default never covers, and the extend() below
+    # would then fail with AttributeError.
+    existing_projects: List[Dict[str, str]] = data.get("projects") or []
 
     # Collect existing paths (canonical keys) to avoid duplicates. The
     # registry dedupes by resolved absolute path, so discovery must use the same
@@ -273,7 +276,15 @@ def discover_new_projects(
     existing_projects.extend(new_projects)
     data["projects"] = existing_projects
 
-    write_yaml_atomic(config_path, data)
+    # Validate the candidate through the loader the bot uses at startup, the
+    # same guarantee scripts/sync_projects_yaml.py gives. Both writers touch
+    # this file, and auto-discovery could otherwise commit a config (a slug or
+    # name colliding with an entry whose path does not resolve, so the dedupe
+    # sets never saw it) that the bot refuses to start on.
+    def _validate(candidate: Path) -> None:
+        load_project_registry(candidate, approved_root)
+
+    write_yaml_atomic(config_path, data, validate=_validate)
 
     logger.info(
         "New projects discovered and added to config",

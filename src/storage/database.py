@@ -498,6 +498,40 @@ class DatabaseManager:
                 ALTER TABLE audit_log ADD COLUMN session_id TEXT;
                 """,
             ),
+            (
+                10,
+                """
+                -- Rebuild user_stats without the messages x sessions fan-out.
+                --
+                -- Migration 2 joined users -> sessions -> messages in one
+                -- query and grouped by user. Both joins are one-to-many off the
+                -- same row, so every message was duplicated once per session the
+                -- user owns: COUNT(m.message_id) and SUM(m.cost) came out
+                -- multiplied by the user's session count. A user with 12
+                -- sessions saw their message count and spend reported 12x.
+                --
+                -- Each aggregate now comes from its own correlated subquery, so
+                -- neither side multiplies the other.
+                --
+                -- Rollback: recreate the view with the migration-2 body and
+                -- delete the version-10 row from schema_version.
+                DROP VIEW IF EXISTS user_stats;
+
+                CREATE VIEW user_stats AS
+                SELECT
+                    u.user_id,
+                    u.telegram_username,
+                    (SELECT COUNT(*) FROM sessions s
+                        WHERE s.user_id = u.user_id) as total_sessions,
+                    (SELECT COUNT(*) FROM messages m
+                        WHERE m.user_id = u.user_id) as total_messages,
+                    (SELECT SUM(m.cost) FROM messages m
+                        WHERE m.user_id = u.user_id) as total_cost,
+                    (SELECT MAX(m.timestamp) FROM messages m
+                        WHERE m.user_id = u.user_id) as last_activity
+                FROM users u;
+                """,
+            ),
         ]
 
     async def _init_pool(self):
@@ -588,7 +622,15 @@ class DatabaseManager:
                     if conn.in_transaction:
                         await conn.rollback()
                     async with self._pool_lock:
-                        if len(self._connection_pool) < self._pool_size:
+                        # A manager closed while this connection was on loan
+                        # must not take it back: close() already drained the
+                        # pool and is a no-op on a second call, so the handle
+                        # would stay open for the life of the process (and
+                        # hold the WAL lock on a file database).
+                        if (
+                            not self._closed
+                            and len(self._connection_pool) < self._pool_size
+                        ):
                             self._connection_pool.append(conn)
                             released = True
                     if not released:
@@ -601,8 +643,8 @@ class DatabaseManager:
 
         Idempotent: a second call is a no-op. NOTE: connections currently
         borrowed by in-flight callers are *not* drained — such a borrower keeps
-        using its connection until it finishes and then hands it back to the
-        (already cleared) pool. Only the reopen-after-close path is closed here.
+        using its connection until it finishes, and then ``get_connection``
+        closes it outright rather than returning it to the cleared pool.
         """
         if self._closed:
             return

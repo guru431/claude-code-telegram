@@ -8,6 +8,7 @@ Features:
 """
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -488,11 +489,15 @@ class AuditLogger:
             "node",
         }
 
-        command_lower = command.lower()
+        # Match on whole tokens, not substrings: "rm" is inside "terraform"
+        # and "confirm", "su" inside "sudo" and "assume", "dd" inside "add", so
+        # a substring test filed `terraform plan` and `git add` as high risk and
+        # skewed the dashboard's risk distribution.
+        tokens = {t for t in re.split(r"[^a-z0-9_]+", command.lower()) if t}
 
-        if any(risky in command_lower for risky in high_risk_commands):
+        if tokens & high_risk_commands:
             return "high"
-        elif any(risky in command_lower for risky in medium_risk_commands):
+        elif tokens & medium_risk_commands:
             return "medium"
         else:
             return "low"

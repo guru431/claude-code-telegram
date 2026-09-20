@@ -505,8 +505,46 @@ class TestCostReservations:
 
         assert new_id is not None
         assert error is None
-        assert leaked_id not in rate_limiter.reservations
+        assert rate_limiter.reservations[leaked_id].released is True
         assert rate_limiter.cost_tracker[user_id] == pytest.approx(1.0)
+
+    async def test_swept_hold_still_charges_a_late_settle(self, rate_limiter):
+        """A run longer than RESERVATION_MAX_AGE still records its real cost.
+
+        The sweep used to drop the id, so settle_reservation found nothing and
+        the run's spend was never counted — a systematic under-count on exactly
+        the most expensive runs.
+        """
+        user_id = 123
+
+        long_run_id, _ = await rate_limiter.reserve_cost(user_id, 2.0)
+        rate_limiter.reservations[long_run_id].created_at = datetime.now(
+            UTC
+        ) - timedelta(hours=2)
+
+        # Some other request for the same user triggers the sweep.
+        await rate_limiter.reserve_cost(user_id, 0.0)
+        assert rate_limiter.cost_tracker[user_id] == pytest.approx(0.0)
+
+        # The long run finally finishes and settles its real cost.
+        await rate_limiter.settle_reservation(long_run_id, 3.5)
+
+        assert rate_limiter.cost_tracker[user_id] == pytest.approx(3.5)
+        assert long_run_id not in rate_limiter.reservations
+
+    async def test_abandoned_hold_is_discarded(self, rate_limiter):
+        """A hold nobody ever settles is eventually forgotten entirely."""
+        user_id = 123
+
+        leaked_id, _ = await rate_limiter.reserve_cost(user_id, 2.0)
+        rate_limiter.reservations[leaked_id].created_at = datetime.now(UTC) - timedelta(
+            hours=25
+        )
+
+        await rate_limiter.reserve_cost(user_id, 1.0)
+
+        assert leaked_id not in rate_limiter.reservations
+        assert leaked_id not in rate_limiter.user_reservations[user_id]
 
     async def test_daily_reset_does_not_credit_a_fresh_window(self, rate_limiter):
         """A hold from the previous window cannot refund the new one."""

@@ -223,6 +223,28 @@ async def handle_cd_callback(
                 return
             # Use the validated path
             new_path = resolved_path
+        else:
+            # DI is expected to always supply the validator, but the boundary
+            # check must not be conditional on it: with no validator,
+            # ``cd:../../etc`` — or an absolute ``cd:C:/x``, which
+            # ``base / "C:/x"`` collapses to on Windows — changed the working
+            # directory with no check at all. Mirrors the /cd fallback in
+            # handlers/command.py.
+            new_path = new_path.resolve()
+            if not _is_within_root(new_path, directory_root):
+                await query.edit_message_text(
+                    "❌ <b>Access Denied</b>\n\n"
+                    "Path is outside the approved directory.",
+                    parse_mode="HTML",
+                )
+                if audit_logger:
+                    await audit_logger.log_security_violation(
+                        user_id=user_id,
+                        violation_type="path_traversal_attempt",
+                        details=f"Attempted path: {project_name}",
+                        severity="medium",
+                    )
+                return
 
         if project_root and not _is_within_root(new_path, project_root):
             await query.edit_message_text(

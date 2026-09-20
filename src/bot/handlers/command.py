@@ -27,6 +27,20 @@ from ..utils.upload_limits import format_file_size
 logger = structlog.get_logger()
 
 
+def _display_relative_path(current_dir: Path, settings: Settings) -> str:
+    """Render *current_dir* relative to the approved root, for display only.
+
+    ``Path.relative_to`` raises when the two are unrelated, which happens with
+    a ``current_directory`` left in ``user_data`` from before APPROVED_DIRECTORY
+    was changed. Every command that prints the path used to die on that
+    ValueError with no reply at all, so fall back to the absolute path instead.
+    """
+    try:
+        return str(current_dir.relative_to(settings.approved_directory))
+    except ValueError:
+        return str(current_dir)
+
+
 def _is_within_root(path: Path, root: Path) -> bool:
     """Check whether path is within root directory."""
     try:
@@ -320,7 +334,7 @@ async def new_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     current_dir = context.user_data.get(
         "current_directory", settings.approved_directory
     )
-    relative_path = current_dir.relative_to(settings.approved_directory)
+    relative_path = _display_relative_path(current_dir, settings)
 
     # Track what was cleared for user feedback
     old_session_id = context.user_data.get("claude_session_id")
@@ -399,7 +413,7 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             status_msg = await update.message.reply_text(
                 f"🔄 <b>Continuing Session</b>\n\n"
                 f"Session ID: <code>{claude_session_id[:8]}...</code>\n"
-                f"Directory: <code>{current_dir.relative_to(settings.approved_directory)}/</code>\n\n"
+                f"Directory: <code>{_display_relative_path(current_dir, settings)}/</code>\n\n"
                 f"{'Processing your message...' if prompt else 'Continuing where you left off...'}",
                 parse_mode="HTML",
             )
@@ -482,7 +496,7 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await status_msg.edit_text(
                 "❌ <b>No Session Found</b>\n\n"
                 f"No recent Claude session found in this directory.\n"
-                f"Directory: <code>{current_dir.relative_to(settings.approved_directory)}/</code>\n\n"
+                f"Directory: <code>{_display_relative_path(current_dir, settings)}/</code>\n\n"
                 f"<b>What you can do:</b>\n"
                 f"• Use <code>/new</code> to start a fresh session\n"
                 f"• Use <code>/status</code> to check your sessions\n"
@@ -577,7 +591,7 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         items = await asyncio.to_thread(_walk_directory)
 
         # Format response
-        relative_path = current_dir.relative_to(settings.approved_directory)
+        relative_path = _display_relative_path(current_dir, settings)
         if not items:
             message = f"📂 <code>{relative_path}/</code>\n\n<i>(empty directory)</i>"
         else:
@@ -796,7 +810,7 @@ async def print_working_directory(
         "current_directory", settings.approved_directory
     )
 
-    relative_path = current_dir.relative_to(settings.approved_directory)
+    relative_path = _display_relative_path(current_dir, settings)
     absolute_path = str(current_dir)
 
     # Add quick navigation buttons
@@ -938,7 +952,7 @@ async def session_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     current_dir = context.user_data.get(
         "current_directory", settings.approved_directory
     )
-    relative_path = current_dir.relative_to(settings.approved_directory)
+    relative_path = _display_relative_path(current_dir, settings)
 
     # Get rate limiter info if available
     rate_limiter = context.bot_data.get("rate_limiter")
@@ -1099,7 +1113,7 @@ async def end_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     current_dir = context.user_data.get(
         "current_directory", settings.approved_directory
     )
-    relative_path = current_dir.relative_to(settings.approved_directory)
+    relative_path = _display_relative_path(current_dir, settings)
 
     # Deactivate the persisted session and clear the Telegram context, so the
     # next message does not auto-resume the just-ended session and /sessions
@@ -1193,7 +1207,7 @@ async def quick_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # Create inline keyboard
         keyboard = quick_action_manager.create_inline_keyboard(actions, columns=2)
 
-        relative_path = current_dir.relative_to(settings.approved_directory)
+        relative_path = _display_relative_path(current_dir, settings)
         await update.message.reply_text(
             f"⚡ <b>Quick Actions</b>\n\n"
             f"📂 Context: <code>{relative_path}/</code>\n\n"
@@ -1243,7 +1257,7 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not is_git_repo:
             await update.message.reply_text(
                 f"📂 <b>Not a Git Repository</b>\n\n"
-                f"Current directory <code>{current_dir.relative_to(settings.approved_directory)}/</code> is not a git repository.\n\n"
+                f"Current directory <code>{_display_relative_path(current_dir, settings)}/</code> is not a git repository.\n\n"
                 f"<b>Options:</b>\n"
                 f"• Navigate to a git repository with <code>/cd</code>\n"
                 f"• Initialize a new repository (ask Claude to help)\n"
@@ -1255,7 +1269,7 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         git_status = await git_integration.get_status(current_dir)
 
         # Format status message
-        relative_path = current_dir.relative_to(settings.approved_directory)
+        relative_path = _display_relative_path(current_dir, settings)
         status_message = "🔗 <b>Git Repository Status</b>\n\n"
         status_message += f"📂 Directory: <code>{relative_path}/</code>\n"
         status_message += f"🌿 Branch: <code>{escape_html(git_status.branch)}</code>\n"

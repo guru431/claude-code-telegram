@@ -208,7 +208,12 @@ def _build_local_session(entry: Path) -> Optional[LocalSession]:
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=UTC)
     except (ValueError, AttributeError):
-        ts = datetime.fromtimestamp(entry.stat().st_mtime, tz=UTC)
+        # The file may have vanished between the mtime sort and this fallback
+        # stat(); skip it rather than let OSError escape into auto-resume.
+        try:
+            ts = datetime.fromtimestamp(entry.stat().st_mtime, tz=UTC)
+        except OSError:
+            return None
 
     return LocalSession(
         session_id=entry.stem,  # Session ID is the file stem (UUID)

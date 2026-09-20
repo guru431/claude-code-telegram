@@ -4,7 +4,7 @@ import os
 import re
 import shlex
 from pathlib import Path
-from typing import Optional, Set, Tuple
+from typing import NamedTuple, Optional, Set, Tuple
 
 from src.security.validators import SecurityValidator
 
@@ -151,6 +151,106 @@ _NETWORK_OR_INTERP_COMMANDS: Set[str] = {
 # same reasoning as ``_INTERP_COMMANDS``/``_INLINE_CODE_FLAGS`` below.
 _CODE_STRING_COMMANDS: Set[str] = {"eval"}
 
+# Commands whose positional operand is a *program*, not a filesystem path:
+# ``awk '{print $1}' file``, ``sed -n '1,5p' file``. Two consequences:
+#   * the script must not be boundary-checked — ``sed '/^foo/d'`` looks like an
+#     absolute path and would be refused as an escape;
+#   * the script is code. awk's ``system()`` and command pipes, and GNU sed's
+#     ``e``/``w``/``r`` commands, run shell commands and touch files no path
+#     check ever sees. That is the same hole ``_INLINE_CODE_FLAGS`` closes for
+#     python/node/perl, and it was open here because the script resolved to a
+#     harmless-looking relative name inside the working directory.
+_SCRIPT_PROGRAM_COMMANDS: Set[str] = {"awk", "gawk", "nawk", "mawk", "sed"}
+
+# Flags carrying a program string (``sed -e 's/a/b/'``), a program *file*
+# (``-f prog.sed`` — a real path, left to the normal boundary check), and flags
+# whose value is neither (``awk -v n=1``). All three are listed so the operand
+# is consumed and not mistaken for the positional script.
+_SCRIPT_PROGRAM_FLAGS: Set[str] = {"-e", "--expression"}
+_SCRIPT_FILE_FLAGS: Set[str] = {"-f", "--file", "--source"}
+_SCRIPT_VALUE_FLAGS: Set[str] = {"-v", "--assign", "-F", "--field-separator"}
+
+# Executing / file-touching constructs inside an awk program.
+_AWK_EXEC_RE = re.compile(
+    r"\bsystem\s*\("  # system("cmd")
+    r'|\|\s*&?\s*"'  # print … | "cmd", … |& "cmd"
+    r'|"\s*\|\s*&?\s*getline'  # "cmd" | getline
+    r'|\b(?:print|printf)\b[^;{}\n]*>>?\s*"'  # print … > "file"
+)
+
+# The GNU sed ``e`` (execute), ``w``/``W`` (write) and ``r``/``R`` (read)
+# commands at a command position — start of script, ``;``, ``}`` or newline,
+# optionally behind a line/regex address — plus the ``e``/``w`` flags on
+# ``s///``. Ordinary ``s/a/b/g``, ``1,5p``, ``$d`` and ``y/…/…/`` do not match.
+_SED_EXEC_RE = re.compile(
+    r"(?:^|[;}\n])\s*!?\s*"
+    r"(?:[0-9$]+(?:\s*~\s*[0-9]+)?(?:\s*,\s*[0-9$+~]+)?|/(?:\\.|[^/\n])*/[IM]*)?"
+    r"\s*!?\s*[eEwWrR]\b"
+    r"|s(?P<d>[^\w\s])(?:\\.|(?!(?P=d)).)*(?P=d)(?:\\.|(?!(?P=d)).)*(?P=d)"
+    r"[gpiImMnN0-9]*[ewW]"
+)
+
+
+def _script_program_operands(cmd_tokens: list[str]) -> dict[int, str]:
+    """Map token index -> program text for an awk/sed invocation.
+
+    Follows the way both tools parse their arguments: ``-e``/``--expression``
+    supplies a script, ``-f``/``--file`` supplies a script *file* (a genuine
+    path, so it is left for the boundary check), and the first positional
+    operand is the script only when neither flag already gave one.
+    """
+    programs: dict[int, str] = {}
+    script_given = False
+    seen_double_dash = False
+    idx = 1
+    while idx < len(cmd_tokens):
+        token = cmd_tokens[idx]
+        if not seen_double_dash and token == "--":
+            seen_double_dash = True
+            idx += 1
+            continue
+        if not seen_double_dash and token.startswith("-") and token != "-":
+            name, sep, inline = token.partition("=")
+            if name in _SCRIPT_PROGRAM_FLAGS:
+                script_given = True
+                if sep:
+                    programs[idx] = inline
+                elif idx + 1 < len(cmd_tokens):
+                    idx += 1
+                    programs[idx] = cmd_tokens[idx]
+            elif name in _SCRIPT_FILE_FLAGS:
+                script_given = True
+                if not sep and idx + 1 < len(cmd_tokens):
+                    idx += 1  # a path — leave it to the boundary check
+            elif name in _SCRIPT_VALUE_FLAGS and not sep:
+                if idx + 1 < len(cmd_tokens):
+                    idx += 1
+            idx += 1
+            continue
+        if not script_given:
+            programs[idx] = token
+            script_given = True
+        idx += 1
+    return programs
+
+
+def _script_program_denial(base_command: str, program: str) -> Optional[str]:
+    """Return a reason if *program* executes a command or names a file."""
+    if base_command == "sed":
+        if _SED_EXEC_RE.search(program):
+            return (
+                "it uses a sed e/w/r command, which executes a shell command or "
+                "reads/writes a file the boundary check never sees"
+            )
+        return None
+    if _AWK_EXEC_RE.search(program):
+        return (
+            "it uses awk system()/command-pipe/redirect, which executes a shell "
+            "command or writes a file the boundary check never sees"
+        )
+    return None
+
+
 # Commands whose *explicit path flags* are boundary-checked, but whose
 # positional operands are not paths (``git commit -m "…"``, ``npm install pkg``,
 # ``poetry add pkg``). They are excluded from the OS sandbox by default (see
@@ -257,7 +357,7 @@ _WRAPPERS_WITH_NUMERIC_OPERAND: Set[str] = {"timeout", "nice", "ionice", "chrt"}
 _WRAPPER_OPERAND_FLAGS: dict[str, Set[str]] = {
     "sudo": {"-u", "-g", "-C", "-h", "-p", "-r", "-t", "-U", "-c"},
     "doas": {"-u", "-C"},
-    "env": {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"},
+    "env": {"-u", "--unset", "-C", "--chdir"},
     "xargs": {
         "-I",
         "-i",
@@ -280,37 +380,90 @@ _WRAPPER_OPERAND_FLAGS: dict[str, Set[str]] = {
     },
 }
 
+# Wrapper flags whose operand is a *shell command string*, not a value to drop.
+# ``env -S 'rm -rf /etc'`` executes the string; dropping flag and operand left
+# an empty chain, which the checker waved through as "nothing to validate".
+# Deny them outright, exactly as ``_INLINE_CODE_FLAGS`` does for interpreters.
+_WRAPPER_CODE_STRING_FLAGS: dict[str, Set[str]] = {
+    "env": {"-S", "--split-string"},
+}
 
-def _strip_launcher_wrappers(cmd_tokens: list[str]) -> list[str]:
+# Wrapper flags whose operand is a real filesystem path: ``xargs -a FILE`` reads
+# FILE. It was being dropped unchecked, so ``xargs -a /etc/shadow …`` read
+# outside the root without tripping any check. Boundary-check it before
+# dropping it from the command position.
+_WRAPPER_PATH_OPERAND_FLAGS: dict[str, Set[str]] = {
+    "xargs": {"-a", "--arg-file"},
+}
+
+
+class _StrippedCommand(NamedTuple):
+    """Result of :func:`_strip_launcher_wrappers`."""
+
+    tokens: list[str]
+    denial: Optional[str]
+    path_operands: list[str]
+
+
+def _strip_launcher_wrappers(cmd_tokens: list[str]) -> _StrippedCommand:
     """Strip leading launcher wrappers (and their own flags/operands).
 
     Handles chained wrappers (``nohup timeout 5 nice -n 5 rm -rf /etc``) by
-    looping until the leading token is no longer a recognized wrapper, so the
-    returned list begins with the command that actually runs.
+    looping until the leading token is no longer a recognized wrapper, so
+    ``tokens`` begins with the command that actually runs.
+
+    A wrapper's own operands are not all inert: ``denial`` is set when one of
+    them is a shell command string the checker cannot analyze, and
+    ``path_operands`` collects the ones that name a file, for the caller to
+    boundary-check.
     """
+    path_operands: list[str] = []
     while cmd_tokens and Path(cmd_tokens[0]).name in _LAUNCHER_WRAPPERS:
         wrapper = Path(cmd_tokens[0]).name
+        code_flags = _WRAPPER_CODE_STRING_FLAGS.get(wrapper, set())
+        path_flags = _WRAPPER_PATH_OPERAND_FLAGS.get(wrapper, set())
+        operand_flags = _WRAPPER_OPERAND_FLAGS.get(wrapper, set())
         cmd_tokens = cmd_tokens[1:]
         # Skip the wrapper's own option flags (``-n``, ``-c2``, ``-f``, …) and
         # any standalone value that follows a separated flag (``-n 10``).
         while cmd_tokens and cmd_tokens[0].startswith("-"):
             flag = cmd_tokens[0]
             cmd_tokens = cmd_tokens[1:]
+            name, sep, inline = flag.partition("=")
+            # A short flag may carry its value in the same token
+            # (``-S'rm -rf /'``, ``-a/etc/shadow``); normalise that form.
+            if name not in code_flags | path_flags and len(flag) > 2:
+                for short in code_flags | path_flags:
+                    if len(short) == 2 and flag.startswith(short):
+                        name, sep, inline = short, "=", flag[2:]
+                        break
+
+            if name in code_flags:
+                return _StrippedCommand(
+                    [],
+                    f"Inline-code execution via '{wrapper} {name}' cannot be "
+                    "validated against the directory boundary and is not allowed",
+                    path_operands,
+                )
+
+            if name in path_flags or name in operand_flags:
+                if sep:
+                    value: Optional[str] = inline
+                elif cmd_tokens and not cmd_tokens[0].startswith("-"):
+                    value = cmd_tokens[0]
+                    cmd_tokens = cmd_tokens[1:]
+                else:
+                    value = None
+                if value and name in path_flags:
+                    path_operands.append(value)
+                continue
+
             # A separated numeric/value operand (``-n 10``, ``-c 2``) is the
             # flag's argument, not the command — drop it too. Bundled forms
             # (``-c2``) carry the value in the same token and need no extra skip.
             if (
                 wrapper in _WRAPPERS_WITH_NUMERIC_OPERAND
                 and flag in {"-n", "-c", "-p", "-i", "-r", "-b", "-k", "-s"}
-                and cmd_tokens
-                and not cmd_tokens[0].startswith("-")
-            ):
-                cmd_tokens = cmd_tokens[1:]
-            # For non-numeric wrappers (``sudo -u user cmd``), drop the operand
-            # that follows an argument-taking flag so the *wrapped* command — not
-            # the flag's value — becomes the base command.
-            elif (
-                flag in _WRAPPER_OPERAND_FLAGS.get(wrapper, set())
                 and cmd_tokens
                 and not cmd_tokens[0].startswith("-")
             ):
@@ -323,7 +476,7 @@ def _strip_launcher_wrappers(cmd_tokens: list[str]) -> list[str]:
             and re.match(r"^\d+(\.\d+)?[a-zA-Z]?$", cmd_tokens[0])
         ):
             cmd_tokens = cmd_tokens[1:]
-    return cmd_tokens
+    return _StrippedCommand(cmd_tokens, None, path_operands)
 
 
 # Bash command separators
@@ -601,7 +754,24 @@ def check_bash_directory_boundary(
         # Strip launcher wrappers (``nohup``, ``timeout 5``, ``sudo``, …) so the
         # wrapped command (``rm``/``cat`` in ``nohup rm -rf /etc``) is the one we
         # classify and path-check, rather than the always-unknown wrapper.
-        cmd_tokens = _strip_launcher_wrappers(cmd_tokens)
+        stripped = _strip_launcher_wrappers(cmd_tokens)
+        if stripped.denial:
+            return False, stripped.denial
+        # A wrapper operand that names a file (``xargs -a FILE``) is a real path
+        # read by the wrapper itself, so it gets the same checks as any other.
+        for operand in stripped.path_operands:
+            if _path_escapes(operand):
+                return False, (
+                    f"Directory boundary violation: '{operand}' is outside "
+                    f"approved directory '{resolved_approved}'"
+                )
+            secret_reason = _secret_reason(operand)
+            if secret_reason:
+                return False, (
+                    f"Directory boundary violation: '{operand}' is a secret "
+                    f"file ({secret_reason})"
+                )
+        cmd_tokens = stripped.tokens
         if not cmd_tokens:
             continue
         # A wrapper may be immediately followed by another ``VAR=value`` (e.g.
@@ -695,6 +865,21 @@ def check_bash_directory_boundary(
                         "and is not allowed"
                     )
 
+        # awk/sed take a *program*, not a path, as their positional operand.
+        # Deny the constructs inside it that execute a shell command or name a
+        # file, and remember which tokens are program text so the boundary loop
+        # below skips them (``sed '/^foo/d'`` is a script, not an absolute path).
+        script_programs: dict[int, str] = {}
+        if base_command in _SCRIPT_PROGRAM_COMMANDS:
+            script_programs = _script_program_operands(cmd_tokens)
+            for program in script_programs.values():
+                reason = _script_program_denial(base_command, program)
+                if reason:
+                    return False, (
+                        f"'{base_command}' program '{program}' is not allowed: "
+                        f"{reason}"
+                    )
+
         # Check each argument for paths outside the boundary
         path_flags = _PATH_BEARING_FLAGS.get(base_command, {})
         seen_double_dash = False
@@ -703,7 +888,10 @@ def check_bash_directory_boundary(
         path_value: Optional[str]
         while idx < len(rest_tokens):
             token = rest_tokens[idx]
+            token_index = idx + 1
             idx += 1
+            if token_index in script_programs:
+                continue
             # For flag-path-only tooling the positional operands are subcommands,
             # package names and commit messages, not paths — checking them would
             # deny ``git commit -m "/etc/hosts: fix"``. Only the directory flags

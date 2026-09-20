@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,6 +13,20 @@ from src.config.settings import Settings
 from src.exceptions import SecurityError
 
 logger = logging.getLogger(__name__)
+
+# Turn off core.quotePath for every invocation. With it on (git's default),
+# non-ASCII paths come back C-quoted ("\320\244\320\260\320\271\320\273"), so
+# status and diff showed users mangled filenames that matched nothing on disk.
+# Passing it through GIT_CONFIG_* rather than "git -c ..." keeps the command
+# array — and therefore the SAFE_COMMANDS/DANGEROUS_PATTERNS checks below —
+# unchanged. Git before 2.31 ignores these variables, i.e. degrades to today's
+# behaviour rather than failing.
+_GIT_ENV = {
+    **os.environ,
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "core.quotePath",
+    "GIT_CONFIG_VALUE_0": "false",
+}
 
 
 class GitError(Exception):
@@ -87,7 +102,10 @@ class GitIntegration:
             settings: Application settings
         """
         self.settings = settings
-        self.approved_dir = Path(settings.approved_directory)
+        # Resolved once: the boundary check below compares against a resolved
+        # cwd, so a relative or symlinked APPROVED_DIRECTORY would otherwise
+        # never match (SecurityValidator resolves both sides too).
+        self.approved_dir = Path(settings.approved_directory).resolve()
 
     async def execute_git_command(
         self, command: List[str], cwd: Path
@@ -121,10 +139,10 @@ class GitIntegration:
         # Validate working directory
         try:
             cwd = cwd.resolve()
-            if not cwd.is_relative_to(self.approved_dir):
-                raise SecurityError("Repository outside approved directory")
         except Exception:
             raise SecurityError("Invalid repository path")
+        if not cwd.is_relative_to(self.approved_dir):
+            raise SecurityError("Repository outside approved directory")
 
         # Execute command
         process = None
@@ -132,6 +150,7 @@ class GitIntegration:
             process = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=cwd,
+                env=_GIT_ENV,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

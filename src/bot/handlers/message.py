@@ -465,8 +465,11 @@ async def handle_text_message(
                 force_new=force_new,
             )
 
-            # New session created successfully — clear the one-shot flag
-            if force_new:
+            # Clear the one-shot flag only on a run the SDK did not flag as an
+            # error — the agentic path (_run_and_format) deliberately keeps it
+            # set on a soft error so the retry after a failed first message
+            # since /new also starts fresh instead of resuming a broken session.
+            if force_new and not claude_response.is_error:
                 context.user_data["force_new_session"] = False
 
             # Update session ID
@@ -791,14 +794,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         file_size=document.file_size,
     )
 
+    # ``file_name`` is optional in Telegram (None for nameless uploads) and is
+    # attacker-controlled. The placeholder keeps a literal "None" out of the
+    # prompt we build for Claude; ``escape_html`` keeps a name containing
+    # ``<``/``>``/``&`` from breaking the HTML markup of every message below —
+    # Telegram answers 400 to invalid markup, so the upload failed with a
+    # generic "Error processing file" instead of being handled.
+    file_name = document.file_name or "document"
+    safe_file_name = escape_html(file_name)
+
     try:
-        # Validate filename using security validator. ``file_name`` is optional
-        # in Telegram and may be None for nameless uploads — fall back to a
-        # placeholder so the typed validator never receives None.
+        # Validate filename using security validator.
         if security_validator:
-            valid, error = security_validator.validate_filename(
-                document.file_name or "document"
-            )
+            valid, error = security_validator.validate_filename(file_name)
             if not valid:
                 await update.message.reply_text(
                     f"❌ <b>File Upload Rejected</b>\n\n{escape_html(error)}",
@@ -837,7 +845,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.chat.send_action("upload_document")
 
         progress_msg = await update.message.reply_text(
-            f"📄 Processing file: <code>{document.file_name}</code>...",
+            f"📄 Processing file: <code>{safe_file_name}</code>...",
             parse_mode="HTML",
         )
 
@@ -857,7 +865,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
                 # Update progress message with file type info
                 await progress_msg.edit_text(
-                    f"📄 Processing {processed_file.type} file: <code>{document.file_name}</code>...",
+                    f"📄 Processing {escape_html(processed_file.type)} file: "
+                    f"<code>{safe_file_name}</code>...",
                     parse_mode="HTML",
                 )
 
@@ -920,7 +929,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 )
                 fence = "`" * max(3, longest_run + 1)
                 prompt = (
-                    f"{caption}\n\n**File:** `{document.file_name}`\n\n"
+                    f"{caption}\n\n**File:** `{file_name}`\n\n"
                     f"{fence}\n{content}\n{fence}"
                 )
 
@@ -1018,10 +1027,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     redact_secrets(claude_response.content or "")
                 )
 
-            # Delete progress message
-            await claude_progress_msg.delete()
-
-            # Send responses
+            # Send responses first, then drop the progress message. Deleting it
+            # up front left the except below editing an already-deleted message,
+            # which raised inside the handler, swallowed the original error and
+            # surfaced as the generic "Error processing file".
             for i, message in enumerate(formatted_messages):
                 await update.message.reply_text(
                     message.text,
@@ -1032,6 +1041,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
                 if i < len(formatted_messages) - 1:
                     await asyncio.sleep(0.5)
+
+            try:
+                await claude_progress_msg.delete()
+            except Exception as delete_error:
+                logger.debug(
+                    "Failed to delete progress message", error=str(delete_error)
+                )
 
             # Log successful file processing (only after responses are sent —
             # a Claude failure must not be audited as a success).
@@ -1045,9 +1061,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 )
 
         except Exception as e:
-            await claude_progress_msg.edit_text(
-                _format_error_message(e), parse_mode="HTML"
-            )
+            # The progress message may already be gone (deleted above); fall
+            # back to a fresh reply so the error still reaches the user.
+            try:
+                await claude_progress_msg.edit_text(
+                    _format_error_message(e), parse_mode="HTML"
+                )
+            except Exception:
+                await update.message.reply_text(
+                    _format_error_message(e), parse_mode="HTML"
+                )
             logger.error("Claude file processing failed", error=str(e), user_id=user_id)
 
             # Audit the failed Claude processing.
@@ -1099,6 +1122,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     image_handler = features.get_image_handler() if features else None
 
     if image_handler:
+        # Bound before the try so the outer except can clean it up: a failure in
+        # process_image left "📸 Processing image..." hanging in the chat forever.
+        progress_msg = None
         try:
             # Send processing indicator
             progress_msg = await update.message.reply_text(
@@ -1115,6 +1141,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
             # Delete progress message
             await progress_msg.delete()
+            progress_msg = None
 
             # Create Claude progress message
             claude_progress_msg = await update.message.reply_text(
@@ -1227,6 +1254,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         except Exception as e:
             logger.error("Image processing failed", error=str(e), user_id=user_id)
+            if progress_msg:
+                try:
+                    await progress_msg.delete()
+                except Exception as delete_error:
+                    logger.debug(
+                        "Failed to delete progress message", error=str(delete_error)
+                    )
             await update.message.reply_text(
                 _format_error_message(e),
                 parse_mode="HTML",
@@ -1267,6 +1301,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             parse_mode="HTML",
         )
         return
+
+    # Bound before the try so the outer except can clean it up: a failure in
+    # process_voice_message left "🎙️ Transcribing..." hanging in the chat.
+    progress_msg = None
 
     try:
         progress_msg = await update.message.reply_text(
@@ -1352,8 +1390,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     redact_secrets(claude_response.content or "")
                 )
 
-            await progress_msg.delete()
-
+            # Responses first, then drop the progress message: deleting it up
+            # front left the except below editing a message that no longer
+            # exists, masking the real error.
             for i, message in enumerate(formatted_messages):
                 await update.message.reply_text(
                     message.text,
@@ -1364,8 +1403,23 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 if i < len(formatted_messages) - 1:
                     await asyncio.sleep(0.5)
 
+            try:
+                await progress_msg.delete()
+            except Exception as delete_error:
+                logger.debug(
+                    "Failed to delete progress message", error=str(delete_error)
+                )
+            progress_msg = None
+
         except Exception as e:
-            await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
+            try:
+                await progress_msg.edit_text(
+                    _format_error_message(e), parse_mode="HTML"
+                )
+            except Exception:
+                await update.message.reply_text(
+                    _format_error_message(e), parse_mode="HTML"
+                )
             logger.error(
                 "Claude voice processing failed", error=str(e), user_id=user_id
             )
@@ -1376,6 +1430,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     except Exception as e:
         logger.error("Voice processing failed", error=str(e), user_id=user_id)
+        if progress_msg:
+            try:
+                await progress_msg.delete()
+            except Exception as delete_error:
+                logger.debug(
+                    "Failed to delete progress message", error=str(delete_error)
+                )
         await update.message.reply_text(
             _format_error_message(e),
             parse_mode="HTML",

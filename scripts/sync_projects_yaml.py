@@ -203,11 +203,14 @@ def _write_config(config_path: Path, payload: dict, approved_dir: Path) -> None:
     would let a config this script considers fine but the loader rejects (or a
     half-written file, if the process dies mid-dump) become the config the bot
     fails to start on.
+
+    The candidate is validated unconditionally — including an empty project
+    list, which the loader rejects outright. Skipping validation for that case
+    was exactly how ``--prune`` could write a config the bot cannot start on.
     """
 
     def _validate(candidate: Path) -> None:
-        if payload["projects"]:
-            load_project_registry(candidate, approved_dir)
+        load_project_registry(candidate, approved_dir)
 
     write_yaml_atomic(config_path, payload, validate=_validate)
 

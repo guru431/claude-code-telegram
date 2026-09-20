@@ -1786,7 +1786,9 @@ class MessageOrchestrator:
                 )
                 fence = "`" * max(3, longest_run + 1)
                 prompt = (
-                    f"{caption}\n\n**File:** `{document.file_name}`\n\n"
+                    # ``file_name`` is optional in Telegram; without the fallback
+                    # a nameless upload put a literal "None" in Claude's prompt.
+                    f"{caption}\n\n**File:** `{document.file_name or 'document'}`\n\n"
                     f"{fence}\n{content}\n{fence}"
                 )
             except UnicodeDecodeError:

@@ -28,6 +28,12 @@ from ..config.settings import Settings
 
 logger = structlog.get_logger()
 
+# Opening words of the cost-limit refusal from ``check_rate_limit``. The
+# rate-limit middleware tells a cost refusal from a request refusal by this
+# prefix in order to audit the right numbers; keeping it here means rewording
+# the message cannot silently start filing cost overruns as request overruns.
+COST_LIMIT_MESSAGE_PREFIX = "Cost limit exceeded"
+
 
 @dataclass
 class RateLimitBucket:
@@ -107,20 +113,30 @@ class CostReservation:
     ``amount`` is the estimate currently counted against the user's budget.
     A daily cost reset zeroes it (the tracker it was charged to is gone) so
     settling later cannot drive the fresh window negative.
+
+    ``released`` marks a hold whose estimate has already been backed out by the
+    stale sweep. The reservation itself stays around so a run that outlived
+    ``RESERVATION_MAX_AGE`` still records its real cost when it finally settles.
     """
 
     id: str
     user_id: int
     amount: float
     created_at: datetime
+    released: bool = False
 
 
 class RateLimiter:
     """Main rate limiting system with request and cost-based limits."""
 
-    # An unsettled reservation is a bug in the caller (a missing ``finally``).
-    # Sweep it after this long so a leaked hold cannot block a user forever.
+    # A hold older than this stops counting against the budget so one long (or
+    # leaked) run cannot block a user forever. The reservation is kept, not
+    # dropped — see ``_sweep_stale_reservations``.
     RESERVATION_MAX_AGE = timedelta(hours=1)
+
+    # After this long no settle is coming (the caller's ``finally`` never ran),
+    # so the bookkeeping entry itself is discarded.
+    RESERVATION_ABANDON_AGE = timedelta(hours=24)
 
     # Fraction of the daily budget at which the user gets one heads-up.
     BUDGET_WARN_FRACTION = 0.8
@@ -373,27 +389,42 @@ class RateLimiter:
         )
 
     def _sweep_stale_reservations(self, user_id: int) -> None:
-        """Release this user's holds that were never settled (caller bug)."""
+        """Release this user's holds that outlived ``RESERVATION_MAX_AGE``.
+
+        The hold's estimate is backed out of the tracker, but the reservation
+        entry is kept (``released``, amount zeroed) exactly as the daily reset
+        does: a Claude run *can* legitimately take longer than an hour, and
+        dropping its id here meant its later ``settle_reservation`` found
+        nothing and the run's real cost was never charged at all. Entries are
+        finally discarded after ``RESERVATION_ABANDON_AGE``, by which point no
+        settle is coming.
+        """
         now = datetime.now(UTC)
-        stale = [
-            rid
-            for rid in self.user_reservations.get(user_id, set())
-            if rid in self.reservations
-            and now - self.reservations[rid].created_at > self.RESERVATION_MAX_AGE
-        ]
-        for rid in stale:
-            reservation = self.reservations.pop(rid)
-            self.user_reservations[user_id].discard(rid)
+        for rid in list(self.user_reservations.get(user_id, set())):
+            reservation = self.reservations.get(rid)
+            if reservation is None:
+                self.user_reservations[user_id].discard(rid)
+                continue
+            age = now - reservation.created_at
+            if age > self.RESERVATION_ABANDON_AGE:
+                self.reservations.pop(rid, None)
+                self.user_reservations[user_id].discard(rid)
+                continue
+            if reservation.released or age <= self.RESERVATION_MAX_AGE:
+                continue
             self.cost_tracker[user_id] = max(
                 0.0, self.cost_tracker[user_id] - reservation.amount
             )
             logger.warning(
-                "Cost reservation expired unsettled",
+                "Cost reservation held past its budget window; releasing the "
+                "estimate but keeping the hold so a late settle still charges",
                 user_id=user_id,
                 reservation_id=rid,
                 amount=reservation.amount,
-                age_seconds=(now - reservation.created_at).total_seconds(),
+                age_seconds=age.total_seconds(),
             )
+            reservation.amount = 0.0
+            reservation.released = True
 
     def _drop_user_reservations(self, user_id: int) -> None:
         """Forget a user's holds entirely (cleanup / admin reset)."""
@@ -437,7 +468,7 @@ class RateLimiter:
         if current_cost + cost > limit:
             remaining = max(0, limit - current_cost)
             message = (
-                f"Cost limit exceeded. Remaining budget: ${remaining:.2f}. "
+                f"{COST_LIMIT_MESSAGE_PREFIX}. Remaining budget: ${remaining:.2f}. "
                 f"Current usage: ${current_cost:.2f}/"
                 f"${limit:.2f}"
             )
@@ -575,9 +606,21 @@ class RateLimiter:
         mutated here (``get_status``/``_effective_cost`` compute values on
         the fly), so it is safe to call without holding ``self.locks``.
         """
-        # Get request bucket status
-        bucket = self._get_or_create_bucket(user_id)
-        bucket_status = bucket.get_status()
+        # Get request bucket status. Read-only lookup on purpose: creating the
+        # bucket here would let status polling for arbitrary (or nonexistent)
+        # user ids grow ``request_buckets`` without bound — ``last_update`` is
+        # fresh on creation, so ``cleanup_inactive_users`` never reclaims them.
+        bucket = self.request_buckets.get(user_id)
+        if bucket is not None:
+            bucket_status = bucket.get_status()
+        else:
+            burst = float(self.config.rate_limit_burst)
+            bucket_status = {
+                "capacity": burst,
+                "tokens": burst,
+                "utilization": 0.0,
+                "refill_rate": self.refill_rate,
+            }
 
         # Get cost status (computed without mutating the tracker)
         current_cost, effective_reset = self._effective_cost(user_id)

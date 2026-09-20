@@ -97,6 +97,6 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
 
-[tool.flake8]
-max-line-length = 88
-extend-ignore = ["E203", "W503", "E501"]
+# flake8 does not read pyproject.toml without a plugin, so its settings live in
+# setup.cfg. A [tool.flake8] section here would be silently ignored and would
+# only drift away from the one flake8 actually reads.

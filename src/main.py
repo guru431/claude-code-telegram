@@ -5,6 +5,7 @@ import asyncio
 import logging
 import signal
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -211,7 +212,9 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     # Create security components
     providers = _build_auth_providers(config)
 
-    auth_manager = AuthenticationManager(providers)
+    auth_manager = AuthenticationManager(
+        providers, session_timeout=timedelta(hours=config.session_timeout_hours)
+    )
     security_validator = SecurityValidator(
         config.approved_directory,
         disable_security_patterns=config.disable_security_patterns,

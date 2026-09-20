@@ -111,7 +111,10 @@ class SecurityValidator:
         ".cfg",
         ".conf",
         ".properties",
-        ".env.example",
+        # No ".env.example" here: it is not a suffix (Path.suffix gives
+        # ".example"), and the hidden-file check below rejects any name starting
+        # with "." that is not in ALLOWED_HIDDEN_FILES. Listing it only read as
+        # if such uploads were accepted.
         ".example",
         ".sample",
         ".dist",

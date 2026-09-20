@@ -121,11 +121,14 @@ async def security_middleware(
     # checks still apply to callbacks; only content validation is skipped here.
     is_callback = getattr(event, "callback_query", None) is not None
 
-    # Validate text content if present (classic mode only)
+    # Validate text content if present (classic mode only). A photo/document
+    # caption reaches Claude's prompt through the same path as plain text, so it
+    # gets the same checks — validating only ``text`` left captions as a bypass.
     message = event.effective_message
-    if message and message.text and not agentic_mode and not is_callback:
+    user_text = (message.text or message.caption) if message else None
+    if user_text and not agentic_mode and not is_callback:
         is_safe, violation_type = await validate_message_content(
-            message.text, security_validator, user_id, audit_logger
+            user_text, security_validator, user_id, audit_logger
         )
         if not is_safe:
             await message.reply_text(
@@ -156,7 +159,7 @@ async def security_middleware(
         "Security validation passed",
         user_id=user_id,
         username=username,
-        has_text=bool(message and message.text),
+        has_text=bool(user_text),
         has_document=bool(message and message.document),
     )
 
