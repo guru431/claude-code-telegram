@@ -307,8 +307,9 @@ async def run_application(app: Dict[str, Any]) -> int:
 
     Returns the desired process exit code: non-zero when the bot must be
     relaunched (a core task crashed, or /restart was requested), 0 on a clean
-    stop. The bot runs as a Windows Scheduled Task with restart-on-failure,
-    which only relaunches on a non-zero exit.
+    stop. The bot runs as a Windows Scheduled Task whose action wraps it in a
+    relaunch loop that exits on 0 and relaunches on anything else (the task's
+    own restart-on-failure only covers a failed launch, not a non-zero exit).
     """
     logger = structlog.get_logger()
     bot: ClaudeCodeBot = app["bot"]
@@ -637,7 +638,7 @@ async def run_application(app: Dict[str, Any]) -> int:
 
         # Decide the process exit code. A clean stop (SIGINT/SIGTERM) exits 0
         # and the Scheduled Task stays down; a crashed core task or an explicit
-        # /restart exits non-zero so restart-on-failure relaunches the bot
+        # /restart exits non-zero so the task's relaunch loop starts the bot again
         # instead of leaving it dead until the next reboot.
         #
         # The restart intent comes from the flag ``restart_command`` sets, not
