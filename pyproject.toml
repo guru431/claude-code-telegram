@@ -63,6 +63,7 @@ pytest = "^8.4.0"
 pytest-asyncio = "^1.0.0"
 pytest-cov = "^6.1.1"
 pytest-mock = "^3.14.1"
+pytest-timeout = "^2.4.0"
 black = "^25.1.0"
 isort = "^6.0.1"
 flake8 = "^7.2.0"
@@ -85,6 +86,8 @@ python_files = "test_*.py"
 # (`pytest --cov=src --cov-report=term-missing`), а не в каждом прогоне: оно
 # тормозит набор и на каждый запуск переписывает htmlcov/.
 addopts = "-m 'not integration and not manual'"
+# pytest-timeout: зависший тест падает за 30 с со стеком, а не держит прогон
+timeout = 30
 markers = [
     "integration: требует сети, реального Telegram API или живого Claude CLI",
     "manual: запускается руками, в свипе не участвует",
