@@ -209,7 +209,11 @@ def discover_new_projects(
     existing_slugs: Set[str] = set()
     existing_names: Set[str] = set()
 
-    for proj in existing_projects:
+    for idx, proj in enumerate(existing_projects):
+        # A hand-edited entry can be a bare string; fail with the same message
+        # load_project_registry gives instead of an AttributeError on .get().
+        if not isinstance(proj, dict):
+            raise ValueError(f"Project entry at index {idx} must be an object")
         p = str(proj.get("path", "")).strip()
         if p:
             key = path_dedupe_key(approved_root, p)

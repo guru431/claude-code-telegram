@@ -130,7 +130,20 @@ class ProjectThreadManager:
                 active_project_slugs=active_slugs,
             )
             for stale in stale_mappings:
-                await self._retire_stale_mapping(bot, stale, result)
+                # Per-item isolation like the project loop above: one failing
+                # set_active must not abort the rest of the run.
+                try:
+                    await self._retire_stale_mapping(bot, stale, result)
+                except PrivateTopicsUnavailableError:
+                    raise
+                except Exception as e:
+                    result.failed += 1
+                    logger.error(
+                        "Failed to retire stale project topic",
+                        project_slug=stale.project_slug,
+                        chat_id=chat_id,
+                        error=str(e),
+                    )
 
             return result
 
@@ -461,12 +474,15 @@ class ProjectThreadManager:
 
     @staticmethod
     def _is_private_topics_unavailable_error(error: TelegramError) -> bool:
-        """Return True for Telegram errors indicating topics are unavailable."""
+        """Return True for Telegram errors indicating topics are unavailable.
+
+        Chat-level markers only. Per-topic errors (``topic_closed``,
+        ``topic deleted``) belong to ``_is_topic_unusable_error``: matching
+        them here aborted the whole sync for one dead topic.
+        """
         text = str(error).lower()
         markers = [
             "topics are not enabled",
-            "topic_closed",
-            "topic deleted",
             "forum topics are disabled",
             "direct messages topic",
             "chat is not a forum",

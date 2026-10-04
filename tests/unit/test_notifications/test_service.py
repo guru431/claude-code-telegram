@@ -2,11 +2,12 @@
 
 import asyncio
 from datetime import timedelta
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from telegram.error import RetryAfter
 
+import src.notifications.service as service_module
 from src.events.bus import EventBus
 from src.events.types import AgentResponseEvent
 from src.notifications.service import (
@@ -202,6 +203,31 @@ class TestNotificationService:
         await stop_task
 
         assert completed == [1]
+
+    async def test_stop_timeout_logs_dropped_notifications(
+        self, service: NotificationService, mock_bot: AsyncMock, monkeypatch
+    ) -> None:
+        """Regression: a drain cut by the stop timeout lost messages silently."""
+        monkeypatch.setattr(service_module, "_STOP_TIMEOUT_SECONDS", 0.05)
+        log = MagicMock()
+        monkeypatch.setattr(service_module, "logger", log)
+        started = asyncio.Event()
+
+        async def hanging_send(**kwargs: object) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        mock_bot.send_message = AsyncMock(side_effect=hanging_send)
+
+        await service.start()
+        for i in range(3):
+            await service.handle_response(AgentResponseEvent(chat_id=100 + i, text="x"))
+        await started.wait()
+
+        await service.stop()
+
+        log.error.assert_called_once()
+        assert log.error.call_args.kwargs["dropped_queued"] == 2
 
     async def test_ignores_non_response_events(
         self, service: NotificationService

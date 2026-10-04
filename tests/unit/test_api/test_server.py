@@ -4,6 +4,7 @@ import hashlib
 import hmac
 from unittest.mock import AsyncMock
 
+import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
@@ -168,6 +169,36 @@ class TestWebhookAPI:
         )
 
         assert response.status_code == 401
+
+    @pytest.mark.parametrize(
+        "body, expected",
+        [
+            (b"[1, 2]", {"payload": [1, 2]}),
+            (b'"text"', {"payload": "text"}),
+            (b"42", {"payload": 42}),
+            (b"null", {"payload": None}),
+            (b'{"a": 1}', {"a": 1}),
+        ],
+    )
+    def test_non_object_json_is_wrapped_into_dict(self, body, expected) -> None:
+        """Regression: valid non-object JSON reached handlers as a non-dict payload."""
+        bus = EventBus()
+        bus.publish = AsyncMock()  # type: ignore[method-assign]
+        settings = make_settings(webhook_api_secret="my-api-secret")
+        client = TestClient(create_api_app(bus, settings))
+
+        response = client.post(
+            "/webhooks/custom",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer my-api-secret",
+            },
+        )
+
+        assert response.status_code == 200
+        event = bus.publish.await_args.args[0]
+        assert event.payload == expected
 
 
 async def test_recover_unprocessed_webhooks_replays_then_idempotent(

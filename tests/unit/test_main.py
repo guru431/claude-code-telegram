@@ -1,9 +1,10 @@
 """Tests for application wiring in ``src.main``."""
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from src.main import _sync_discovered_project_topics
+from src.main import _sync_discovered_project_topics, apply_configured_log_level
 
 
 class _FakeLog:
@@ -126,3 +127,32 @@ class TestSyncDiscoveredProjectTopics:
 
         manager.sync_topics.assert_not_awaited()
         assert any("no chat id to sync" in event for event, _ in log.warnings)
+
+
+class TestApplyConfiguredLogLevel:
+    """LOG_LEVEL must reach the root logger once the config is loaded."""
+
+    def _with_root_level(self, level, fn):
+        root = logging.getLogger()
+        saved = root.level
+        root.setLevel(level)
+        try:
+            fn()
+            return root.level
+        finally:
+            root.setLevel(saved)
+
+    def test_log_level_applied(self):
+        """Regression: LOG_LEVEL was validated but never used."""
+        config = SimpleNamespace(log_level="WARNING")
+        level = self._with_root_level(
+            logging.INFO, lambda: apply_configured_log_level(config, False)
+        )
+        assert level == logging.WARNING
+
+    def test_debug_flag_overrides_log_level(self):
+        config = SimpleNamespace(log_level="ERROR")
+        level = self._with_root_level(
+            logging.DEBUG, lambda: apply_configured_log_level(config, True)
+        )
+        assert level == logging.DEBUG

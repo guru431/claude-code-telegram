@@ -61,16 +61,7 @@ class FeatureFlags:
     @property
     def voice_messages_enabled(self) -> bool:
         """Check if voice message transcription is enabled."""
-        if not self.settings.enable_voice_messages:
-            return False
-        # Truthy check on the string value, matching FeatureRegistry: an empty
-        # SecretStr is a missing key, and reporting the feature as enabled would
-        # only surface later as "API key is not configured" at first use.
-        if self.settings.voice_provider == "openai":
-            return bool(self.settings.openai_api_key_str) or bool(
-                self.settings.voice_base_url
-            )
-        return bool(self.settings.mistral_api_key_str)
+        return self.settings.voice_transcription_available
 
     @property
     def stream_drafts_enabled(self) -> bool:

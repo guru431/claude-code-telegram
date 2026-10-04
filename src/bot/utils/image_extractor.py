@@ -34,6 +34,8 @@ TELEGRAM_ANIMATION_EXTENSIONS = {".gif"}
 
 # Safety caps
 MAX_IMAGES_PER_RESPONSE = 10
+# Outbound cap: Telegram Bot API limit for sending a file as a document. Not
+# the inbound policy (Settings.max_file_upload_size_bytes caps user uploads).
 MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
 PHOTO_SIZE_LIMIT = 10 * 1024 * 1024  # 10 MB — Telegram photo API limit
 

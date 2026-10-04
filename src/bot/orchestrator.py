@@ -726,8 +726,15 @@ class MessageOrchestrator:
         lines: List[str] = []
 
         rate_limiter = context.bot_data.get("rate_limiter")
+        usage: Optional[Dict[str, Any]] = None
         if rate_limiter:
-            usage = rate_limiter.get_user_status(user_id).get("cost_usage", {})
+            # Guarded like agentic_status: a limiter failure must not take the
+            # spend history below down with it.
+            try:
+                usage = rate_limiter.get_user_status(user_id).get("cost_usage", {})
+            except Exception as exc:
+                logger.warning("Failed to read cost usage", error=str(exc))
+        if usage is not None:
             current = usage.get("current", 0.0)
             limit = usage.get("limit", 0.0)
             remaining = usage.get("remaining", 0.0)
@@ -2104,7 +2111,10 @@ class MessageOrchestrator:
         if args:
             # Switch to named repo
             target_name = args[0]
-            target_path = self._resolve_within_approved(target_name, base)
+            # resolve() + is_dir() stat the FS: keep them off the event loop.
+            target_path = await asyncio.to_thread(
+                self._resolve_within_approved, target_name, base
+            )
             if target_path is None:
                 await update.message.reply_text(
                     f"Directory not found: <code>{escape_html(target_name)}</code>",
@@ -2125,7 +2135,8 @@ class MessageOrchestrator:
                     session_id = existing.session_id
             context.user_data["claude_session_id"] = session_id
 
-            is_git = (target_path / ".git").is_dir()
+            # Off the event loop, like the listing below (slow/networked FS).
+            is_git = await asyncio.to_thread((target_path / ".git").is_dir)
             git_badge = " (git)" if is_git else ""
             session_badge = " · session resumed" if session_id else ""
 
@@ -2159,7 +2170,11 @@ class MessageOrchestrator:
         try:
             entries = await asyncio.to_thread(_scan_repos)
         except OSError as e:
-            await update.message.reply_text(f"Error reading workspace: {e}")
+            # The OSError text carries absolute host paths — log it only.
+            logger.error("Error reading workspace", error=str(e))
+            await update.message.reply_text(
+                "Error reading workspace. The details have been logged."
+            )
             return
 
         if not entries:
@@ -2289,10 +2304,18 @@ class MessageOrchestrator:
                     target_chat_ids=[update.effective_chat.id],
                     created_by=user_id,
                 )
-            except Exception as e:
+            except ValueError as e:
+                # CronTrigger.from_crontab's message names the bad field.
                 await update.message.reply_text(
                     f"Failed to add job: {escape_html(str(e))}",
                     parse_mode="HTML",
+                )
+                return
+            except Exception as e:
+                # Anything else (storage, scheduler) stays in the log.
+                logger.error("Failed to add scheduled job", error=str(e))
+                await update.message.reply_text(
+                    "Failed to add job. The details have been logged."
                 )
                 return
             await update.message.reply_text(
@@ -2428,8 +2451,9 @@ class MessageOrchestrator:
         data = query.data
         _, project_name = data.split(":", 1)
 
-        new_path = self._resolve_within_approved(
-            project_name, self._navigation_root(context)
+        # resolve() + is_dir() stat the FS: keep them off the event loop.
+        new_path = await asyncio.to_thread(
+            self._resolve_within_approved, project_name, self._navigation_root(context)
         )
 
         if new_path is None:
@@ -2452,7 +2476,8 @@ class MessageOrchestrator:
                 session_id = existing.session_id
         context.user_data["claude_session_id"] = session_id
 
-        is_git = (new_path / ".git").is_dir()
+        # Off the event loop, like the /repo listing (slow/networked FS).
+        is_git = await asyncio.to_thread((new_path / ".git").is_dir)
         git_badge = " (git)" if is_git else ""
         session_badge = " · session resumed" if session_id else ""
 

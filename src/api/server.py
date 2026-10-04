@@ -146,9 +146,15 @@ def create_api_app(
         # Parse JSON payload from the already-buffered body so we do not
         # re-read the request stream after signature verification.
         try:
-            payload: Dict[str, Any] = json.loads(body)
+            parsed = json.loads(body)
         except Exception:
-            payload = {"raw_body": body.decode("utf-8", errors="replace")[:5000]}
+            payload: Dict[str, Any] = {
+                "raw_body": body.decode("utf-8", errors="replace")[:5000]
+            }
+        else:
+            # Valid JSON that is not an object (array, string, number, null)
+            # is wrapped: handlers read the payload with .get().
+            payload = parsed if isinstance(parsed, dict) else {"payload": parsed}
 
         # Atomic dedupe: attempt INSERT first, only publish if new
         if db_manager and delivery_id:
@@ -275,6 +281,9 @@ async def _claim_and_replay(
             payload: Dict[str, Any] = json.loads(raw) if raw else {}
         except Exception:
             payload = {}
+        if not isinstance(payload, dict):
+            # Rows stored before non-object bodies were wrapped on receipt.
+            payload = {"payload": payload}
         event = WebhookEvent(
             provider=row_dict["provider"],
             event_type_name=row_dict["event_type"],

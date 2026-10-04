@@ -2,7 +2,9 @@
 
 import asyncio
 from dataclasses import dataclass
+from unittest.mock import MagicMock
 
+import src.events.bus as bus_module
 from src.events.bus import Event, EventBus
 
 
@@ -192,3 +194,27 @@ class TestEventBus:
         await stop_task
 
         assert len(received) == 1
+
+    async def test_stop_timeout_logs_dropped_events(self, monkeypatch) -> None:
+        """Regression: a drain cut by the stop timeout lost events silently."""
+        monkeypatch.setattr(bus_module, "_STOP_TIMEOUT_SECONDS", 0.05)
+        log = MagicMock()
+        monkeypatch.setattr(bus_module, "logger", log)
+        bus = EventBus()
+        started = asyncio.Event()
+
+        async def hanging_handler(event: Event) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        bus.subscribe(BusTestEvent, hanging_handler)
+        await bus.start()
+        for i in range(3):
+            await bus.publish(BusTestEvent(data=str(i)))
+        await started.wait()
+
+        await bus.stop()
+
+        log.error.assert_called_once()
+        # One event was in flight; the other two were still queued.
+        assert log.error.call_args.kwargs["dropped_queued"] == 2

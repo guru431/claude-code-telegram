@@ -17,6 +17,9 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+# Mirrors src.bot.utils.image_extractor.IMAGE_EXTENSIONS. Not imported: this
+# file runs as a standalone script (``python src/mcp/telegram_server.py``),
+# where ``src`` is not on sys.path. A unit test keeps the two in sync.
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 
 mcp = FastMCP("telegram")

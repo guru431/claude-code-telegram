@@ -36,6 +36,9 @@ EventHandler = Callable[[Event], Coroutine[Any, Any, None]]
 # A real Event instance so the typed queue accepts it; compared by identity.
 _SHUTDOWN: Event = Event(source="__shutdown_sentinel__")
 
+# How long stop() waits for the worker to finish the in-flight event and drain.
+_STOP_TIMEOUT_SECONDS = 30.0
+
 
 class EventBus:
     """Async event bus with typed subscriptions.
@@ -89,13 +92,16 @@ class EventBus:
         logger.info("Event bus started")
 
     async def stop(self) -> None:
-        """Stop processing events, finishing the in-flight event and backlog.
+        """Stop processing events, trying to finish the in-flight event and backlog.
 
         The worker is not cancelled up front: cancelling it while it is inside
         ``_dispatch`` would drop an event already taken off the queue. Instead
         we clear the running flag and wake the worker with a sentinel; it
-        finishes the current dispatch, drains the queue, and exits. Cancellation
-        is only a last-resort guard if a handler hangs past the timeout.
+        finishes the current dispatch, drains the queue, and exits.
+
+        The whole drain is bounded by ``_STOP_TIMEOUT_SECONDS``. Past it the
+        worker is cancelled: the in-flight event and whatever is still queued
+        are dropped, and the dropped count is logged as an error.
         """
         if not self._running:
             return
@@ -104,13 +110,22 @@ class EventBus:
         if task:
             self._queue.put_nowait(_SHUTDOWN)
             try:
-                await asyncio.wait_for(task, timeout=30.0)
+                await asyncio.wait_for(task, timeout=_STOP_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
+                dropped = 0
+                while not self._queue.empty():
+                    if self._queue.get_nowait() is not _SHUTDOWN:
+                        dropped += 1
+                logger.error(
+                    "Event bus stop timed out; in-flight and queued events dropped",
+                    timeout_seconds=_STOP_TIMEOUT_SECONDS,
+                    dropped_queued=dropped,
+                )
         logger.info("Event bus stopped")
 
     async def _process_events(self) -> None:

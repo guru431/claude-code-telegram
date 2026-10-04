@@ -128,6 +128,17 @@ class TestCostCommand:
         assert "Today:" in text
         assert "History is unavailable" in text
 
+    async def test_limiter_failure_does_not_break_the_reply(self, orchestrator):
+        """get_user_status raising must degrade like agentic_status, not abort."""
+        limiter = MagicMock()
+        limiter.get_user_status.side_effect = RuntimeError("limiter down")
+        update = _update()
+
+        await orchestrator.agentic_cost(update, _context(rate_limiter=limiter))
+
+        text = update.message.reply_text.await_args.args[0]
+        assert "Cost tracking is not available." in text
+
 
 class TestBudgetWarning:
     async def test_warns_once_when_crossing_the_threshold(self, settings):

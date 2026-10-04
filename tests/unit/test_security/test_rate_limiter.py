@@ -285,6 +285,34 @@ class TestRateLimiter:
         assert user_id not in rate_limiter.request_buckets
         assert user_id not in rate_limiter.cost_tracker
 
+    async def test_cleanup_keeps_lock_with_pending_waiter(self, rate_limiter):
+        """Between release() and the waiter's re-acquire ``locked()`` is False.
+
+        Regression: cleanup dropped the lock in that gap, so the woken waiter
+        ran under the orphaned lock while the next caller got a fresh one from
+        the defaultdict — two coroutines in one critical section.
+        """
+        import asyncio
+
+        user_id = 123
+        rate_limiter._get_or_create_bucket(user_id).last_update = datetime.now(
+            UTC
+        ) - timedelta(hours=25)
+
+        lock = rate_limiter.locks[user_id]
+        await lock.acquire()
+        waiter = asyncio.create_task(rate_limiter.reserve_cost(user_id, 0.1))
+        await asyncio.sleep(0)  # waiter is now queued on the lock
+        lock.release()
+        assert not lock.locked()  # the gap: waiter woken but not yet running
+
+        await rate_limiter.cleanup_inactive_users(timedelta(hours=24))
+
+        # The next caller must contend on the same lock as the waiter.
+        assert rate_limiter.locks[user_id] is lock
+        reservation_id, _ = await waiter
+        assert reservation_id is not None
+
     async def test_concurrent_access(self, rate_limiter):
         """Test concurrent access to rate limiter."""
         import asyncio

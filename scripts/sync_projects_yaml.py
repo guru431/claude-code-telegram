@@ -78,7 +78,11 @@ def sync(config_path: Path, approved_dir: Path, prune: bool = False) -> bool:
     # "Duplicate project path", taking the bot down on the next startup.
     by_key: dict[str, dict] = {}
     ordered_keys: list[str] = []
-    for entry in existing:
+    for idx, entry in enumerate(existing):
+        # A hand-edited entry can be a bare string; main() reports this
+        # ValueError instead of crashing with AttributeError on .get().
+        if not isinstance(entry, dict):
+            raise ValueError(f"Project entry at index {idx} must be an object")
         p = str(entry.get("path", "")).strip()
         if not p:
             continue

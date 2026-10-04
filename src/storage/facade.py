@@ -304,6 +304,9 @@ class Storage:
         rerun starts from a consistent state. Returns
         ``(tool_usage_purged, messages_purged)``.
         """
+        # 0 means "keep forever"; a ``-0 days`` cutoff would match every row.
+        if days <= 0:
+            return 0, 0
         cutoff = "datetime('now', '-' || ? || ' days')"
         async with self.db_manager.get_connection() as conn:
             try:

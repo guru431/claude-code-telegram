@@ -198,6 +198,19 @@ class TestSyncIsAdditive:
 
         assert config.read_text(encoding="utf-8") == original
 
+    def test_non_dict_entry_aborts_without_writing(
+        self, approved: Path, tmp_path: Path
+    ) -> None:
+        """Regression: a bare string entry crashed with AttributeError on .get()."""
+        config = tmp_path / "projects.yaml"
+        original = "projects:\n  - typo\n"
+        config.write_text(original, encoding="utf-8")
+
+        with pytest.raises(ValueError, match="index 0 must be an object"):
+            sync(config, approved)
+
+        assert config.read_text(encoding="utf-8") == original
+
     def test_no_changes_reports_false(self, approved: Path, tmp_path: Path) -> None:
         config = tmp_path / "projects.yaml"
         _write(config, [])

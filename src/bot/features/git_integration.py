@@ -283,9 +283,10 @@ class GitIntegration:
         command.extend(["--no-color", "--minimal"])
 
         if file_path:
-            # Validate file path
+            # Validate file path. Both sides resolved: a relative or symlinked
+            # repo_path would otherwise reject every legitimate file.
             file_path_obj = (repo_path / file_path).resolve()
-            if not file_path_obj.is_relative_to(repo_path):
+            if not file_path_obj.is_relative_to(repo_path.resolve()):
                 raise SecurityError("File path outside repository")
             # ``--`` ends option parsing so a dashed file name (e.g.
             # ``--output=...``) is treated as a pathspec, not a git flag.
@@ -324,9 +325,9 @@ class GitIntegration:
         Returns:
             List of commit information
         """
-        # Validate file path
+        # Validate file path (both sides resolved, as in get_diff)
         file_path_obj = (repo_path / file_path).resolve()
-        if not file_path_obj.is_relative_to(repo_path):
+        if not file_path_obj.is_relative_to(repo_path.resolve()):
             raise SecurityError("File path outside repository")
 
         # Get commit log with stats

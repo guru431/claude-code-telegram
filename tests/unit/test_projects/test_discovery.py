@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 from src.projects.discovery import (
@@ -304,3 +305,18 @@ class TestDiscoverNewProjects:
 
         new, total = discover_new_projects(approved, config)
         assert len(new) == 1
+
+    def test_non_dict_entry_raises_with_index(self, tmp_path: Path) -> None:
+        """Regression: a bare string entry crashed with AttributeError on .get()."""
+        approved = tmp_path / "projects"
+        approved.mkdir()
+        (approved / "alpha").mkdir()
+
+        config = tmp_path / "projects.yaml"
+        original = "projects:\n  - slug: a\n    name: A\n    path: alpha\n  - typo\n"
+        config.write_text(original, encoding="utf-8")
+
+        with pytest.raises(ValueError, match="index 1 must be an object"):
+            discover_new_projects(approved, config)
+
+        assert config.read_text(encoding="utf-8") == original

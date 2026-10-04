@@ -517,6 +517,64 @@ def test_voice_provider_validation_and_normalization(tmp_path):
     assert "voice_provider must be one of" in str(exc_info.value)
 
 
+@pytest.mark.parametrize(
+    "provider, extra, expected",
+    [
+        ("openai", {"openai_api_key": "sk-test"}, True),
+        # Self-hosted Whisper without auth: base_url alone is a valid setup.
+        ("openai", {"voice_base_url": "http://localhost:9000/v1"}, True),
+        ("openai", {}, False),
+        ("mistral", {"mistral_api_key": "m-test"}, True),
+        ("mistral", {"voice_base_url": "http://localhost:9000/v1"}, False),
+        (
+            "openai",
+            {"openai_api_key": "sk-test", "enable_voice_messages": False},
+            False,
+        ),
+    ],
+)
+def test_voice_flags_and_registry_agree(tmp_path, provider, extra, expected):
+    """Regression: flags said "enabled" for base_url-only, registry built nothing."""
+    from unittest.mock import MagicMock
+
+    from src.bot.features.registry import FeatureRegistry
+
+    project_dir = tmp_path / "projects"
+    project_dir.mkdir()
+    settings = Settings(
+        _env_file=None,
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(project_dir),
+        voice_provider=provider,
+        **extra,
+    )
+
+    assert FeatureFlags(settings).voice_messages_enabled is expected
+    registry = FeatureRegistry(settings, storage=MagicMock(), security=MagicMock())
+    assert registry.is_enabled("voice_handler") is expected
+
+
+def test_database_path_slices_prefix_like_database_manager(tmp_path):
+    """Only the leading ``sqlite:///`` is stripped, as DatabaseManager does."""
+    from src.storage.database import DatabaseManager
+
+    test_dir = tmp_path / "projects"
+    test_dir.mkdir()
+    url = "sqlite:///data/sqlite:///bot.db"
+    settings = Settings(
+        _env_file=None,
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(test_dir),
+        database_url=url,
+    )
+
+    parsed = DatabaseManager(url)._parse_database_url(url)
+    assert settings.database_path == Path(parsed).resolve()
+    assert settings.database_path == Path("data/sqlite:///bot.db").resolve()
+
+
 def test_voice_max_file_size_configuration(tmp_path):
     """Voice max file size should be configurable and validated."""
     project_dir = tmp_path / "projects"

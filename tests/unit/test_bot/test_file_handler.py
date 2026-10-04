@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from src.bot.features import file_handler as file_handler_module
 from src.bot.features.file_handler import (
     MAX_INLINE_CONTENT,
     FileHandler,
@@ -43,6 +44,23 @@ async def test_zip_with_directory_entries_extracts(
     assert "pkg" in result.prompt
     # Both real code files should be discoverable (dir entries skipped).
     assert result.metadata["code_files"] == 2
+
+
+def test_file_tree_is_cut_off_at_depth_limit(
+    handler: FileHandler, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """An arbitrarily deep archive must not recurse past the depth cap
+    (a ~1000-level path would otherwise raise RecursionError)."""
+    monkeypatch.setattr(file_handler_module, "MAX_FILE_TREE_DEPTH", 3)
+    deep = tmp_path.joinpath(*(f"d{i}" for i in range(6)))
+    deep.mkdir(parents=True)
+    (deep / "leaf.py").write_text("x = 1\n", encoding="utf-8")
+
+    tree = handler._build_file_tree(tmp_path)
+
+    assert "d2/" in tree
+    assert "d3" not in tree and "leaf.py" not in tree
+    assert "deeper levels omitted" in tree
 
 
 async def test_process_code_file_truncates(handler: FileHandler, tmp_path: Path):

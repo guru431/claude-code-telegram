@@ -37,6 +37,9 @@ MAX_RETRY_AFTER_SECONDS = 60.0
 # A real event instance so the typed queue accepts it; compared by identity.
 _SHUTDOWN: AgentResponseEvent = AgentResponseEvent(source="__shutdown_sentinel__")
 
+# How long stop() waits for the sender to finish the in-flight send and drain.
+_STOP_TIMEOUT_SECONDS = 30.0
+
 # Maps an event's ``parse_mode`` string to Telegram's ParseMode enum. ``None``
 # is plain text. An unrecognized value is rejected explicitly rather than being
 # silently downgraded to plain text (which would strip all formatting).
@@ -97,13 +100,17 @@ class NotificationService:
         logger.info("Notification service started")
 
     async def stop(self) -> None:
-        """Stop the sender, finishing the in-flight send and any backlog.
+        """Stop the sender, trying to finish the in-flight send and any backlog.
 
         The worker is not cancelled up front: cancelling it mid-send would drop
         a message already taken off the queue. We clear the running flag and
         wake the worker with a sentinel; it finishes the current send, drains
-        the queue, and exits. Cancellation is only a last-resort guard if a send
-        hangs past the timeout.
+        the queue, and exits.
+
+        The whole drain is bounded by ``_STOP_TIMEOUT_SECONDS`` (at ~1 msg/sec
+        per chat a large backlog does not fit). Past it the worker is
+        cancelled: the in-flight send and whatever is still queued are dropped,
+        and the dropped count is logged as an error.
         """
         if not self._running:
             return
@@ -112,13 +119,23 @@ class NotificationService:
         if task:
             self._send_queue.put_nowait(_SHUTDOWN)
             try:
-                await asyncio.wait_for(task, timeout=30.0)
+                await asyncio.wait_for(task, timeout=_STOP_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
+                dropped = 0
+                while not self._send_queue.empty():
+                    if self._send_queue.get_nowait() is not _SHUTDOWN:
+                        dropped += 1
+                logger.error(
+                    "Notification service stop timed out; "
+                    "in-flight and queued notifications dropped",
+                    timeout_seconds=_STOP_TIMEOUT_SECONDS,
+                    dropped_queued=dropped,
+                )
         logger.info("Notification service stopped")
 
     async def handle_response(self, event: Event) -> None:

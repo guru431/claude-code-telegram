@@ -522,6 +522,10 @@ class MessageRepository:
 
     async def purge_old_messages(self, days: int) -> int:
         """Delete messages older than ``days`` and return the count removed."""
+        # 0 means "keep forever" (Settings.data_retention_days); a cutoff of
+        # ``-0 days`` would instead match every row.
+        if days <= 0:
+            return 0
         async with self.db.get_connection() as conn:
             cursor = await conn.execute(
                 """
@@ -689,6 +693,10 @@ class ToolUsageRepository:
 
     async def purge_old_tool_usage(self, days: int) -> int:
         """Delete tool-usage rows older than ``days`` and return the count."""
+        # 0 means "keep forever" (Settings.data_retention_days); a cutoff of
+        # ``-0 days`` would instead match every row.
+        if days <= 0:
+            return 0
         async with self.db.get_connection() as conn:
             cursor = await conn.execute(
                 """
@@ -796,6 +804,10 @@ class AuditLogRepository:
 
     async def purge_old_audit_log(self, days: int) -> int:
         """Delete audit-log rows older than ``days`` and return the count."""
+        # 0 means "keep forever" (Settings.data_retention_days); a cutoff of
+        # ``-0 days`` would instead match every row.
+        if days <= 0:
+            return 0
         async with self.db.get_connection() as conn:
             cursor = await conn.execute(
                 """
@@ -1093,6 +1105,10 @@ class WebhookEventRepository:
 
         The webhook_events table records ingestion time in ``received_at``.
         """
+        # 0 means "keep forever" (Settings.data_retention_days); a cutoff of
+        # ``-0 days`` would instead match every row.
+        if days <= 0:
+            return 0
         async with self.db.get_connection() as conn:
             cursor = await conn.execute(
                 """

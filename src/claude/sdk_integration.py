@@ -599,6 +599,16 @@ class ClaudeSDKManager:
                     break  # success — exit retry loop
                 except asyncio.CancelledError:
                     if not interrupted:
+                        # External cancellation (e.g. bot shutdown): shield()
+                        # keeps run_task alive, so stop it and await its
+                        # teardown (client.disconnect) like the timeout branch,
+                        # then let the cancellation propagate. Nothing raised
+                        # by the teardown may replace the CancelledError.
+                        run_task.cancel()
+                        try:
+                            await run_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
                         raise
                     # Interrupt cancelled the task — wait for cleanup
                     try:

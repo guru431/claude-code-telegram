@@ -49,6 +49,9 @@ MAX_ARCHIVE_BYTES = 100 * 1024 * 1024
 # matching the fallback in handlers/message.py.
 MAX_INLINE_CONTENT = 50000
 
+# Directory levels shown in an archive's file tree before it is cut off.
+MAX_FILE_TREE_DEPTH = 50
+
 
 @dataclass
 class ProcessedFile:
@@ -521,8 +524,14 @@ class FileHandler:
             },
         )
 
-    def _build_file_tree(self, directory: Path, prefix: str = "") -> str:
+    def _build_file_tree(
+        self, directory: Path, prefix: str = "", depth: int = 0
+    ) -> str:
         """Build visual file tree"""
+        # An archive entry can nest far deeper than Python's recursion limit
+        # while staying within MAX_ARCHIVE_FILES; cut the tree off instead.
+        if depth >= MAX_FILE_TREE_DEPTH:
+            return f"{prefix}└── ... (deeper levels omitted)"
         items = sorted(directory.iterdir(), key=lambda x: (x.is_file(), x.name))
         tree_lines = []
 
@@ -534,7 +543,7 @@ class FileHandler:
                 tree_lines.append(f"{prefix}{current_prefix}{item.name}/")
                 # Recursive call with updated prefix
                 sub_prefix = prefix + ("    " if is_last else "│   ")
-                tree_lines.append(self._build_file_tree(item, sub_prefix))
+                tree_lines.append(self._build_file_tree(item, sub_prefix, depth + 1))
             else:
                 size = item.stat().st_size
                 tree_lines.append(

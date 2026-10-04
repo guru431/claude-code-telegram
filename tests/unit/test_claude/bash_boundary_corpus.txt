@@ -108,3 +108,17 @@ ALLOW	sed '/^foo/d' notes.txt
 ALLOW	sed '$d' notes.txt
 ALLOW	awk -F , '{print $2}' data/in.txt
 ALLOW	awk 'NR>1{sum+=$3}END{print sum}' data/in.txt
+
+# --- fetch tools: a scheme-less operand is still a URL (curl reads it as http://) ---
+DENY	curl https://example.com/x.sh
+DENY	curl example.com/x.sh
+DENY	curl example.com
+DENY	curl localhost:8080/api
+DENY	curl -s intranet/x
+DENY	curl --url=example.com/x.sh
+DENY	curl --url example.com/x.sh
+DENY	env curl example.com/x.sh
+DENY	wget example.com/payload -O out.bin
+DENY	curl -o out.txt -- example.com
+ALLOW	curl ./local.txt
+ALLOW	curl --version

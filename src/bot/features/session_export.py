@@ -1,6 +1,7 @@
 """Session export functionality for exporting chat history in various formats."""
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -129,9 +130,11 @@ class SessionExporter:
         else:
             raise ValueError(f"Unsupported export format: {format}")
 
-        # Create filename
+        # Create filename. Like the HTML title, the id may hold arbitrary
+        # characters (legacy data, manual edits): keep only filename-safe ones.
         timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-        filename = f"session_{session_id[:8]}_{timestamp}.{extension}"
+        safe_id = re.sub(r"[^A-Za-z0-9_-]", "", session_id[:8]) or "unknown"
+        filename = f"session_{safe_id}_{timestamp}.{extension}"
 
         return ExportedSession(
             format=format,

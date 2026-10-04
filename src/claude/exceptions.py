@@ -1,20 +1,25 @@
-"""Claude-specific exceptions."""
+"""Claude-specific exceptions.
 
+The base classes live in :mod:`src.exceptions` (one tree under
+``ClaudeCodeTelegramError``) and are re-exported here, so ``except ClaudeError``
+catches the same classes whichever module it was imported from.
+"""
 
-class ClaudeError(Exception):
-    """Base Claude error."""
+from ..exceptions import (
+    ClaudeError,
+    ClaudeParsingError,
+    ClaudeProcessError,
+    ClaudeTimeoutError,
+)
 
-
-class ClaudeTimeoutError(ClaudeError):
-    """Operation timed out."""
-
-
-class ClaudeProcessError(ClaudeError):
-    """Process execution failed."""
-
-
-class ClaudeParsingError(ClaudeError):
-    """Failed to parse output."""
+__all__ = [
+    "ClaudeError",
+    "ClaudeTimeoutError",
+    "ClaudeProcessError",
+    "ClaudeParsingError",
+    "ClaudeSessionError",
+    "ClaudeMCPError",
+]
 
 
 class ClaudeSessionError(ClaudeError):

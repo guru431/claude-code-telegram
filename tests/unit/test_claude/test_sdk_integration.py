@@ -282,6 +282,45 @@ class TestClaudeSDKManager:
                     working_directory=Path("/test"),
                 )
 
+    async def test_external_cancel_stops_run_task(self, sdk_manager):
+        """Cancelling the caller (bot shutdown) must not leave the shielded
+        client run going in the background: it is cancelled, its teardown
+        (disconnect) is awaited, and CancelledError reaches the caller."""
+        started = asyncio.Event()
+        receive_cancelled = asyncio.Event()
+
+        client = AsyncMock()
+        client.connect = AsyncMock()
+        client.disconnect = AsyncMock()
+        client.query = AsyncMock()
+
+        async def hanging_receive():
+            started.set()
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                receive_cancelled.set()
+                raise
+            yield  # Never reached
+
+        query_mock = AsyncMock()
+        query_mock.receive_messages = hanging_receive
+        client._query = query_mock
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", return_value=client):
+            task = asyncio.create_task(
+                sdk_manager.execute_command(
+                    prompt="Test prompt", working_directory=Path("/test")
+                )
+            )
+            await asyncio.wait_for(started.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert receive_cancelled.is_set()
+        client.disconnect.assert_awaited()
+
     async def test_execute_command_passes_mcp_config(self, tmp_path):
         """Test that MCP config is passed to ClaudeAgentOptions when enabled."""
         # Create a valid MCP config file

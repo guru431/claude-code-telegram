@@ -272,6 +272,8 @@ class TestTermination:
         assert strip_tags("".join(chunks)) == "x" * 4000
         for c in chunks:
             assert tg_len(c) <= 300
+            # Regression: closing tags of dropped formatting leaked as strays.
+            assert_balanced(c)
 
     def test_oversized_single_tag_is_emitted_alone(self) -> None:
         big_tag = '<a href="' + "u" * 5000 + '">'
@@ -280,6 +282,42 @@ class TestTermination:
 
         assert "".join(chunks) == text
         assert chunks[0] == big_tag  # unrepresentable, but never corrupted
+
+    @pytest.mark.parametrize(
+        "text,limit",
+        [
+            # <b> + </b> leave exactly one unit: an emoji (2 units) never fits.
+            ("<b>😀😀</b>", 8),
+            ("<b>a😀b</b>", 8),
+            # The emoji cannot fit any chunk at all.
+            ("😀😀", 1),
+        ],
+    )
+    def test_one_unit_left_before_astral_char_does_not_hang(
+        self, text: str, limit: int, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: a zero cut flushed a tags-only chunk and looped forever."""
+        from src.bot.utils import html_format
+
+        calls = 0
+        real_tg_len = html_format.tg_len
+
+        def counting_tg_len(value: str) -> int:
+            nonlocal calls
+            calls += 1
+            if calls > 10_000:
+                raise AssertionError("split_telegram_html made no progress")
+            return real_tg_len(value)
+
+        monkeypatch.setattr(html_format, "tg_len", counting_tg_len)
+        chunks = split_telegram_html(text, limit)
+
+        assert strip_tags("".join(chunks)) == strip_tags(text)
+        assert all(c.encode("utf-8").decode("utf-8") == c for c in chunks)
+        for c in chunks:
+            assert_balanced(c)
+        if limit > 1:
+            assert all(real_tg_len(c) <= limit for c in chunks)
 
     @pytest.mark.parametrize("limit", [64, 65, 128, 257, 999, 1000, 4096])
     def test_invariants_hold_across_limits(self, limit: int) -> None:

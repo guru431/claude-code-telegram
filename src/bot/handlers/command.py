@@ -14,10 +14,13 @@ from telegram.ext import ContextTypes
 
 from ...claude.facade import ClaudeIntegration
 from ...config.settings import Settings
+from ...exceptions import SecurityError
 from ...projects import PrivateTopicsUnavailableError, load_project_registry
 from ...security.audit import AuditLogger
+from ...security.secret_patterns import redact_secrets
 from ...security.validators import SecurityValidator
 from ...storage.models import SessionModel
+from ..features.git_integration import GitError
 from ..middleware.rate_limit import estimate_message_cost
 from ..utils.claude_run import run_claude_for_user
 from ..utils.html_format import escape_html
@@ -468,12 +471,28 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await status_msg.delete()
 
             # Format and send Claude's response
-            from ..utils.formatting import ResponseFormatter
+            from ..utils.formatting import FormattedMessage, ResponseFormatter
 
-            formatter = ResponseFormatter(settings)
-            formatted_messages = formatter.format_claude_response(
-                claude_response.content
-            )
+            if claude_response.is_error:
+                # The run did not raise but the SDK flagged an error; show the
+                # same explicit message the plain-message path does.
+                from .message import _format_error_message
+
+                formatted_messages = [
+                    FormattedMessage(
+                        _format_error_message(
+                            claude_response.error_type or "Claude returned an error."
+                        ),
+                        parse_mode="HTML",
+                    )
+                ]
+            else:
+                formatter = ResponseFormatter(settings)
+                # Redact secrets before the response leaves the bot — tool
+                # OUTPUT (e.g. a printenv dump) can land here.
+                formatted_messages = formatter.format_claude_response(
+                    redact_secrets(claude_response.content or "")
+                )
 
             for msg in formatted_messages:
                 await update.message.reply_text(
@@ -527,17 +546,12 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except Exception:
             pass
 
-        # Send error response
-        await update.message.reply_text(
-            f"❌ <b>Error Continuing Session</b>\n\n"
-            f"An error occurred while trying to continue your session:\n\n"
-            f"<code>{escape_html(error_msg)}</code>\n\n"
-            f"<b>Suggestions:</b>\n"
-            f"• Try starting a new session with <code>/new</code>\n"
-            f"• Check your session status with <code>/status</code>\n"
-            f"• Contact support if the issue persists",
-            parse_mode="HTML",
-        )
+        # Same formatter as the plain-message path: known Claude errors get an
+        # actionable message, anything else a generic one — the raw exception
+        # (host paths, config) stays in the log above.
+        from .message import _format_error_message
+
+        await update.message.reply_text(_format_error_message(e), parse_mode="HTML")
 
         # Log failed continue
         if audit_logger:
@@ -636,8 +650,10 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await audit_logger.log_command(user_id, "ls", [], True)
 
     except Exception as e:
-        error_msg = f"❌ Error listing directory: {str(e)}"
-        await update.message.reply_text(error_msg)
+        # Details (absolute host paths in an OSError) go to the log below only.
+        await update.message.reply_text(
+            "❌ Error listing directory. The details have been logged."
+        )
 
         # Log failed command
         if audit_logger:
@@ -733,8 +749,12 @@ async def change_directory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             return
 
-        # Check if directory exists and is actually a directory
-        if not resolved_path.exists():
+        # Check if directory exists and is actually a directory. The stats run
+        # off the event loop (slow/networked FS), like the /ls walk.
+        path_exists, path_is_dir = await asyncio.to_thread(
+            lambda: (resolved_path.exists(), resolved_path.is_dir())
+        )
+        if not path_exists:
             await update.message.reply_text(
                 f"❌ <b>Directory Not Found</b>\n\n"
                 f"<code>{escape_html(target_path)}</code> does not exist.",
@@ -742,7 +762,7 @@ async def change_directory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             return
 
-        if not resolved_path.is_dir():
+        if not path_is_dir:
             await update.message.reply_text(
                 f"❌ <b>Not a Directory</b>\n\n"
                 f"<code>{escape_html(target_path)}</code> is not a directory.",
@@ -776,9 +796,17 @@ async def change_directory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 )
 
         # Send confirmation
+        # The directory is already switched above, so a display failure must
+        # not turn into an error reply: ``..`` keeps an unresolved
+        # ``current_dir`` that can pass the resolved boundary check yet not be
+        # lexically under the root. Fall back to the absolute path, as
+        # ``_display_relative_path`` does.
         relative_base = project_root or settings.approved_directory
-        relative_path = resolved_path.relative_to(relative_base)
-        relative_display = "/" if str(relative_path) == "." else f"{relative_path}/"
+        try:
+            relative_path = resolved_path.relative_to(relative_base)
+            relative_display = "/" if str(relative_path) == "." else f"{relative_path}/"
+        except ValueError:
+            relative_display = f"{resolved_path}/"
         await update.message.reply_text(
             f"✅ <b>Directory Changed</b>\n\n"
             f"📂 Current directory: <code>{relative_display}</code>"
@@ -791,8 +819,13 @@ async def change_directory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await audit_logger.log_command(user_id, "cd", [target_path], True)
 
     except Exception as e:
-        error_msg = f"❌ <b>Error changing directory</b>\n\n{escape_html(str(e))}"
-        await update.message.reply_text(error_msg, parse_mode="HTML")
+        # Details (absolute host paths in an OSError) go to the log below only.
+        await update.message.reply_text(
+            "❌ <b>Error changing directory</b>\n\n"
+            "An error occurred while changing directory. "
+            "The details have been logged.",
+            parse_mode="HTML",
+        )
 
         # Log failed command
         if audit_logger:
@@ -938,7 +971,9 @@ async def show_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
     except Exception as e:
-        await update.message.reply_text(f"❌ Error loading projects: {str(e)}")
+        await update.message.reply_text(
+            "❌ Error loading projects. The details have been logged."
+        )
         logger.error("Error in show_projects command", error=str(e))
 
 
@@ -1218,7 +1253,9 @@ async def quick_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     except Exception as e:
         await update.message.reply_text(
-            f"❌ <b>Error Loading Actions</b>\n\n{escape_html(str(e))}",
+            "❌ <b>Error Loading Actions</b>\n\n"
+            "An error occurred while loading quick actions. "
+            "The details have been logged.",
             parse_mode="HTML",
         )
         logger.error("Error in quick_actions command", error=str(e), user_id=user_id)
@@ -1312,8 +1349,15 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
 
     except Exception as e:
+        # GitError/SecurityError carry git_integration's own messages (git's
+        # stderr, the reason a command was refused); anything else stays in
+        # the log.
+        if isinstance(e, (GitError, SecurityError)):
+            detail = escape_html(str(e))
+        else:
+            detail = "An error occurred while reading the repository."
         await update.message.reply_text(
-            f"❌ <b>Git Error</b>\n\n{escape_html(str(e))}",
+            f"❌ <b>Git Error</b>\n\n{detail}",
             parse_mode="HTML",
         )
         logger.error("Error in git_command", error=str(e), user_id=user_id)

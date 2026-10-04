@@ -10,9 +10,12 @@ from telegram.ext import ContextTypes
 
 from ...claude.facade import ClaudeIntegration
 from ...config.settings import Settings
+from ...exceptions import SecurityError
 from ...security.audit import AuditLogger
+from ...security.secret_patterns import redact_secrets
 from ...security.validators import SecurityValidator
 from ...utils.constants import TELEGRAM_MAX_MESSAGE_LENGTH
+from ..features.git_integration import GitError
 from ..middleware.rate_limit import estimate_prompt_cost
 from ..utils.claude_run import run_claude_for_user
 from ..utils.html_format import escape_html, split_telegram_html, tg_len
@@ -254,8 +257,10 @@ async def handle_cd_callback(
             )
             return
 
-        # Check if directory exists
-        if not new_path.exists() or not new_path.is_dir():
+        # Check if directory exists. The stat runs off the event loop like the
+        # listings in this module: on a slow or networked filesystem it would
+        # otherwise stall update processing for every user.
+        if not await asyncio.to_thread(new_path.is_dir):
             await query.edit_message_text(
                 f"❌ <b>Directory Not Found</b>\n\n"
                 f"The directory <code>{escape_html(project_name)}</code> no longer exists or is not accessible.",
@@ -287,9 +292,15 @@ async def handle_cd_callback(
             resumed_session_info = "\n🆕 Send a message to start a new session."
 
         # Send confirmation with new directory info
+        # The directory is already switched above, so a display failure must
+        # not turn into an error reply — fall back to the absolute path, as
+        # /cd does.
         relative_base = project_root or settings.approved_directory
-        relative_path = new_path.relative_to(relative_base)
-        relative_display = "/" if str(relative_path) == "." else f"{relative_path}/"
+        try:
+            relative_path = new_path.relative_to(relative_base)
+            relative_display = "/" if str(relative_path) == "." else f"{relative_path}/"
+        except ValueError:
+            relative_display = f"{new_path}/"
 
         # Add navigation buttons
         keyboard = [
@@ -323,8 +334,18 @@ async def handle_cd_callback(
             )
 
     except Exception as e:
+        # The raw exception carries absolute host paths (OSError) — keep it in
+        # the log, give the chat a generic message.
+        logger.error(
+            "Error in cd callback",
+            error=str(e),
+            user_id=user_id,
+            project_name=project_name,
+        )
         await query.edit_message_text(
-            f"❌ <b>Error changing directory</b>\n\n{escape_html(str(e))}",
+            "❌ <b>Error changing directory</b>\n\n"
+            "An error occurred while changing directory.\n"
+            "Please try again or use text commands.",
             parse_mode="HTML",
         )
 
@@ -551,7 +572,11 @@ async def _handle_show_projects_action(
         )
 
     except Exception as e:
-        await query.edit_message_text(f"❌ Error loading projects: {str(e)}")
+        # Details (absolute host paths in an OSError) go to the log only.
+        logger.error("Error in show projects action", error=str(e))
+        await query.edit_message_text(
+            "❌ Error loading projects. The details have been logged."
+        )
 
 
 async def _handle_new_session_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -748,10 +773,11 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
             # Send Claude's response. ``query.message`` may be ``None``/
             # ``InaccessibleMessage`` for buttons older than 48h, so fall back
             # to sending directly to the user.
+            content = redact_secrets(claude_response.content or "")
             continued_text = (
                 f"✅ <b>Session Continued</b>\n\n"
-                f"{escape_html(claude_response.content[:500])}"
-                f"{'...' if len(claude_response.content) > 500 else ''}"
+                f"{escape_html(content[:500]) or '<i>(no output)</i>'}"
+                f"{'...' if len(content) > 500 else ''}"
             )
             if isinstance(query.message, Message):
                 await query.message.reply_text(continued_text, parse_mode="HTML")
@@ -786,10 +812,12 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
 
     except Exception as e:
         logger.error("Error in continue action", error=str(e), user_id=user_id)
+        # Known Claude errors get an actionable message, anything else a
+        # generic one — the raw exception stays in the log above.
+        from .message import _format_error_message
+
         await query.edit_message_text(
-            f"❌ <b>Error Continuing Session</b>\n\n"
-            f"An error occurred: <code>{escape_html(str(e))}</code>\n\n"
-            f"Try starting a new session instead.",
+            _format_error_message(e),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
                 [
@@ -958,7 +986,11 @@ async def _handle_ls_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     except Exception as e:
-        await query.edit_message_text(f"❌ Error listing directory: {str(e)}")
+        # Details (absolute host paths in an OSError) go to the log only.
+        logger.error("Error in ls action", error=str(e))
+        await query.edit_message_text(
+            "❌ Error listing directory. The details have been logged."
+        )
 
 
 async def _handle_start_coding_action(
@@ -1158,7 +1190,12 @@ async def handle_quick_action_callback(
             # just the body -- the header also counts against Telegram's limit.
             # A run that succeeded but produced no text is not a failure; say so
             # rather than sending an empty body (which Telegram rejects).
-            body = escape_html(claude_response.content or "") or "<i>(no output)</i>"
+            # Redact secrets before the response leaves the bot — tool OUTPUT
+            # (e.g. a printenv dump) can land here.
+            body = (
+                escape_html(redact_secrets(claude_response.content or ""))
+                or "<i>(no output)</i>"
+            )
             done_text = _first_chunk(
                 f"✅ <b>{action.icon} {escape_html(action.name)} Complete</b>\n\n"
                 f"{body}"
@@ -1178,11 +1215,11 @@ async def handle_quick_action_callback(
 
     except Exception as e:
         logger.error("Quick action execution failed", error=str(e), user_id=user_id)
-        await query.edit_message_text(
-            f"❌ <b>Action Error</b>\n\n"
-            f"An error occurred while executing {escape_html(action_id)}: {escape_html(str(e))}",
-            parse_mode="HTML",
-        )
+        # Same formatter as the plain-message path: known Claude errors get an
+        # actionable message, anything else a generic one.
+        from .message import _format_error_message
+
+        await query.edit_message_text(_format_error_message(e), parse_mode="HTML")
 
 
 async def handle_followup_callback(
@@ -1258,8 +1295,10 @@ async def handle_followup_callback(
             context.user_data["claude_session_id"] = claude_response.session_id
 
             # An empty body would be rejected by Telegram as an empty message.
+            # Secrets in tool output are redacted as on every other path.
             response_text = _first_chunk(
-                escape_html(claude_response.content or "") or "<i>(no output)</i>"
+                escape_html(redact_secrets(claude_response.content or ""))
+                or "<i>(no output)</i>"
             )
             if isinstance(query.message, Message):
                 await query.message.reply_text(response_text, parse_mode="HTML")
@@ -1506,8 +1545,15 @@ async def handle_git_callback(
             git_action=git_action,
             user_id=user_id,
         )
+        # GitError/SecurityError carry git_integration's own messages (git's
+        # stderr, the reason a command was refused); anything else stays in
+        # the log.
+        if isinstance(e, (GitError, SecurityError)):
+            detail = escape_html(str(e))
+        else:
+            detail = "An error occurred while running the git action."
         await query.edit_message_text(
-            f"❌ <b>Git Error</b>\n\n{escape_html(str(e))}",
+            f"❌ <b>Git Error</b>\n\n{detail}",
             parse_mode="HTML",
         )
 
@@ -1612,7 +1658,8 @@ async def handle_export_callback(
             "Export failed", error=str(e), user_id=user_id, format=export_format
         )
         await query.edit_message_text(
-            f"❌ <b>Export Failed</b>\n\n{escape_html(str(e))}",
+            "❌ <b>Export Failed</b>\n\n"
+            "Could not export the session. The details have been logged.",
             parse_mode="HTML",
         )
 

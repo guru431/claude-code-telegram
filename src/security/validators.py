@@ -90,8 +90,8 @@ class SecurityValidator:
         ".zsh",
         ".fish",
         ".ps1",
-        ".bat",
-        ".cmd",
+        # No ".bat"/".cmd": DANGEROUS_FILE_PATTERNS rejects them first, so an
+        # entry here would only read as if such uploads were accepted.
         ".r",
         ".scala",
         ".clj",

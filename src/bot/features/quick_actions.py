@@ -184,7 +184,7 @@ class QuickActionManager:
 
         # Analyze recent messages for context clues
         for msg in recent_messages:
-            content = msg.get("content", "").lower()
+            content = (msg.get("content") or "").lower()
 
             # Check for test indicators
             if any(word in content for word in ["test", "pytest", "unittest"]):

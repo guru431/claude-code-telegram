@@ -676,20 +676,23 @@ class RateLimiter:
         # Clean up data
         evicted = []
         for user_id in inactive_users:
-            lock = self.locks[user_id]
-            if lock.locked():
+            lock = self.locks.get(user_id)
+            if lock is not None and lock.locked():
                 # Somebody is mid-``reserve_cost``/``settle_reservation`` under
-                # this lock. Dropping it now would hand the next caller a fresh
-                # lock from the defaultdict, putting two coroutines in the same
-                # critical section over a tracker entry we just deleted.
+                # this lock; deleting the state it is working on would corrupt
+                # that run's bookkeeping.
                 continue
             # No await between the check above and the pops below, so the lock
-            # cannot be taken underneath us.
+            # cannot be taken underneath us. The lock itself is kept: between
+            # an owner's release() and the woken waiter's re-acquire locked()
+            # reads False, so dropping it here would let the waiter run under
+            # the orphaned lock while the next caller gets a fresh one from the
+            # defaultdict — two coroutines in one critical section. One Lock
+            # per authorized user is a bounded cost.
             self.request_buckets.pop(user_id, None)
             self.cost_tracker.pop(user_id, None)
             self.cost_reset_time.pop(user_id, None)
             self._drop_user_reservations(user_id)
-            self.locks.pop(user_id, None)
             # Forget the hydration marker too: the tracker this user's spend
             # lived in is gone, so a later request must re-read it from storage.
             self._hydrated_users.discard(user_id)

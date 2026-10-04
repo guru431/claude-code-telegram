@@ -2,7 +2,7 @@
 
 import asyncio
 import re
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import structlog
 from telegram import InputMediaPhoto, Update
@@ -32,6 +32,9 @@ from ..utils.image_extractor import (
     validate_image_path,
 )
 from ..utils.upload_limits import exceeds_upload_limit
+
+if TYPE_CHECKING:
+    from ..utils.formatting import FormattedMessage
 
 logger = structlog.get_logger()
 
@@ -331,6 +334,77 @@ def _format_process_error(error_str: str) -> str:
     )
 
 
+async def _send_formatted_messages(
+    update: Update, formatted_messages: "list[FormattedMessage]"
+) -> None:
+    """Send formatted responses, retrying each as plain text on a Telegram error.
+
+    Telegram rejects malformed HTML with a 400; without the retry that turned a
+    successful run into a failed one. Only a message that cannot be delivered
+    even as plain text gets the "Failed to deliver response" notice.
+    """
+    for i, message in enumerate(formatted_messages):
+        try:
+            await update.message.reply_text(
+                message.text,
+                parse_mode=message.parse_mode,
+                reply_markup=message.reply_markup,
+                reply_to_message_id=(update.message.message_id if i == 0 else None),
+            )
+            if i < len(formatted_messages) - 1:
+                await asyncio.sleep(0.5)
+        except Exception as send_err:
+            logger.warning(
+                "Failed to send HTML response, retrying as plain text",
+                error=str(send_err),
+                message_index=i,
+            )
+            try:
+                await update.message.reply_text(
+                    message.text,
+                    reply_markup=message.reply_markup,
+                    reply_to_message_id=(update.message.message_id if i == 0 else None),
+                )
+            except Exception as plain_err:
+                logger.error(
+                    "Failed to send plain text fallback response",
+                    error=str(plain_err),
+                )
+                await update.message.reply_text(
+                    f"Failed to deliver response "
+                    f"(Telegram error: {str(plain_err)[:150]}). "
+                    f"Please try again.",
+                    reply_to_message_id=(update.message.message_id if i == 0 else None),
+                )
+
+
+async def _audit_command(
+    audit_logger: Optional[AuditLogger],
+    user_id: int,
+    command: str,
+    args: list[str],
+    success: bool,
+) -> None:
+    """Write a command audit record; an audit failure is logged, never raised.
+
+    Called after the reply was already sent, so an audit error must not fall
+    through to the handler's error path and send the user a second message.
+    """
+    if not audit_logger:
+        return
+    try:
+        await audit_logger.log_command(
+            user_id=user_id, command=command, args=args, success=success
+        )
+    except Exception as audit_err:
+        logger.warning(
+            "Failed to write audit log",
+            error=str(audit_err),
+            command=command,
+            user_id=user_id,
+        )
+
+
 async def handle_text_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -520,8 +594,12 @@ async def handle_text_message(
             if rate_limiter and reservation_id:
                 await rate_limiter.settle_reservation(reservation_id, actual_cost)
 
-        # Delete progress message
-        await progress_msg.delete()
+        # Delete progress message. The run already succeeded; a failed delete
+        # must not reach the outer except and replace the answer with an error.
+        try:
+            await progress_msg.delete()
+        except Exception as delete_error:
+            logger.debug("Failed to delete progress message", error=str(delete_error))
 
         # Use MCP-collected images (from send_image_to_user tool calls)
         images: list[ImageAttachment] = mcp_images
@@ -571,45 +649,7 @@ async def handle_text_message(
 
         if not caption_sent:
             # Send formatted responses (may be multiple messages)
-            for i, message in enumerate(formatted_messages):
-                try:
-                    await update.message.reply_text(
-                        message.text,
-                        parse_mode=message.parse_mode,
-                        reply_markup=message.reply_markup,
-                        reply_to_message_id=(
-                            update.message.message_id if i == 0 else None
-                        ),
-                    )
-                    if i < len(formatted_messages) - 1:
-                        await asyncio.sleep(0.5)
-                except Exception as send_err:
-                    logger.warning(
-                        "Failed to send HTML response, retrying as plain text",
-                        error=str(send_err),
-                        message_index=i,
-                    )
-                    try:
-                        await update.message.reply_text(
-                            message.text,
-                            reply_markup=message.reply_markup,
-                            reply_to_message_id=(
-                                update.message.message_id if i == 0 else None
-                            ),
-                        )
-                    except Exception as plain_err:
-                        logger.error(
-                            "Failed to send plain text fallback response",
-                            error=str(plain_err),
-                        )
-                        await update.message.reply_text(
-                            f"Failed to deliver response "
-                            f"(Telegram error: {str(plain_err)[:150]}). "
-                            f"Please try again.",
-                            reply_to_message_id=(
-                                update.message.message_id if i == 0 else None
-                            ),
-                        )
+            await _send_formatted_messages(update, formatted_messages)
 
             # Send images separately
             if images:
@@ -1031,16 +1071,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             # up front left the except below editing an already-deleted message,
             # which raised inside the handler, swallowed the original error and
             # surfaced as the generic "Error processing file".
-            for i, message in enumerate(formatted_messages):
-                await update.message.reply_text(
-                    message.text,
-                    parse_mode=message.parse_mode,
-                    reply_markup=message.reply_markup,
-                    reply_to_message_id=(update.message.message_id if i == 0 else None),
-                )
-
-                if i < len(formatted_messages) - 1:
-                    await asyncio.sleep(0.5)
+            await _send_formatted_messages(update, formatted_messages)
 
             try:
                 await claude_progress_msg.delete()
@@ -1120,6 +1151,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Check if enhanced image handler is available
     features = context.bot_data.get("features")
     image_handler = features.get_image_handler() if features else None
+    audit_logger: Optional[AuditLogger] = context.bot_data.get("audit_logger")
+    caption = update.message.caption
+    audit_args = [caption[:100]] if caption else []
 
     if image_handler:
         # Bound before the try so the outer except can clean it up: a failure in
@@ -1223,29 +1257,36 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                         redact_secrets(claude_response.content or "")
                     )
 
-                # Delete progress message
-                await claude_progress_msg.delete()
+                # Responses first, then drop the progress message: deleting it
+                # up front left the except below editing a message that no
+                # longer exists, masking the real error (as in handle_document).
+                await _send_formatted_messages(update, formatted_messages)
 
-                # Send responses
-                for i, message in enumerate(formatted_messages):
-                    await update.message.reply_text(
-                        message.text,
-                        parse_mode=message.parse_mode,
-                        reply_markup=message.reply_markup,
-                        reply_to_message_id=(
-                            update.message.message_id if i == 0 else None
-                        ),
+                try:
+                    await claude_progress_msg.delete()
+                except Exception as delete_error:
+                    logger.debug(
+                        "Failed to delete progress message", error=str(delete_error)
                     )
 
-                    if i < len(formatted_messages) - 1:
-                        await asyncio.sleep(0.5)
+                await _audit_command(
+                    audit_logger, user_id, "photo", audit_args, success=True
+                )
 
             except Exception as e:
-                await claude_progress_msg.edit_text(
-                    _format_error_message(e), parse_mode="HTML"
-                )
+                try:
+                    await claude_progress_msg.edit_text(
+                        _format_error_message(e), parse_mode="HTML"
+                    )
+                except Exception:
+                    await update.message.reply_text(
+                        _format_error_message(e), parse_mode="HTML"
+                    )
                 logger.error(
                     "Claude image processing failed", error=str(e), user_id=user_id
+                )
+                await _audit_command(
+                    audit_logger, user_id, "photo", audit_args, success=False
                 )
             finally:
                 # Always release the hold; a failed or empty run settles at 0.0.
@@ -1264,6 +1305,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.message.reply_text(
                 _format_error_message(e),
                 parse_mode="HTML",
+            )
+            await _audit_command(
+                audit_logger, user_id, "photo", audit_args, success=False
             )
     else:
         # Fall back to unsupported message
@@ -1301,6 +1345,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             parse_mode="HTML",
         )
         return
+
+    audit_logger: Optional[AuditLogger] = context.bot_data.get("audit_logger")
+    caption = update.message.caption
+    audit_args = [caption[:100]] if caption else []
 
     # Bound before the try so the outer except can clean it up: a failure in
     # process_voice_message left "🎙️ Transcribing..." hanging in the chat.
@@ -1393,15 +1441,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             # Responses first, then drop the progress message: deleting it up
             # front left the except below editing a message that no longer
             # exists, masking the real error.
-            for i, message in enumerate(formatted_messages):
-                await update.message.reply_text(
-                    message.text,
-                    parse_mode=message.parse_mode,
-                    reply_markup=message.reply_markup,
-                    reply_to_message_id=(update.message.message_id if i == 0 else None),
-                )
-                if i < len(formatted_messages) - 1:
-                    await asyncio.sleep(0.5)
+            await _send_formatted_messages(update, formatted_messages)
 
             try:
                 await progress_msg.delete()
@@ -1410,6 +1450,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     "Failed to delete progress message", error=str(delete_error)
                 )
             progress_msg = None
+
+            await _audit_command(
+                audit_logger, user_id, "voice", audit_args, success=True
+            )
 
         except Exception as e:
             try:
@@ -1422,6 +1466,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 )
             logger.error(
                 "Claude voice processing failed", error=str(e), user_id=user_id
+            )
+            await _audit_command(
+                audit_logger, user_id, "voice", audit_args, success=False
             )
         finally:
             # Always release the hold; a failed or empty run settles at 0.0.
@@ -1441,6 +1488,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             _format_error_message(e),
             parse_mode="HTML",
         )
+        await _audit_command(audit_logger, user_id, "voice", audit_args, success=False)
 
 
 def _estimate_file_processing_cost(file_size: Optional[int]) -> float:

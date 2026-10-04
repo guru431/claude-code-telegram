@@ -4,11 +4,22 @@ from pathlib import Path
 
 import pytest
 
+from src.bot.utils import image_extractor
 from src.mcp.telegram_server import (
+    IMAGE_EXTENSIONS,
     _approved_directory,
     _UnresolvableApprovedDirectory,
     send_image_to_user,
 )
+
+
+def test_image_extensions_match_bot_side() -> None:
+    """Contract: the server accepts exactly what the bot can deliver.
+
+    The server keeps its own copy (it runs as a standalone script where
+    ``src`` is not importable), so drift is caught here instead.
+    """
+    assert IMAGE_EXTENSIONS == set(image_extractor.IMAGE_EXTENSIONS)
 
 
 @pytest.fixture

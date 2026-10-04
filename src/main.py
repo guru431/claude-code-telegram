@@ -86,6 +86,17 @@ def setup_logging(debug: bool = False) -> None:
     )
 
 
+def apply_configured_log_level(config: Settings, debug_flag: bool) -> None:
+    """Apply ``LOG_LEVEL`` once the config is loaded.
+
+    ``setup_logging`` runs before the config exists, so it can only honour
+    ``--debug``; the root level is set here afterwards. ``--debug`` wins.
+    """
+    if debug_flag:
+        return
+    logging.getLogger().setLevel(config.log_level)
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -738,6 +749,7 @@ async def main() -> None:
         from src.config import FeatureFlags, load_config
 
         config = load_config(config_file=args.config_file)
+        apply_configured_log_level(config, args.debug)
         features = FeatureFlags(config)
 
         logger.info(

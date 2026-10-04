@@ -306,6 +306,19 @@ class TestSecurityValidator:
         assert summary["max_command_length"] == 1000
         assert len(summary["allowed_extensions"]) > 10
 
+    def test_allowed_extensions_not_shadowed_by_dangerous_patterns(self):
+        """An allowlisted extension that DANGEROUS_FILE_PATTERNS rejects first is
+        a dead entry that misreads as "accepted" (it used to be .bat/.cmd)."""
+        import re
+
+        shadowed = [
+            ext
+            for ext in SecurityValidator.ALLOWED_EXTENSIONS
+            for pattern in SecurityValidator.DANGEROUS_FILE_PATTERNS
+            if re.match(pattern, f"file{ext}", re.IGNORECASE)
+        ]
+        assert shadowed == []
+
     def test_path_validation_with_symlinks(self, validator, temp_approved_dir):
         """Test path validation with symbolic links."""
         # Create a directory and file inside approved directory

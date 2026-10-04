@@ -694,8 +694,12 @@ class Settings(BaseSettings):
         (``sqlite:///:memory:`` or an empty path after the prefix), so callers
         skip parent-directory creation and on-disk file handling.
         """
-        if self.database_url.startswith("sqlite:///"):
-            db_path = self.database_url.replace("sqlite:///", "")
+        prefix = "sqlite:///"
+        if self.database_url.startswith(prefix):
+            # Slice off the prefix only, exactly like
+            # DatabaseManager._parse_database_url — a replace() would also
+            # strip later occurrences inside the path.
+            db_path = self.database_url[len(prefix) :]
             if db_path in ("", ":memory:"):
                 return None
             return Path(db_path).resolve()
@@ -733,6 +737,21 @@ class Settings(BaseSettings):
         if self.voice_provider == "openai":
             return "whisper-1"
         return "voxtral-mini-latest"
+
+    @property
+    def voice_transcription_available(self) -> bool:
+        """Whether voice transcription is enabled and can reach its provider.
+
+        Single predicate for ``FeatureFlags`` and ``FeatureRegistry``. Truthy
+        check on the string value: an empty SecretStr is a missing key. For
+        ``openai`` a ``voice_base_url`` alone is enough — a self-hosted
+        Whisper server without auth, ``VoiceHandler`` uses a placeholder key.
+        """
+        if not self.enable_voice_messages:
+            return False
+        if self.voice_provider == "openai":
+            return bool(self.openai_api_key_str) or bool(self.voice_base_url)
+        return bool(self.mistral_api_key_str)
 
     @property
     def voice_max_file_size_bytes(self) -> int:

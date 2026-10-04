@@ -293,6 +293,15 @@ _INTERP_COMMANDS: Set[str] = {
 # arguments to network commands, which are remote fetches rather than paths.
 _URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
 
+# Fetch tools whose positional operand is always a URL: curl/wget read a
+# scheme-less ``example.com/x`` or ``localhost:8080`` as ``http://…``, so the
+# scheme check alone misses it and the token resolves to a harmless-looking
+# relative path inside the working dir. Only operands spelled as paths
+# (``./x``, ``../x``, ``/x``, ``~/x``) go on to the boundary check; anything
+# else is treated as a remote host and denied.
+_FETCH_COMMANDS: Set[str] = {"curl", "wget", "fetch"}
+_PATH_SHAPED_PREFIXES: Tuple[str, ...] = ("/", "./", "../", "~")
+
 # Flags that introduce inline code / opaque module execution across the
 # interpreters above (python -c/-m, node -e/-p/--eval/--print,
 # perl -e/-E/-n/-p, ruby -e, php -r/-R, bash/sh/zsh -c).
@@ -910,7 +919,12 @@ def check_bash_directory_boundary(
                 # check the value side before waving the flag through.
                 if base_command in _NETWORK_OR_INTERP_COMMANDS and "=" in token:
                     value = token.split("=", 1)[1]
-                    if _URL_SCHEME_RE.match(value):
+                    bare_url = (
+                        base_command in _FETCH_COMMANDS
+                        and token.split("=", 1)[0] == "--url"
+                        and not value.startswith(_PATH_SHAPED_PREFIXES)
+                    )
+                    if _URL_SCHEME_RE.match(value) or bare_url:
                         return False, (
                             f"Directory boundary violation: '{base_command}' "
                             f"fetches remote URL '{value}', which cannot be "
@@ -966,6 +980,14 @@ def check_bash_directory_boundary(
                     f"Directory boundary violation: '{base_command}' fetches "
                     f"remote URL '{token}', which cannot be validated against "
                     f"approved directory '{resolved_approved}'"
+                )
+            if base_command in _FETCH_COMMANDS and not token.startswith(
+                _PATH_SHAPED_PREFIXES
+            ):
+                return False, (
+                    f"Directory boundary violation: '{base_command}' treats "
+                    f"'{token}' as a remote URL, which cannot be validated "
+                    f"against approved directory '{resolved_approved}'"
                 )
 
             # ``key=value`` operands (e.g. ``dd of=/etc/shadow``) hide the real

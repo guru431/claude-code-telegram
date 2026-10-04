@@ -224,6 +224,32 @@ class TestRetentionCleanupOrdering:
         assert second["messages_purged"] == 0
         assert second["tool_usage_purged"] == 0
 
+    async def test_purge_with_zero_days_keeps_everything(self, storage):
+        """``days=0`` means keep forever: a ``-0 days`` cutoff would match every
+        row, so each purge method must refuse it rather than wipe the table."""
+        await self._make_old_message_with_tool_usage(storage)
+        async with storage.db_manager.get_connection() as conn:
+            await conn.execute(
+                "INSERT INTO audit_log (user_id, event_type, timestamp) "
+                "VALUES (1, 'x', datetime('now', '-1 days'))"
+            )
+            await conn.execute(
+                "INSERT INTO webhook_events (event_id, provider, event_type, "
+                "received_at) VALUES ('e', 'p', 't', datetime('now', '-1 days'))"
+            )
+            await conn.commit()
+
+        assert await storage.messages.purge_old_messages(0) == 0
+        assert await storage.tools.purge_old_tool_usage(0) == 0
+        assert await storage.audit.purge_old_audit_log(0) == 0
+        assert await storage.webhooks.purge_old_webhook_events(0) == 0
+        assert await storage._purge_messages_and_tool_usage(0) == (0, 0)
+
+        async with storage.db_manager.get_connection() as conn:
+            for table in ("messages", "tool_usage", "audit_log", "webhook_events"):
+                cursor = await conn.execute(f"SELECT COUNT(*) FROM {table}")
+                assert (await cursor.fetchone())[0] == 1, table
+
     async def test_cleanup_keeps_recent_rows(self, storage):
         """Rows inside the retention window survive the purge."""
         await seed_user(storage, 999011, "recentuser")

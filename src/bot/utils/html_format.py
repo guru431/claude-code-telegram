@@ -180,6 +180,7 @@ def split_telegram_html(
     buf: List[str] = []
     body_len = 0
     has_content = False  # buffer holds text/entity content, not just tags
+    dropped: List[str] = []  # names of opening tags dropped from the stack
 
     def closing_len() -> int:
         # "</name>" is pure ASCII, so its UTF-16 length is len(name) + 3.
@@ -199,6 +200,21 @@ def split_telegram_html(
         body_len = 0
         has_content = False
 
+    def drop_carried() -> None:
+        # Only called with an empty buffer, so every tag on the stack lives in
+        # chunk_prefix. Their closing tags are dropped later (see ``dropped``).
+        nonlocal chunk_prefix, prefix_len
+        logger.warning(
+            "Dropping carried HTML formatting: reopened tags exceed the "
+            "message budget",
+            open_tags=[n for _, n in stack],
+            max_length=max_length,
+        )
+        dropped.extend(n for _, n in stack)
+        stack.clear()
+        chunk_prefix = ""
+        prefix_len = 0
+
     pending: Deque[Tuple[str, str]] = deque(_tokenize_html(text))
 
     while pending:
@@ -217,6 +233,11 @@ def split_telegram_html(
                     del stack[i]
                     break
             else:
+                if name in dropped:
+                    # Its opening tag was dropped with the carried formatting:
+                    # emitting it would leave a stray "</b>" Telegram rejects.
+                    dropped.remove(name)
+                    continue
                 tag_kind = "text"
             if tag_kind == "close":
                 continue
@@ -233,6 +254,12 @@ def split_telegram_html(
                 pending.appendleft((kind, token))
                 flush()
                 continue
+            if stack:
+                # The carried-over tags leave no room to open this one. Emitting
+                # it as text here would leave it unclosed in this chunk.
+                drop_carried()
+                pending.appendleft((kind, token))
+                continue
             # Cannot open the tag even on a fresh chunk: emit it as literal
             # text instead of tracking an entity we can never close.
             tag_kind = "text"
@@ -245,11 +272,16 @@ def split_telegram_html(
             has_content = True
             continue
 
+        cut = 0
         if kind == "text" and available > 0:
+            cut = _preferred_cut(token, utf16_cut(token, available))
+        if cut > 0:
             # Fill the current chunk to the brim, then continue with the rest.
             # Cutting here (rather than flushing first) matters: flushing with
             # only a just-opened tag buffered would emit an empty "<b></b>".
-            cut = _preferred_cut(token, utf16_cut(token, available))
+            # A zero cut (one unit left, an astral first character) falls
+            # through instead: appending "" would flush a tags-only chunk and
+            # retry in the same state forever.
             buf.append(token[:cut])
             body_len += tg_len(token[:cut])
             has_content = True
@@ -265,23 +297,21 @@ def split_telegram_html(
         if stack:
             # Nothing buffered yet and the carried-over tags already consume the
             # whole budget. Drop the carried formatting rather than spin.
-            logger.warning(
-                "Dropping carried HTML formatting: reopened tags exceed the "
-                "message budget",
-                open_tags=[n for _, n in stack],
-                max_length=max_length,
-            )
-            stack.clear()
-            chunk_prefix = ""
-            prefix_len = 0
+            drop_carried()
             pending.appendleft((kind, token))
+            continue
+
+        if kind == "text":
+            # Only possible with max_length == 1 and an astral character, which
+            # fits no chunk: emit that one character alone and move on.
+            chunks.append(token[0])
+            if len(token) > 1:
+                pending.appendleft(("text", token[1:]))
             continue
 
         # A single atomic token (a malformed or absurdly long tag) longer than
         # the whole limit, on an otherwise empty chunk. It cannot be split
-        # without corrupting it, so emit it alone and move on. A text token can
-        # never reach here: with an empty buffer and no carried tags the full
-        # budget is available, so the branch above always cuts it.
+        # without corrupting it, so emit it alone and move on.
         logger.warning(
             "Emitting oversized atomic HTML token as its own chunk",
             token_length=token_len,

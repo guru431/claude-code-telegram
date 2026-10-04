@@ -777,3 +777,79 @@ async def test_stale_mapping_stays_active_when_delete_and_close_both_fail(
         if m.project_slug == "app2"
     ]
     assert app2[0].is_active is False
+
+
+async def test_topic_level_error_does_not_abort_whole_sync(
+    tmp_path: Path, db_manager
+) -> None:
+    """Regression: TOPIC_CLOSED was read as "topics disabled" and aborted the run."""
+    approved = tmp_path / "projects"
+    approved.mkdir()
+
+    config_file = _write_registry(tmp_path, approved, "app1,app2")
+    registry = load_project_registry(config_file, approved)
+    repo = ProjectThreadRepository(db_manager)
+    manager = ProjectThreadManager(registry, repo, sync_action_interval_seconds=0.0)
+
+    bot = AsyncMock()
+    bot.create_forum_topic = AsyncMock(
+        side_effect=[
+            TelegramError("Bad Request: TOPIC_CLOSED"),
+            SimpleNamespace(message_thread_id=202),
+        ]
+    )
+    bot.send_message = AsyncMock()
+
+    result = await manager.sync_topics(bot, chat_id=42)
+
+    assert result.failed == 1
+    assert result.created == 1
+
+
+async def test_stale_mapping_db_error_does_not_abort_sync(
+    tmp_path: Path, db_manager, monkeypatch
+) -> None:
+    """Regression: an exception from set_active escaped and aborted sync_topics."""
+    approved = tmp_path / "projects"
+    approved.mkdir()
+    (approved / "app1").mkdir()
+
+    config_file = tmp_path / "projects.yaml"
+    config_file.write_text(
+        "projects:\n  - slug: app1\n    name: App1\n    path: app1\n",
+        encoding="utf-8",
+    )
+    registry = load_project_registry(config_file, approved)
+    repo = ProjectThreadRepository(db_manager)
+    for slug, thread_id in (("gone1", 301), ("gone2", 302)):
+        await repo.upsert_mapping(
+            project_slug=slug,
+            chat_id=42,
+            message_thread_id=thread_id,
+            topic_name=slug,
+            is_active=True,
+        )
+    real_set_active = repo.set_active
+    calls = []
+
+    async def flaky_set_active(**kwargs):
+        calls.append(kwargs["project_slug"])
+        if len(calls) == 1:
+            raise RuntimeError("db is down")
+        return await real_set_active(**kwargs)
+
+    monkeypatch.setattr(repo, "set_active", flaky_set_active)
+    manager = ProjectThreadManager(registry, repo, sync_action_interval_seconds=0.0)
+
+    bot = AsyncMock()
+    bot.create_forum_topic = AsyncMock(
+        return_value=SimpleNamespace(message_thread_id=101)
+    )
+    bot.send_message = AsyncMock()
+    bot.delete_forum_topic = AsyncMock()
+
+    result = await manager.sync_topics(bot, chat_id=42)
+
+    assert len(calls) == 2
+    assert result.failed == 1
+    assert result.deactivated == 1
