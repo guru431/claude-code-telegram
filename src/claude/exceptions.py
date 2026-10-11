@@ -5,6 +5,8 @@ The base classes live in :mod:`src.exceptions` (one tree under
 catches the same classes whichever module it was imported from.
 """
 
+from typing import Optional
+
 from ..exceptions import (
     ClaudeError,
     ClaudeParsingError,
@@ -29,6 +31,6 @@ class ClaudeSessionError(ClaudeError):
 class ClaudeMCPError(ClaudeError):
     """MCP server connection or configuration error."""
 
-    def __init__(self, message: str, server_name: str = None):
+    def __init__(self, message: str, server_name: Optional[str] = None):
         super().__init__(message)
         self.server_name = server_name

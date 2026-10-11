@@ -510,3 +510,56 @@ def test_bash_boundary_corpus(verdict: str, command: str) -> None:
     cwd = approved / "myapp"
     valid, error = check_bash_directory_boundary(command, cwd, approved)
     assert valid is (verdict == "ALLOW"), f"{command!r} -> valid={valid} ({error})"
+
+
+_HEREDOC_DATA = [
+    # The finding: body lines were parsed as commands of their own.
+    "cat > deploy.sh <<EOF\ncurl https://example.com/x\nrm -rf /tmp/build\nEOF",
+    # A quoted delimiter makes the body literal: quotes, backticks and $(…)
+    # in it are text.
+    "cat > notes.md <<'EOF'\nit's a note with `code` and $(date)\nEOF",
+    'cat <<"EOF" > out.txt\nunbalanced " quote\nEOF',
+    "cat <<-EOF > out.txt\n\tindented\n\tEOF",
+    "tee config.yml <<EOF\nkey: value\nEOF",
+    "cat>a.txt<<EOF\nglued\nEOF",
+    # The commands around the heredoc are still commands.
+    "mkdir -p scripts\ncat > scripts/run.sh <<'EOF'\n#!/bin/sh\n"
+    "python -c 'print(1)'\nEOF\nchmod +x scripts/run.sh",
+]
+
+_HEREDOC_DENIED = [
+    # The heredoc line itself is checked like any other command.
+    "cat > /etc/cron.d/x <<EOF\n* * * * * root id\nEOF",
+    "cat > .env <<EOF\nKEY=1\nEOF",
+    "tee /etc/hosts <<EOF\n127.0.0.1 x\nEOF",
+    # What follows the terminator is a command again.
+    "cat > a.txt <<EOF\nhello\nEOF\nrm -rf /etc",
+    # An unquoted delimiter leaves substitution live inside the body.
+    "cat > a.txt <<EOF\n$(cat /etc/shadow)\nEOF",
+    # Consumers that execute the body, directly or through a pipe.
+    "bash <<EOF\nrm -rf /etc\nEOF",
+    "cat <<EOF | bash\nrm -rf /etc\nEOF",
+    # Not a heredoc at all: the lines below it run.
+    "cat '<<EOF'\nrm -rf /etc\nEOF",
+    "cat # <<EOF\nrm -rf /etc\nEOF",
+    # Another heredoc's body must not be mistaken for the start of a data one.
+    "bash <<X\ncat > f <<EOF\nX\nrm -rf /etc\nEOF",
+    # Bash joins backslash-newline in an expanding body, so "EO\" + "F" ends it.
+    "cat > a.txt <<EOF\nEO\\\nF\nrm -rf /etc\nEOF",
+]
+
+
+@pytest.mark.parametrize("command", _HEREDOC_DATA)
+def test_heredoc_body_read_by_cat_or_tee_is_data(command: str) -> None:
+    """``cat > file <<EOF`` writes its body; the body is not a list of commands."""
+    approved = Path("/root/projects")
+    valid, error = check_bash_directory_boundary(command, approved / "myapp", approved)
+    assert valid, f"{command!r} -> {error}"
+
+
+@pytest.mark.parametrize("command", _HEREDOC_DENIED)
+def test_heredoc_does_not_hide_commands(command: str) -> None:
+    """Setting a body aside must never set aside something bash would run."""
+    approved = Path("/root/projects")
+    valid, _ = check_bash_directory_boundary(command, approved / "myapp", approved)
+    assert not valid, f"{command!r} was allowed"

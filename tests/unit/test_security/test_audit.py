@@ -104,6 +104,30 @@ class TestInMemoryAuditStorage:
         assert storage.events[0].user_id == 2  # First kept event
         assert storage.events[-1].user_id == 4  # Last event
 
+    async def test_reading_events_does_not_reorder_the_store(self, storage):
+        """An unfiltered read sorted the store itself newest-first, so the next
+        trim (which keeps the tail) threw away the newest events."""
+        storage.max_events = 3
+        start = datetime.now(UTC)
+
+        async def store(n: int) -> None:
+            await storage.store_event(
+                AuditEvent(
+                    timestamp=start + timedelta(minutes=n),
+                    user_id=n,
+                    event_type="test",
+                    success=True,
+                    details={},
+                )
+            )
+
+        for n in range(3):
+            await store(n)
+        await storage.get_events()
+        await store(3)
+
+        assert [e.user_id for e in storage.events] == [1, 2, 3]
+
     async def test_get_events_no_filter(self, storage):
         """Test getting events without filters."""
         # Store multiple events
@@ -421,6 +445,17 @@ class TestAuditLogger:
         assert event.details["violation_type"] == "path_traversal"
         assert event.details["severity"] == "high"
         assert event.risk_level == "critical"  # High severity maps to critical risk
+
+    async def test_critical_severity_is_not_downgraded(self, audit_logger, storage):
+        """``critical`` had no mapping and fell through to the ``high`` default."""
+        await audit_logger.log_security_violation(
+            user_id=123,
+            violation_type="path_traversal",
+            details="x",
+            severity="critical",
+        )
+
+        assert (await storage.get_events())[0].risk_level == "critical"
 
     async def test_log_rate_limit_exceeded(self, audit_logger, storage):
         """Test logging rate limit exceeded."""

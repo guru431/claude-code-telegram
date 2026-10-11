@@ -573,7 +573,7 @@ class SecurityValidator:
         """Get summary of security validation rules."""
         return {
             "approved_directory": str(self.approved_directory),
-            "allowed_extensions": sorted(list(self.ALLOWED_EXTENSIONS)),
+            "allowed_extensions": sorted(self.allowed_extensions),
             "forbidden_filenames": sorted(list(self.FORBIDDEN_FILENAMES)),
             "dangerous_patterns_count": len(self.DANGEROUS_PATTERNS),
             "dangerous_file_patterns_count": len(self.DANGEROUS_FILE_PATTERNS),

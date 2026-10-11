@@ -90,6 +90,33 @@ async def test_callback_cd_stays_within_project_root(thread_settings):
     query.edit_message_text.assert_called_once()
 
 
+async def test_ls_offers_go_up_only_below_project_root(thread_settings):
+    """At the project root ``cd:..`` is clamped back to it, so the button that
+    sends it must not be offered there."""
+    settings, project_root = thread_settings
+    project_root = project_root.resolve()
+    (project_root / "src").mkdir()
+
+    query = MagicMock()
+    query.edit_message_text = AsyncMock()
+    context = MagicMock()
+    context.bot_data = {"settings": settings}
+    context.user_data = {
+        "current_directory": project_root,
+        "_thread_context": {"project_root": str(project_root)},
+    }
+
+    async def button_labels() -> list[str]:
+        await callback._handle_ls_action(query, context)
+        markup = query.edit_message_text.call_args.kwargs["reply_markup"]
+        return [button.text for row in markup.inline_keyboard for button in row]
+
+    assert not any("Go Up" in label for label in await button_labels())
+
+    context.user_data["current_directory"] = project_root / "src"
+    assert any("Go Up" in label for label in await button_labels())
+
+
 async def test_start_private_mode_triggers_auto_sync(thread_settings):
     """Private mode /start auto-syncs project topics for current private chat."""
     settings, _ = thread_settings

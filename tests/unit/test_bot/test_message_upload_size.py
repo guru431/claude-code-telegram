@@ -105,3 +105,19 @@ async def test_limit_comes_from_settings(tmp_path):
     replies = _replies(update)
     assert any("too large" in r.lower() for r in replies)
     assert any("1MB" in r for r in replies)
+
+
+async def test_download_failure_does_not_echo_the_exception_text(tmp_path):
+    """A failure before the Claude run gets the generic error reply: the raw
+    exception text can carry host paths."""
+    update = _make_update()
+    context = _make_context(tmp_path, update)
+    update.message.document.get_file = AsyncMock(
+        side_effect=OSError("[Errno 13] Permission denied: '/srv/bot/tmp/upload'")
+    )
+
+    await handle_document(update, context)
+
+    replies = _replies(update)
+    assert any("Unexpected Error" in r for r in replies)
+    assert not any("/srv/bot" in r for r in replies)

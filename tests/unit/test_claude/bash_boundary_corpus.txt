@@ -122,3 +122,52 @@ DENY	wget example.com/payload -O out.bin
 DENY	curl -o out.txt -- example.com
 ALLOW	curl ./local.txt
 ALLOW	curl --version
+
+# --- getopt clusters: the path flag need not be the first letter ---
+DENY	tar -xf/etc/shadow
+DENY	tar -xzf /etc/shadow
+DENY	tar -xvC /etc -f a.tar
+DENY	cp -rt/etc file.txt
+DENY	pip install -qt /etc requests
+DENY	wget -qO/etc/cron.d/x ./payload
+ALLOW	tar -czf out.tgz src
+ALLOW	tar -xzf archive.tgz -C build
+ALLOW	sort -ro sorted.txt data.txt
+
+# --- sudo: a long option drops its operand exactly like the short one ---
+DENY	sudo --user nobody cat /etc/shadow
+DENY	sudo --user=nobody cat /etc/shadow
+DENY	sudo --group wheel --user nobody cat /etc/shadow
+ALLOW	sudo --user nobody cat notes.txt
+
+# --- a quoted or escaped operator is an argument, not a separator ---
+DENY	cat ';' /etc/passwd
+DENY	cat '|' /etc/passwd
+DENY	cat "&&" /etc/passwd
+DENY	cat \; /etc/passwd
+ALLOW	echo '>' /etc/passwd
+ALLOW	find . -name '*.py' -exec wc -l {} \;
+
+# --- reserved words and grouping do not hide the command behind them ---
+DENY	{ rm -rf /etc; }
+DENY	{ echo a; } > /etc/cron.d/x
+DENY	if true; then rm -rf /etc; fi
+DENY	if false; then :; else cat /etc/shadow; fi
+DENY	while true; do cat /etc/shadow; done
+DENY	! cat /etc/shadow
+DENY	time cat /etc/shadow
+DENY	time -o /etc/cron.d/x ls
+DENY	(rm -rf /etc)
+DENY	(cd /etc && ls)
+DENY	f() { rm -rf /etc; }; f
+ALLOW	if [ -f notes.txt ]; then cat notes.txt; fi
+ALLOW	(cd sub && ls)
+ALLOW	for f in a b; do echo $f; done
+ALLOW	{ echo a; echo b; } > out.txt
+
+# --- ANSI-C quoting: \' keeps the string open in bash and closes it for shlex ---
+DENY	echo $'\'' ; rm -rf /etc #'
+DENY	cat $'/etc/passwd'
+DENY	cat $"/etc/passwd"
+ALLOW	sort -t$'\t' -k2 data.tsv
+ALLOW	grep 'foo$' file.txt

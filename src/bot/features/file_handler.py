@@ -466,9 +466,12 @@ class FileHandler:
             # Create analysis prompt
             prompt = f"{context}\n\nProject structure:\n{file_tree}\n\n"
 
-            # Add key files
+            # Add key files. Only the first 1000 characters are shown, so read
+            # just enough bytes for them (UTF-8 is at most 4 per character)
+            # instead of a file that may be tens of megabytes.
             for file_path in code_files[:5]:  # Limit to 5 files
-                content = file_path.read_text(encoding="utf-8", errors="ignore")
+                with open(file_path, "rb") as fh:
+                    content = fh.read(4000).decode("utf-8", errors="ignore")
                 prompt += f"\nFile: {file_path.relative_to(extract_dir)}\n```\n{content[:1000]}...\n```\n"
 
             return ProcessedFile(
@@ -485,7 +488,15 @@ class FileHandler:
             shutil.rmtree(extract_dir, ignore_errors=True)
 
     async def _process_code_file(self, file_path: Path, context: str) -> ProcessedFile:
-        """Process single code file"""
+        """Process single code file.
+
+        Read off the event loop for the same reason as ``_process_archive``: an
+        upload may be as large as MAX_FILE_UPLOAD_SIZE_MB.
+        """
+        return await asyncio.to_thread(self._process_code_file_sync, file_path, context)
+
+    def _process_code_file_sync(self, file_path: Path, context: str) -> ProcessedFile:
+        """Process single code file (synchronous worker)."""
         content = file_path.read_text(encoding="utf-8", errors="ignore")
         if len(content) > MAX_INLINE_CONTENT:
             content = content[:MAX_INLINE_CONTENT] + "\n...[truncated]"
@@ -507,7 +518,11 @@ class FileHandler:
         )
 
     async def _process_text_file(self, file_path: Path, context: str) -> ProcessedFile:
-        """Process text file"""
+        """Process text file (off the event loop, as ``_process_code_file``)."""
+        return await asyncio.to_thread(self._process_text_file_sync, file_path, context)
+
+    def _process_text_file_sync(self, file_path: Path, context: str) -> ProcessedFile:
+        """Process text file (synchronous worker)."""
         content = file_path.read_text(encoding="utf-8", errors="ignore")
         if len(content) > MAX_INLINE_CONTENT:
             content = content[:MAX_INLINE_CONTENT] + "\n...[truncated]"

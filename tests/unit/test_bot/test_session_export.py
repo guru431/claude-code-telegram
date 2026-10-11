@@ -41,3 +41,14 @@ async def test_filename_session_segment_is_sanitized(
     assert exported.filename.startswith(expected_segment)
     assert exported.filename.endswith(".json")
     assert "/" not in exported.filename and "\\" not in exported.filename
+
+
+def test_html_export_keeps_heading_levels() -> None:
+    """``##`` used to come out as <h3>, flattening the document outline."""
+    html = SessionExporter(MagicMock())._markdown_to_html(
+        "# Title\n## Section\n### Message"
+    )
+
+    assert "<h1>Title</h1>" in html
+    assert "<h2>Section</h2>" in html
+    assert "<h3>Message</h3>" in html

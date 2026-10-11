@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import structlog
+from apscheduler.jobstores.base import JobLookupError  # type: ignore[import-untyped]
 from apscheduler.schedulers.asyncio import (
     AsyncIOScheduler,  # type: ignore[import-untyped]
 )
@@ -129,9 +130,12 @@ class JobScheduler:
         Returns True only if an active job row was actually deactivated, so the
         caller can tell "removed" apart from "no such job".
         """
+        # Only "no such job" is benign here. Any other failure leaves the job
+        # live in the scheduler, and deactivating its row anyway would hide a
+        # job that keeps firing from /schedule list until the next restart.
         try:
             self._scheduler.remove_job(job_id)
-        except Exception:
+        except JobLookupError:
             logger.warning("Job not found in scheduler", job_id=job_id)
 
         removed = await self._delete_job(job_id)

@@ -21,6 +21,9 @@ logger = structlog.get_logger()
 # replacing every non-alphanumeric character (except ``-``) with ``-``.
 _NON_ALNUM_RE = re.compile(r"[^a-zA-Z0-9-]")
 
+# A session id as it may appear in a file name: a UUID in practice.
+_SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
+
 
 def _encode_path(path: Path) -> str:
     """Encode a working-directory path the same way Claude Code does."""
@@ -130,7 +133,13 @@ def load_session_previews(cwd: Path, session_id: str) -> tuple[str, str]:
     Enriches rows the bot took from its own storage, where no directory scan
     happened: the JSONL path is fully determined by the session's cwd and id, so
     this is a couple of bounded reads rather than a walk.
+
+    The id comes from the bot's own storage and becomes a file name here, so
+    anything that is not a plain id (``../x``, an absolute path) is refused
+    rather than joined into a path outside the project's folder.
     """
+    if not _SESSION_ID_RE.fullmatch(session_id):
+        return "", ""
     path = _claude_projects_dir() / _encode_path(cwd) / f"{session_id}.jsonl"
     if not path.is_file():
         return "", ""

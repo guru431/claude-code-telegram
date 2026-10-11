@@ -121,9 +121,11 @@ class InMemoryAuditStorage(AuditStorage):
         if end_time is not None:
             filtered_events = [e for e in filtered_events if e.timestamp <= end_time]
 
-        # Sort by timestamp (newest first) and limit
-        filtered_events.sort(key=lambda e: e.timestamp, reverse=True)
-        return filtered_events[:limit]
+        # Sort by timestamp (newest first) and limit. ``sorted`` copies: with no
+        # filter ``filtered_events`` is ``self.events`` itself, and sorting that
+        # in place left the store newest-first, so the next trim in
+        # ``store_event`` (which keeps the tail) dropped the newest events.
+        return sorted(filtered_events, key=lambda e: e.timestamp, reverse=True)[:limit]
 
     async def get_security_violations(
         self,
@@ -404,7 +406,12 @@ class AuditLogger:
     ) -> None:
         """Log security violation."""
         # Map severity to risk level
-        risk_mapping = {"low": "medium", "medium": "high", "high": "critical"}
+        risk_mapping = {
+            "low": "medium",
+            "medium": "high",
+            "high": "critical",
+            "critical": "critical",
+        }
         risk_level = risk_mapping.get(severity, "high")
 
         event = AuditEvent(

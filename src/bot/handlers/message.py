@@ -1127,8 +1127,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     "Failed to delete progress message", error=str(delete_error)
                 )
 
-        error_msg = f"❌ <b>Error processing file</b>\n\n{escape_html(str(e))}"
-        await update.message.reply_text(error_msg, parse_mode="HTML")
+        await update.message.reply_text(_format_error_message(e), parse_mode="HTML")
 
         # Log failed file processing
         if audit_logger:

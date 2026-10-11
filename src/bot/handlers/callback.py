@@ -962,7 +962,12 @@ async def _handle_ls_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         # Add buttons
         keyboard = []
-        if current_dir != settings.approved_directory:
+        # Compare against the root ``cd:..`` is clamped to (the project root in
+        # thread mode), or the button shows up there and does nothing.
+        directory_root = (
+            _get_thread_project_root(settings, context) or settings.approved_directory
+        )
+        if current_dir != directory_root:
             keyboard.append(
                 [
                     InlineKeyboardButton("⬆️ Go Up", callback_data="cd:.."),

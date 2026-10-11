@@ -10,7 +10,7 @@ Features:
 import asyncio
 import sqlite3
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, List, Optional, Tuple, Union
 
@@ -26,8 +26,22 @@ logger = structlog.get_logger()
 # Register explicit adapters/converters once at import time to avoid warnings
 # and keep consistent ISO-8601 persistence for datetime values.
 sqlite3.register_adapter(datetime, lambda value: value.isoformat())
-sqlite3.register_converter("TIMESTAMP", lambda b: datetime.fromisoformat(b.decode()))
-sqlite3.register_converter("DATETIME", lambda b: datetime.fromisoformat(b.decode()))
+
+
+def _convert_timestamp(raw: bytes) -> datetime:
+    """Read a stored timestamp as timezone-aware UTC.
+
+    Values written through the adapter carry ``+00:00``, but columns filled by
+    ``DEFAULT CURRENT_TIMESTAMP`` hold naive ``YYYY-MM-DD HH:MM:SS`` text (UTC by
+    SQLite's definition). Returning those naive handed callers a datetime that
+    raises ``TypeError`` the moment it meets ``datetime.now(UTC)``.
+    """
+    value = datetime.fromisoformat(raw.decode())
+    return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+sqlite3.register_converter("TIMESTAMP", _convert_timestamp)
+sqlite3.register_converter("DATETIME", _convert_timestamp)
 # Keep DATE columns as raw ISO strings (matches existing model expectations).
 sqlite3.register_converter("DATE", lambda b: b.decode())
 

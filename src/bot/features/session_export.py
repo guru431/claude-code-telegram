@@ -335,7 +335,7 @@ class SessionExporter:
         # are each wrapped in a properly closed tag.
         def _wrap_headers(match: "re.Match[str]") -> str:
             hashes, text = match.group(1), match.group(2)
-            level = 1 if len(hashes) == 1 else 3
+            level = len(hashes)
             return f"<h{level}>{text}</h{level}>"
 
         html = re.sub(r"^(#{1,3}) (.*)$", _wrap_headers, html, flags=re.MULTILINE)

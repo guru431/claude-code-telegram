@@ -1,5 +1,6 @@
 """Regressions for SQLite-backed session storage."""
 
+import asyncio
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -121,5 +122,48 @@ class TestUserSessionCounter:
             last_used=datetime.now(UTC),
         )
         await session_storage.save_session(second)
+
+        assert await self._session_count(session_storage, 555001) == 2
+
+    async def test_concurrent_saves_of_a_new_session_count_once(
+        self, session_storage, sample_session, monkeypatch
+    ):
+        """Whether a session row is new must be decided under the write lock.
+
+        Each save runs on its own pooled connection. With a separate "does it
+        exist?" SELECT ahead of the upsert, every concurrent save of one new
+        session saw no row yet and bumped users.session_count.
+        """
+        # The user row exists already, so the saves below take no early lock.
+        await session_storage.save_session(
+            ClaudeSession(
+                session_id="warm-up",
+                user_id=555001,
+                project_path=Path("/test/path"),
+                created_at=datetime.now(UTC),
+                last_used=datetime.now(UTC),
+            )
+        )
+
+        # Hold every save just before its session write until all of them are
+        # there, so the writes are guaranteed to overlap.
+        saves = 4
+        arrived = 0
+        all_arrived = asyncio.Event()
+        ensure_user_exists = session_storage._ensure_user_exists
+
+        async def gated(conn, user_id, username=None):
+            nonlocal arrived
+            await ensure_user_exists(conn, user_id, username)
+            arrived += 1
+            if arrived == saves:
+                all_arrived.set()
+            await all_arrived.wait()
+
+        monkeypatch.setattr(session_storage, "_ensure_user_exists", gated)
+
+        await asyncio.gather(
+            *(session_storage.save_session(sample_session) for _ in range(saves))
+        )
 
         assert await self._session_count(session_storage, 555001) == 2

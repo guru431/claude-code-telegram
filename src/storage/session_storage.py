@@ -92,36 +92,23 @@ class SQLiteSessionStorage(SessionStorage):
             # upsert so a failed upsert cannot leave a committed orphan user.
             await self._ensure_user_exists(conn, session.user_id)
 
-            # Does this session already have a row? The upsert below reports
-            # rowcount 1 for both insert and update, so ownership of
-            # users.session_count needs the answer up front. This is the
-            # production write path for sessions (SessionManager -> here), and
-            # it never bumped the counter — only Storage.create_session did,
-            # which nothing in the running bot calls. The result was
-            # sessions=N / users.session_count=0 in every deployment.
+            # Insert first and let the statement say whether the row is new:
+            # ``ON CONFLICT DO NOTHING`` reports rowcount 0 for an existing
+            # session, and the INSERT takes the write lock, so the answer cannot
+            # go stale. (A ``DO UPDATE`` upsert reports 1 either way, and the
+            # "does it exist?" SELECT that used to precede it ran outside the
+            # lock — concurrent saves of one new session each saw no row and
+            # each bumped users.session_count.) This is the production write
+            # path for sessions (SessionManager -> here), so the counter is
+            # kept here: Storage.create_session bumps it too, but nothing in
+            # the running bot calls that.
             cursor = await conn.execute(
-                "SELECT 1 FROM sessions WHERE session_id = ?",
-                (session_model.session_id,),
-            )
-            is_new_row = await cursor.fetchone() is None
-
-            # Single race-safe upsert: avoids the UPDATE-then-INSERT PK race of
-            # two separate pooled connections, and restores is_active=TRUE so a
-            # session marked inactive by cleanup/eviction becomes visible to
-            # listings and the max_sessions count again when it is re-saved
-            # (it is still resumable).
-            await conn.execute(
                 """
                 INSERT INTO sessions
                 (session_id, user_id, project_path, created_at, last_used,
                  total_cost, total_turns, message_count)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(session_id) DO UPDATE SET
-                    last_used = excluded.last_used,
-                    total_cost = excluded.total_cost,
-                    total_turns = excluded.total_turns,
-                    message_count = excluded.message_count,
-                    is_active = TRUE
+                ON CONFLICT(session_id) DO NOTHING
             """,
                 (
                     session_model.session_id,
@@ -134,6 +121,7 @@ class SQLiteSessionStorage(SessionStorage):
                     session_model.message_count,
                 ),
             )
+            is_new_row = cursor.rowcount == 1
 
             if is_new_row:
                 # Same transaction as the INSERT: two separate commits can
@@ -145,6 +133,29 @@ class SQLiteSessionStorage(SessionStorage):
                     "UPDATE users SET session_count = session_count + 1 "
                     "WHERE user_id = ?",
                     (session_model.user_id,),
+                )
+            else:
+                # Restores is_active=TRUE so a session marked inactive by
+                # cleanup/eviction becomes visible to listings and the
+                # max_sessions count again when it is re-saved (it is still
+                # resumable).
+                await conn.execute(
+                    """
+                    UPDATE sessions SET
+                        last_used = ?,
+                        total_cost = ?,
+                        total_turns = ?,
+                        message_count = ?,
+                        is_active = TRUE
+                    WHERE session_id = ?
+                """,
+                    (
+                        session_model.last_used,
+                        session_model.total_cost,
+                        session_model.total_turns,
+                        session_model.message_count,
+                        session_model.session_id,
+                    ),
                 )
 
             await conn.commit()

@@ -53,12 +53,14 @@ class ResponseFormatter:
         text = self._format_code_blocks(text)
         messages = self._split_message(text)
 
-        # Add context-aware quick actions to the last message
-        if messages and self.settings.enable_quick_actions:
-            messages[-1].reply_markup = self._get_contextual_keyboard(context)
-
         # Filter out any empty messages produced by formatting/splitting
         messages = [m for m in messages if m.text and m.text.strip()]
+
+        # Add context-aware quick actions to the last message that is actually
+        # sent: attached before the filter, the keyboard went down with a
+        # whitespace-only trailing chunk.
+        if messages and self.settings.enable_quick_actions:
+            messages[-1].reply_markup = self._get_contextual_keyboard(context)
 
         return (
             messages

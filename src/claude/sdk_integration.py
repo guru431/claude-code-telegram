@@ -661,9 +661,11 @@ class ClaudeSDKManager:
             is_error = False
             error_type: Optional[str] = None
             saw_result_message = False
+            reported_turns: Optional[int] = None
             for message in messages:
                 if isinstance(message, ResultMessage):
                     saw_result_message = True
+                    reported_turns = getattr(message, "num_turns", None)
                     cost = getattr(message, "total_cost_usd", 0.0) or 0.0
                     claude_session_id = getattr(message, "session_id", None)
                     result_content = getattr(message, "result", None)
@@ -755,18 +757,23 @@ class ClaudeSDKManager:
                             content_parts.append(str(msg_content))
                 content = "\n".join(content_parts)
 
+            # Claude's own count when it reported one. The fallback (no
+            # ResultMessage) counts assistant messages only: tool results come
+            # back as UserMessage, so counting those too turned one agent turn
+            # with three tool calls into four.
+            if isinstance(reported_turns, int) and not isinstance(reported_turns, bool):
+                num_turns = reported_turns
+            else:
+                num_turns = len(
+                    [m for m in messages if isinstance(m, AssistantMessage)]
+                )
+
             return ClaudeResponse(
                 content=content,
                 session_id=final_session_id,
                 cost=cost,
                 duration_ms=duration_ms,
-                num_turns=len(
-                    [
-                        m
-                        for m in messages
-                        if isinstance(m, (UserMessage, AssistantMessage))
-                    ]
-                ),
+                num_turns=num_turns,
                 is_error=is_error,
                 error_type=error_type,
                 tools_used=tools_used,

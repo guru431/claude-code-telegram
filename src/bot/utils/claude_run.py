@@ -94,5 +94,11 @@ async def run_claude_for_user(
     finally:
         # Always release the hold: success, soft error, exception and cancel
         # alike. An unsettled hold blocks the user's budget until it is swept.
+        # A run that raised settles at 0 and that is accepted, not overlooked:
+        # the SDK reports cost only in the final ResultMessage, so no figure
+        # exists for what a timed-out or crashed run burned before it failed,
+        # and that spend stays invisible to the daily limit. Charging the
+        # estimate instead would bill failures that never reached Claude (CLI
+        # missing, connection refused) with a made-up number.
         if rate_limiter is not None and reservation_id:
             await rate_limiter.settle_reservation(reservation_id, actual_cost)

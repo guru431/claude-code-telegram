@@ -1,6 +1,7 @@
 """Tests for database management."""
 
 import tempfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -107,6 +108,22 @@ class TestDatabaseManager:
 
         assert "risk_level" in columns
         assert "session_id" in columns
+
+    async def test_default_timestamps_are_read_timezone_aware(self, db_manager):
+        """A ``DEFAULT CURRENT_TIMESTAMP`` column holds naive UTC text. Read back
+        naive, it raised TypeError against the aware values everything else
+        carries."""
+        async with db_manager.get_connection() as conn:
+            await conn.execute(
+                "INSERT INTO scheduled_jobs "
+                "(job_id, job_name, cron_expression, prompt, working_directory) "
+                "VALUES ('j1', 'n', '* * * * *', 'p', '/w')"
+            )
+            cursor = await conn.execute("SELECT created_at FROM scheduled_jobs")
+            created_at = (await cursor.fetchone())[0]
+
+        assert created_at.tzinfo is not None
+        assert abs(datetime.now(UTC) - created_at) < timedelta(minutes=5)
 
 
 class TestDatabaseClose:

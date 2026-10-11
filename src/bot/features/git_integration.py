@@ -95,6 +95,30 @@ class GitIntegration:
         r"-c\s*core\.sshCommand",
     ]
 
+    # Options that take an otherwise read-only subcommand outside the
+    # repository: ``diff --no-index A B`` prints any two files on the host,
+    # ``--output=FILE`` writes the result wherever it is told.
+    FORBIDDEN_OPTIONS = ("--no-index", "--output")
+
+    # ``branch`` and ``remote`` only list with these arguments. Any other form
+    # creates, renames or deletes a ref or a remote (``branch -D``, ``remote
+    # remove``) or talks to the network (``remote update``).
+    READ_ONLY_ARGUMENTS = {
+        "branch": {
+            "--show-current",
+            "--list",
+            "-l",
+            "-a",
+            "--all",
+            "-r",
+            "--remotes",
+            "-v",
+            "-vv",
+            "--verbose",
+        },
+        "remote": {"-v", "--verbose"},
+    }
+
     def __init__(self, settings: Settings):
         """Initialize git integration.
 
@@ -127,8 +151,10 @@ class GitIntegration:
         if not command or command[0] != "git":
             raise SecurityError("Only git commands allowed")
 
-        if len(command) < 2 or command[1] not in self.SAFE_COMMANDS:
-            raise SecurityError(f"Unsafe git command: {command[1]}")
+        subcommand = command[1] if len(command) > 1 else ""
+        if subcommand not in self.SAFE_COMMANDS:
+            raise SecurityError(f"Unsafe git command: {subcommand}")
+        self._validate_arguments(subcommand, command[2:])
 
         # Check for dangerous patterns
         cmd_str = " ".join(command)
@@ -172,9 +198,38 @@ class GitIntegration:
                 process.kill()
                 await process.wait()
             raise GitError("Git command timed out")
+        except GitError:
+            # Git's own refusal (non-zero exit, e.g. no upstream configured) is
+            # an expected outcome: pass it on as raised instead of logging it
+            # as an error and wrapping its message a second time.
+            raise
         except Exception as e:
             logger.error(f"Git command error: {e}")
             raise GitError(f"Failed to execute git command: {e}")
+
+    def _validate_arguments(self, subcommand: str, args: List[str]) -> None:
+        """Reject arguments that make an allowed subcommand unsafe.
+
+        Raises:
+            SecurityError: If an argument is not read-only for *subcommand*
+        """
+        read_only = self.READ_ONLY_ARGUMENTS.get(subcommand)
+        if read_only is not None:
+            for arg in args:
+                if arg not in read_only:
+                    raise SecurityError(f"Unsafe git {subcommand} argument: {arg}")
+            return
+
+        # Everything after ``--`` is a pathspec, not an option. Git accepts any
+        # unambiguous prefix of a long option (``--no-ind``, ``--outp=FILE``),
+        # so a forbidden option is matched by prefix, not by its full name.
+        options = args[: args.index("--")] if "--" in args else args
+        for option in options:
+            name = option.split("=", 1)[0]
+            if len(name) > 2 and any(
+                forbidden.startswith(name) for forbidden in self.FORBIDDEN_OPTIONS
+            ):
+                raise SecurityError(f"Unsafe git option: {option}")
 
     async def get_status(self, repo_path: Path) -> GitStatus:
         """Get repository status.
@@ -191,9 +246,12 @@ class GitIntegration:
         )
         branch = branch_out.strip() or "HEAD"
 
-        # Get file status
+        # Get file status. ``-z`` ends every entry with NUL and prints paths
+        # verbatim. The line format C-quotes a name holding a quote, backslash
+        # or control character and writes a rename as "old -> new", which a
+        # file literally named "a -> b" cannot be told apart from.
         status_out, _ = await self.execute_git_command(
-            ["git", "status", "--porcelain=v1"], repo_path
+            ["git", "status", "--porcelain=v1", "-z"], repo_path
         )
 
         modified = []
@@ -201,18 +259,21 @@ class GitIntegration:
         deleted = []
         untracked = []
 
-        for line in status_out.strip().split("\n"):
-            if not line:
+        # Split on NUL only, never strip: a leading space is the index column
+        # of the first entry (" M file"), and paths may end in whitespace.
+        entries = status_out.split("\0")
+        position = 0
+        while position < len(entries):
+            entry = entries[position]
+            position += 1
+            if not entry:
                 continue
 
             # Porcelain v1: XY then a space then the path. X is the index
-            # (staged) column, Y the worktree column. For renames/copies the
-            # path field is "old -> new"; take the new path.
-            index_col = line[0]
-            worktree_col = line[1]
-            path = line[3:]
-            if " -> " in path:
-                path = path.split(" -> ", 1)[1]
+            # (staged) column, Y the worktree column.
+            index_col = entry[0]
+            worktree_col = entry[1]
+            path = entry[3:]
 
             if index_col == "?" and worktree_col == "?":
                 untracked.append(path)
@@ -221,8 +282,10 @@ class GitIntegration:
                 worktree_col,
             ):
                 # Rename or copy: tree changed — record the new path. Treated
-                # as a modification so is_clean reports dirty.
+                # as a modification so is_clean reports dirty. With ``-z`` the
+                # original path follows as an entry of its own; skip it.
                 modified.append(path)
+                position += 1
             elif "D" in (index_col, worktree_col):
                 deleted.append(path)
             elif "A" in (index_col, worktree_col):

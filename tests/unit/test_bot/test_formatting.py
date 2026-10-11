@@ -289,6 +289,22 @@ class TestResponseFormatter:
             # Should be balanced or have one extra opening (continued in next message)
             assert abs(opening_count - closing_count) <= 1
 
+    def test_quick_actions_go_on_the_last_message_that_is_sent(
+        self, formatter, monkeypatch
+    ):
+        """The keyboard was attached before empty chunks were dropped, so a
+        whitespace-only trailing chunk took it down with it."""
+        monkeypatch.setattr(
+            formatter,
+            "_split_message",
+            lambda text: [FormattedMessage("answer"), FormattedMessage(" \n")],
+        )
+
+        messages = formatter.format_claude_response("answer")
+
+        assert [m.text for m in messages] == ["answer"]
+        assert messages[-1].reply_markup is not None
+
     def test_long_response_not_split_inside_pre_tag(self, formatter):
         """A long HTML response with a <pre> block must not be cut mid-tag.
 

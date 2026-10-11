@@ -351,6 +351,20 @@ _LAUNCHER_WRAPPERS: Set[str] = {
     # because ``sudo`` is a wrapper). Strip them and classify what they launch.
     "env",
     "xargs",
+    # Shell reserved words that prefix a command the same way: ``{ rm -rf /etc;
+    # }``, ``if …; then rm -rf /etc; fi``, ``! cat /etc/shadow``. Left as the
+    # base command they are just another unknown name, and the command behind
+    # them ran unchecked.
+    "{",
+    "!",
+    "time",
+    "if",
+    "then",
+    "elif",
+    "else",
+    "while",
+    "until",
+    "do",
 }
 
 # Wrappers that take a numeric/value operand of their own *before* the wrapped
@@ -364,8 +378,36 @@ _WRAPPERS_WITH_NUMERIC_OPERAND: Set[str] = {"timeout", "nice", "ionice", "chrt"}
 # operand too, ``sudo -u user cat /etc/passwd`` leaves ``user`` as the base
 # command and the real ``cat /etc/passwd`` is never checked.
 _WRAPPER_OPERAND_FLAGS: dict[str, Set[str]] = {
-    "sudo": {"-u", "-g", "-C", "-h", "-p", "-r", "-t", "-U", "-c"},
+    # Long spellings included: ``sudo --user nobody cat /etc/shadow`` must drop
+    # ``nobody`` exactly as ``sudo -u nobody …`` does.
+    "sudo": {
+        "-u",
+        "-g",
+        "-C",
+        "-D",
+        "-h",
+        "-p",
+        "-R",
+        "-r",
+        "-t",
+        "-T",
+        "-U",
+        "-c",
+        "--user",
+        "--group",
+        "--close-from",
+        "--chdir",
+        "--host",
+        "--prompt",
+        "--chroot",
+        "--role",
+        "--type",
+        "--command-timeout",
+        "--other-user",
+        "--login-class",
+    },
     "doas": {"-u", "-C"},
+    "time": {"-f", "--format"},
     "env": {"-u", "--unset", "-C", "--chdir"},
     "xargs": {
         "-I",
@@ -403,6 +445,7 @@ _WRAPPER_CODE_STRING_FLAGS: dict[str, Set[str]] = {
 # dropping it from the command position.
 _WRAPPER_PATH_OPERAND_FLAGS: dict[str, Set[str]] = {
     "xargs": {"-a", "--arg-file"},
+    "time": {"-o", "--output"},
 }
 
 
@@ -488,8 +531,10 @@ def _strip_launcher_wrappers(cmd_tokens: list[str]) -> _StrippedCommand:
     return _StrippedCommand(cmd_tokens, None, path_operands)
 
 
-# Bash command separators
-_COMMAND_SEPARATORS: Set[str] = {"&&", "||", ";", "|", "&"}
+# Bash command separators. Parentheses count: ``(rm -rf /etc)`` and the body of
+# ``f() { …; }`` start a command just as ``;`` does, and glued to the word they
+# used to hide it (``(rm`` is an unknown name).
+_COMMAND_SEPARATORS: Set[str] = {"&&", "||", ";", "|", "&", "(", ")"}
 
 # Redirection operators. The token *following* one of these is a filesystem
 # path the command writes to / reads from (e.g. ``echo x > /etc/cron.d/y``),
@@ -535,7 +580,25 @@ _SHELL_OPERATORS: Tuple[str, ...] = (
     "|",
     ";",
     "&",
+    "(",
+    ")",
 )
+
+# Prefix the normalizer puts on every operator it finds *outside quotes*, so the
+# tokens ``shlex`` hands back can be told apart from an argument that merely
+# spells one. In ``cat ';' /etc/passwd`` the ``;`` is a file name; read as a
+# separator it cut ``/etc/passwd`` off from ``cat`` and left it unchecked. NUL
+# cannot occur in a command line, so the mark cannot be forged from inside one.
+_OPERATOR_MARK = "\x00"
+
+
+class _Operator(str):
+    """A shell operator that stood unquoted in the command."""
+
+
+# ``$'…`` up to, not including, its closing quote, as bash reads it.
+_ANSI_C_STRING_RE = re.compile(r"\$'(?:[^'\\]|\\.)*")
+
 
 # Character devices that are legitimate redirection targets even though they sit
 # outside the approved root. ``2>/dev/null`` appears in a large share of ordinary
@@ -563,6 +626,13 @@ def _normalize_shell_operators(line: str) -> str:
     backslash-escaped operators are left alone (``grep 'a|b' f`` keeps its pipe
     inside the pattern). An unterminated quote is left as-is for ``shlex`` to
     reject, which the caller turns into a denial.
+
+    Each operator found this way is prefixed with ``_OPERATOR_MARK`` (see
+    :func:`_tokenize`). Raises ``ValueError`` — a denial, like a ``shlex``
+    failure — on ``$'…\\'…'``: inside ANSI-C quoting ``\\'`` continues the
+    string where ``shlex`` ends it, so from there on the two disagree about
+    what is quoted and ``echo $'\\'' ; rm -rf /etc #'`` reads as one harmless
+    ``echo`` here. ``$'\\t'`` and the like tokenize the same either way.
     """
     out: list[str] = []
     i = 0
@@ -593,6 +663,14 @@ def _normalize_shell_operators(line: str) -> str:
             out.append(line[i + 1])
             i += 2
             continue
+        if ch == "$" and line.startswith(("'", '"'), i + 1):
+            ansi_c = _ANSI_C_STRING_RE.match(line, i)
+            if ansi_c and "'" in ansi_c.group()[2:]:
+                raise ValueError("escaped quote inside ANSI-C quoting")
+            # ``$'…'`` and ``$"…"`` stand for the quoted text itself. Kept, the
+            # ``$`` made ``cat $'/etc/passwd'`` a relative ``$/etc/passwd``.
+            i += 1
+            continue
         if ch == "'":
             in_single = True
             out.append(ch)
@@ -606,7 +684,7 @@ def _normalize_shell_operators(line: str) -> str:
         for op in _SHELL_OPERATORS:
             if line.startswith(op, i):
                 out.append(" ")
-                out.append(op)
+                out.append(_OPERATOR_MARK + op)
                 out.append(" ")
                 i += len(op)
                 break
@@ -614,6 +692,78 @@ def _normalize_shell_operators(line: str) -> str:
             out.append(ch)
             i += 1
     return "".join(out)
+
+
+def _tokenize(line: str) -> list[str]:
+    """Split one command line into shell words.
+
+    Operators that stood unquoted come back as :class:`_Operator`; a quoted or
+    escaped one (``';'``, ``\\;``) is an ordinary word. Raises ``ValueError``
+    when the line cannot be tokenized.
+    """
+    return [
+        _Operator(token[1:]) if token.startswith(_OPERATOR_MARK) else token
+        for token in shlex.split(_normalize_shell_operators(line))
+    ]
+
+
+# A heredoc whose body is plain data: ``cat`` or ``tee`` copying it to stdout or
+# to a file. Only this exact shape counts — one simple command with plain
+# arguments and ``>`` redirections; no quoting, expansion, comment, pipe, chain
+# or second ``<`` anywhere on the line — so where the body starts and who reads
+# it is never a matter of interpretation.
+_DATA_HEREDOC_RE = re.compile(
+    r"""^[ \t]*(?:cat|tee)(?=[ \t<>])
+        [\w \t>./~+,:=@%^-]*
+        <<(?P<strip>-?)[ \t]*
+        (?P<quote>['"]?)(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)
+        [\w \t>./~+,:=@%^-]*$
+    """,
+    re.VERBOSE,
+)
+
+
+def _split_data_heredocs(lines: list[str]) -> Tuple[list[str], list[str]]:
+    """Set aside heredoc bodies that are data, not commands.
+
+    Returns ``(command_lines, expanded_lines)``: the lines to check as commands,
+    and those plus every body bash still expands — an unquoted delimiter keeps
+    ``$(…)`` live inside the body, a quoted one (``<<'EOF'``) makes it literal.
+
+    Without this, each body line of ``cat > deploy.sh <<EOF`` was parsed as a
+    command of its own: a line with an apostrophe failed to tokenize, a line
+    naming ``curl https://…`` was refused as a fetch, and a quoted body holding
+    ``$(…)`` as a substitution.
+
+    Any ``<<`` outside the recognised shape turns the whole thing off (every
+    line is a command again, as before): which later lines belong to *that*
+    heredoc is not modelled, so a body recognised after it could be misplaced.
+    """
+    commands: list[str] = []
+    expanded: list[str] = []
+    position = 0
+    while position < len(lines):
+        line = lines[position]
+        position += 1
+        commands.append(line)
+        expanded.append(line)
+        match = _DATA_HEREDOC_RE.match(line)
+        if match is None:
+            if "<<" in line:
+                return lines, lines
+            continue
+        while position < len(lines):
+            body = lines[position]
+            position += 1
+            if (body.lstrip("\t") if match["strip"] else body) == match["delimiter"]:
+                break
+            if not match["quote"]:
+                # Bash joins a backslash-newline in an expanding body, so the
+                # terminator could be assembled from two lines we see apart.
+                if body.endswith("\\"):
+                    return lines, lines
+                expanded.append(body)
+    return commands, expanded
 
 
 # Path-bearing option flags per command. Their value is a filesystem path the
@@ -660,40 +810,50 @@ def check_bash_directory_boundary(
 ) -> Tuple[bool, Optional[str]]:
     """Check if a bash command's paths stay within the approved directory."""
 
-    # Reject subshells / command substitution outright — shlex.split bundles
-    # ``$(rm -rf /etc)`` and ``<(cat /etc/shadow)`` into a single opaque token,
-    # so per-command path checking cannot see what's executing inside. We
-    # consider such constructs out of scope for static analysis.
-    for pat in _SUBSHELL_PATTERNS:
-        if pat.search(command):
-            return False, (
-                "Directory boundary violation: command contains subshell or "
-                "command-substitution syntax which cannot be safely validated"
-            )
+    unparseable = (
+        False,
+        "Directory boundary violation: command could not be parsed for "
+        "path validation and is not allowed",
+    )
+    if _OPERATOR_MARK in command:
+        return unparseable
 
     # Newlines are command separators in bash, but shlex.split collapses them
     # into ordinary whitespace — so ``echo a\nrm -rf /outside`` would be parsed
     # as a single ``echo``-led chain and skip path validation. Split on newlines
     # first and tokenize each physical line independently so each line becomes
-    # its own command chain.
+    # its own command chain. Heredoc bodies that are data are not commands.
+    command_lines, expanded_lines = _split_data_heredocs(
+        command.replace("\r", "\n").split("\n")
+    )
+
+    # Reject subshells / command substitution outright — shlex.split bundles
+    # ``$(rm -rf /etc)`` and ``<(cat /etc/shadow)`` into a single opaque token,
+    # so per-command path checking cannot see what's executing inside. We
+    # consider such constructs out of scope for static analysis.
+    expanded = "\n".join(expanded_lines)
+    for pat in _SUBSHELL_PATTERNS:
+        if pat.search(expanded):
+            return False, (
+                "Directory boundary violation: command contains subshell or "
+                "command-substitution syntax which cannot be safely validated"
+            )
+
     tokens: list[str] = []
-    for line in command.replace("\r", "\n").split("\n"):
+    for line in command_lines:
         if not line.strip():
             continue
         try:
-            line_tokens = shlex.split(_normalize_shell_operators(line))
+            line_tokens = _tokenize(line)
         except ValueError:
             # A command we cannot tokenize (e.g. an unclosed quote) cannot be
             # boundary-checked at all. Deny by default rather than fail open —
             # otherwise any malformed command bypasses the check whenever the OS
             # sandbox is disabled.
-            return False, (
-                "Directory boundary violation: command could not be parsed for "
-                "path validation and is not allowed"
-            )
+            return unparseable
         if tokens and line_tokens:
             # Treat the line break as a separator between chains.
-            tokens.append(";")
+            tokens.append(_Operator(";"))
         tokens.extend(line_tokens)
 
     if not tokens:
@@ -704,7 +864,7 @@ def check_bash_directory_boundary(
     current_chain: list[str] = []
 
     for token in tokens:
-        if token in _COMMAND_SEPARATORS:
+        if isinstance(token, _Operator) and token in _COMMAND_SEPARATORS:
             if current_chain:
                 command_chains.append(current_chain)
             current_chain = []
@@ -800,7 +960,11 @@ def check_bash_directory_boundary(
         # redirection operator even for no-path commands like ``echo`` (so
         # ``echo x > /etc/cron.d/y`` is caught).
         for idx, token in enumerate(cmd_tokens):
-            if token in _REDIRECTION_OPERATORS and idx + 1 < len(cmd_tokens):
+            if (
+                isinstance(token, _Operator)
+                and token in _REDIRECTION_OPERATORS
+                and idx + 1 < len(cmd_tokens)
+            ):
                 target = cmd_tokens[idx + 1]
                 if _path_escapes(target):
                     return False, (
@@ -948,9 +1112,17 @@ def check_bash_directory_boundary(
                         if idx < len(rest_tokens):
                             path_value = rest_tokens[idx]
                             idx += 1
-                    elif len(token) > 2 and token[1] != "-" and token[:2] in short_set:
-                        # Bundled form ``-tDIR``.
-                        path_value = token[2:]
+                    elif len(token) > 2 and token[1] != "-":
+                        # Bundled form ``-tDIR``, and a getopt cluster where the
+                        # path flag is not the first letter: ``-xf/etc/shadow``
+                        # (value attached) or ``-xf ARCHIVE`` (value next).
+                        for pos in range(1, len(token)):
+                            if f"-{token[pos]}" in short_set:
+                                path_value = token[pos + 1 :]
+                                if not path_value and idx < len(rest_tokens):
+                                    path_value = rest_tokens[idx]
+                                    idx += 1
+                                break
                 if path_value and _path_escapes(path_value):
                     return False, (
                         f"Directory boundary violation: '{base_command}' "

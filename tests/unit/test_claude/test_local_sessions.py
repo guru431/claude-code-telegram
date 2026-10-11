@@ -121,3 +121,19 @@ class TestLoadSessionPreviews:
         )
 
         assert load_session_previews(tmp_path, "missing") == ("", "")
+
+    def test_session_id_cannot_leave_the_project_folder(self, tmp_path, monkeypatch):
+        """The id becomes a file name; ``../x`` must not reach another folder."""
+        projects = tmp_path / "projects"
+        cwd = tmp_path / "work"
+        (projects / _encode_path(cwd)).mkdir(parents=True)
+        _write_jsonl(
+            projects / "other.jsonl",
+            [
+                {"type": "summary", "cwd": "elsewhere", "timestamp": "2026-01-01"},
+                _user("someone else's prompt"),
+            ],
+        )
+        monkeypatch.setattr(local_sessions, "_claude_projects_dir", lambda: projects)
+
+        assert load_session_previews(cwd, "../other") == ("", "")

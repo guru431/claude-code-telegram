@@ -13,6 +13,7 @@ from claude_agent_sdk import (
     ResultMessage,
     TextBlock,
     ToolPermissionContext,
+    UserMessage,
 )
 from claude_agent_sdk._errors import MessageParseError
 from claude_agent_sdk.types import StreamEvent
@@ -224,6 +225,42 @@ class TestClaudeSDKManager:
             )
 
         assert response.content == "Extracted from messages"
+
+    async def test_num_turns_is_the_count_claude_reports(self, sdk_manager):
+        """ResultMessage.num_turns wins over a count of stream messages."""
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("first"),
+            _make_assistant_message("second"),
+            _make_result_message(num_turns=7),
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            response = await sdk_manager.execute_command(
+                prompt="Test prompt",
+                working_directory=Path("/test"),
+            )
+
+        assert response.num_turns == 7
+
+    async def test_num_turns_fallback_ignores_tool_results(self, sdk_manager):
+        """With no ResultMessage only assistant messages count as turns: a tool
+        result arrives as a UserMessage and used to be counted as one more."""
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("calling a tool"),
+            UserMessage(content="tool output"),
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            response = await sdk_manager.execute_command(
+                prompt="Test prompt",
+                working_directory=Path("/test"),
+            )
+
+        assert response.num_turns == 1
 
     async def test_execute_command_with_streaming(self, sdk_manager):
         """Test command execution with streaming callback."""

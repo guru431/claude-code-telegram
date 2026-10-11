@@ -28,6 +28,14 @@ if (-not $t_work) {
     else { $t_work = (Get-Location).Path }
 }
 
+# The path is pasted into a cmd.exe command line below, and cmd expands %NAME%
+# even inside quotes: a checkout under a folder called %TEMP% would send the
+# task somewhere else without a word.
+if ($t_work.Contains('%')) {
+    Write-Error "Project path contains '%', which cmd.exe expands as an environment variable: $t_work. Move the checkout or pass -ProjectRoot <path>."
+    exit 1
+}
+
 if (-not (Test-Path (Join-Path $t_work 'pyproject.toml')) -or
     -not (Test-Path (Join-Path $t_work 'src'))) {
     Write-Error "Not a project root: $t_work (expected pyproject.toml and src\). Pass -ProjectRoot <path>."
@@ -91,4 +99,6 @@ try {
     }
 }
 
-Start-Sleep -Seconds 5
+# The only trigger is system startup, so nothing is running yet.
+Write-Host "Task '$t_name' registered. It starts at the next boot; to start it now:"
+Write-Host "  Start-ScheduledTask -TaskName '$t_name'"
