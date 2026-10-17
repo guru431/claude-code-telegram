@@ -48,8 +48,9 @@ async def rate_limit_middleware(
     )
 
     if not user_id:
+        # Same fail-closed policy as security and auth middleware.
         logger.warning("No user information in update")
-        return await handler(event, data)
+        return
 
     # Get dependencies from context
     rate_limiter = data.get("rate_limiter")
@@ -132,6 +133,13 @@ def estimate_message_cost(event: Any) -> float:
     - Content complexity
     - Expected Claude usage
     """
+    # A callback's effective_message is the bot's own message (often a long
+    # Claude reply), not user input; sizing from it could refuse a free button
+    # on a low budget. Callbacks that run Claude size their own hold from the
+    # prompt via estimate_prompt_cost.
+    if getattr(event, "callback_query", None):
+        return estimate_prompt_cost("")
+
     message = event.effective_message
     message_text = (message.text or "") if message else ""
 

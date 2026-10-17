@@ -52,7 +52,7 @@ from .features.file_handler import FileTooLargeError
 from .middleware.rate_limit import estimate_message_cost
 from .utils.claude_run import persist_interaction
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
-from .utils.html_format import escape_html
+from .utils.html_format import escape_html, html_to_plain_text
 from .utils.image_extractor import (
     MAX_IMAGES_PER_RESPONSE,
     ImageAttachment,
@@ -1369,7 +1369,11 @@ class MessageOrchestrator:
                     )
                     try:
                         await update.message.reply_text(
-                            message.text,
+                            (
+                                html_to_plain_text(message.text)
+                                if message.parse_mode
+                                else message.text
+                            ),
                             reply_markup=None,
                             reply_to_message_id=(
                                 update.message.message_id if i == 0 else None
@@ -2760,9 +2764,10 @@ class MessageOrchestrator:
                     jsonl = project_dir / f"{session_id}.jsonl"
                     if jsonl.is_file():
                         first = _parse_session_head(jsonl)
-                        if not first:
-                            return None
-                        return first.get("cwd")
+                        # A broken or cwd-less head here must not hide a
+                        # readable copy in a later project directory.
+                        if first and first.get("cwd"):
+                            return str(first["cwd"])
                 return None
 
             # Synchronous directory iteration + JSONL parse — offload to a

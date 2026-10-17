@@ -1536,6 +1536,33 @@ async def test_resume_allows_own_session_in_root(isolation_settings, deps, tmp_d
     assert context.user_data["current_directory"] == Path(str(tmp_dir))
 
 
+async def test_resume_local_session_skips_unreadable_copy(
+    admin_isolation_settings, deps, tmp_dir, monkeypatch
+):
+    """A broken head in one project dir must not stop the scan of the rest."""
+    import src.claude.local_sessions as local_sessions_mod
+
+    projects = tmp_dir / "claude-projects"
+    prefix = local_sessions_mod._encode_path(tmp_dir.resolve())
+    for suffix in ("-a-broken", "-b-good"):
+        (projects / f"{prefix}{suffix}").mkdir(parents=True)
+        (projects / f"{prefix}{suffix}" / "cli-session.jsonl").write_text("")
+
+    def _fake_head(path):
+        return {"cwd": str(tmp_dir)} if "-b-good" in str(path) else None
+
+    monkeypatch.setattr(local_sessions_mod, "_claude_projects_dir", lambda: projects)
+    monkeypatch.setattr(local_sessions_mod, "_parse_session_head", _fake_head)
+
+    orchestrator = MessageOrchestrator(admin_isolation_settings, deps)
+    update = _resume_update(user_id=111, session_id="cli-session")
+    context = _ctx(_storage_mock())
+
+    await orchestrator._agentic_resume_callback(update, context)
+
+    assert context.user_data["claude_session_id"] == "cli-session"
+
+
 # --- Cost reservations are always settled -----------------------------------
 #
 # The budget hold is taken before the Claude run and must be released on every

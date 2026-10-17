@@ -291,6 +291,21 @@ class TestCheckBashDirectoryBoundary:
         assert not valid
         assert "/tmp" in error
 
+    def test_pushd_outside_blocked_like_cd(self) -> None:
+        """pushd changes directory too; it used to pass as an unknown command."""
+        valid, error = check_bash_directory_boundary(
+            "pushd /tmp; cat secrets.txt", self.cwd, self.approved
+        )
+        assert not valid
+        assert "'pushd'" in error
+
+    def test_pushd_popd_inside_pass(self) -> None:
+        valid, error = check_bash_directory_boundary(
+            "pushd subdir && ls && popd", self.cwd, self.approved
+        )
+        assert valid
+        assert error is None
+
     # --- destructive commands, env-prefix and key=value operands ---
 
     def test_chmod_outside_approved_directory(self) -> None:

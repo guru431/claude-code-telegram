@@ -523,12 +523,18 @@ class Settings(BaseSettings):
             v = Path(v)
         if not v.exists():
             raise ValueError(f"MCP config file does not exist: {v}")
+        if not v.is_file():
+            raise ValueError(f"MCP config path is not a file: {v}")
         # Validate that the file contains valid JSON with mcpServers
         try:
             with open(v) as f:
                 config_data = json.load(f)
         except json.JSONDecodeError as e:
             raise ValueError(f"MCP config file is not valid JSON: {e}")
+        except OSError as e:
+            # Pydantic re-raises anything but ValueError/AssertionError as is:
+            # a raw traceback at startup instead of a configuration error.
+            raise ValueError(f"MCP config file cannot be read: {e}")
         if not isinstance(config_data, dict):
             raise ValueError("MCP config file must contain a JSON object")
         if "mcpServers" not in config_data:

@@ -52,3 +52,14 @@ def test_html_export_keeps_heading_levels() -> None:
     assert "<h1>Title</h1>" in html
     assert "<h2>Section</h2>" in html
     assert "<h3>Message</h3>" in html
+
+
+def test_html_export_does_not_wrap_headings_in_paragraphs() -> None:
+    """A heading closing a paragraph must not leave ``</hN></p>`` behind."""
+    for level in (1, 2, 3):
+        marker = "#" * level
+        html = SessionExporter(MagicMock())._markdown_to_html(
+            f"intro\n\n{marker} Heading\n\nbody"
+        )
+        assert f"</h{level}></p>" not in html
+        assert f"<h{level}>Heading</h{level}>" in html

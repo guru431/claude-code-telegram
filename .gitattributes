@@ -1,2 +1,4 @@
 # Keep the git hook as LF so its shebang works after a fresh clone on Windows
 .githooks/pre-commit text eol=lf
+# cmd.exe misparses labels and ( ... ) blocks in LF files; last rule wins, so keep it last
+*.cmd text eol=crlf

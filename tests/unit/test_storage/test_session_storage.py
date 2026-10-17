@@ -152,9 +152,9 @@ class TestUserSessionCounter:
         all_arrived = asyncio.Event()
         ensure_user_exists = session_storage._ensure_user_exists
 
-        async def gated(conn, user_id, username=None):
+        async def gated(conn, user_id):
             nonlocal arrived
-            await ensure_user_exists(conn, user_id, username)
+            await ensure_user_exists(conn, user_id)
             arrived += 1
             if arrived == saves:
                 all_arrived.set()

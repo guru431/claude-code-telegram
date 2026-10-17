@@ -7,7 +7,8 @@ Claude's output which contains underscores, asterisks, brackets, etc.
 
 import re
 from collections import deque
-from typing import Deque, FrozenSet, Iterator, List, Optional, Tuple
+from html import unescape
+from typing import Deque, Dict, FrozenSet, Iterator, List, Optional, Tuple
 
 import structlog
 
@@ -18,6 +19,7 @@ logger = structlog.get_logger()
 __all__ = [
     "TELEGRAM_MAX_MESSAGE_LENGTH",
     "escape_html",
+    "html_to_plain_text",
     "markdown_to_telegram_html",
     "split_telegram_html",
     "tg_len",
@@ -50,13 +52,20 @@ _ALLOWED_HTML_TAGS: FrozenSet[str] = frozenset(
 )
 
 # One token = a whole HTML tag, a whole character entity, or a run of literal
-# text. Tags and entities are atomic: a cut is never allowed inside them.
+# text. Tags and entities are atomic: a cut is never allowed inside them. A
+# quoted attribute value may contain ">" (``<a href="x?a>b">``); without the
+# quote alternatives the tag ended there and the splitter emitted a truncated
+# opening tag that Telegram rejects.
 _TOKEN_RE = re.compile(
-    r"(?P<tag></?[a-zA-Z][a-zA-Z0-9-]*(?:\s[^<>]*)?>)"
+    r"(?P<tag></?[a-zA-Z][a-zA-Z0-9-]*"
+    r"""(?:\s(?:[^<>"']|"[^"<]*"|'[^'<]*')*)?>)"""
     r"|(?P<entity>&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[a-zA-Z][a-zA-Z0-9]{1,31});)"
 )
 
 _TAG_NAME_RE = re.compile(r"</?([a-zA-Z][a-zA-Z0-9-]*)")
+
+# Placeholder keys markdown_to_telegram_html substitutes for extracted spans.
+_PLACEHOLDER_RE = re.compile(r"\x00PH\d+\x00")
 
 
 def escape_html(text: str) -> str:
@@ -124,6 +133,22 @@ def _classify_tag(tag: str) -> Tuple[str, Optional[str]]:
     if tag.rstrip(">").rstrip().endswith("/"):
         return "text", None
     return "open", name
+
+
+def html_to_plain_text(text: str) -> str:
+    """Drop Telegram formatting tags and decode entities, for a plain-text send.
+
+    The fallback after Telegram rejects a message's HTML resent the same string
+    without ``parse_mode``, so the user read raw ``<b>`` tags and ``&lt;``
+    entities. Only tags Telegram would interpret are removed; anything else is
+    already literal text and stays.
+    """
+    parts: List[str] = []
+    for kind, token in _tokenize_html(text):
+        if kind == "tag" and _classify_tag(token)[0] != "text":
+            continue
+        parts.append(unescape(token) if kind == "entity" else token)
+    return "".join(parts)
 
 
 def _preferred_cut(run: str, hard_cut: int) -> int:
@@ -335,22 +360,26 @@ def markdown_to_telegram_html(text: str) -> str:
     Order of operations:
     1. Extract fenced code blocks -> placeholders
     2. Extract inline code -> placeholders
-    3. HTML-escape remaining text
-    4. Convert bold (**text** / __text__)
-    5. Convert italic (*text*, _text_ with word boundaries)
-    6. Convert links [text](url)
+    3. Convert links [text](url): the <a> tags become placeholders, the label
+       stays in the text and is formatted by the steps below
+    4. HTML-escape remaining text
+    5. Convert bold (**text** / __text__)
+    6. Convert italic (*text*, _text_ with word boundaries)
     7. Convert headers (# Header -> <b>Header</b>)
     8. Convert strikethrough (~~text~~)
     9. Restore placeholders
     """
     placeholders: List[Tuple[str, str]] = []
+    # Markdown each placeholder replaced, to put back where it is literal text.
+    sources: Dict[str, str] = {}
     placeholder_counter = 0
 
-    def _make_placeholder(html_content: str) -> str:
+    def _make_placeholder(html_content: str, source: str = "") -> str:
         nonlocal placeholder_counter
         key = f"\x00PH{placeholder_counter}\x00"
         placeholder_counter += 1
         placeholders.append((key, html_content))
+        sources[key] = source
         return key
 
     # --- 1. Extract fenced code blocks ---
@@ -362,7 +391,7 @@ def markdown_to_telegram_html(text: str) -> str:
             html = f'<pre><code class="language-{escape_html(lang)}">{escaped_code}</code></pre>'
         else:
             html = f"<pre><code>{escaped_code}</code></pre>"
-        return _make_placeholder(html)
+        return _make_placeholder(html, m.group(0))
 
     text = re.sub(
         r"```([^\n`]*)\n(.*?)```",
@@ -375,41 +404,50 @@ def markdown_to_telegram_html(text: str) -> str:
     def _replace_inline_code(m: re.Match) -> str:  # type: ignore[type-arg]
         code = m.group(1)
         escaped_code = escape_html(code)
-        return _make_placeholder(f"<code>{escaped_code}</code>")
+        return _make_placeholder(f"<code>{escaped_code}</code>", m.group(0))
 
     text = re.sub(r"`([^`\n]+)`", _replace_inline_code, text)
 
-    # --- 3. HTML-escape remaining text ---
-    text = escape_html(text)
-
-    # --- 4. Bold: **text** or __text__ ---
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    # __text__ only at word boundaries (avoid some_var__thing__more)
-    text = re.sub(r"(?<!\w)__(\S.*?\S|\S)__(?!\w)", r"<b>\1</b>", text)
-
-    # --- 5. Italic: *text* (require non-space after/before) ---
-    text = re.sub(r"\*(\S.*?\S|\S)\*", r"<i>\1</i>", text)
-    # _text_ only at word boundaries (avoid my_var_name)
-    text = re.sub(r"(?<!\w)_(\S.*?\S|\S)_(?!\w)", r"<i>\1</i>", text)
-
-    # --- 6. Links: [text](url) ---
+    # --- 3. Links: [text](url) ---
+    # Before escaping and emphasis: run later, they rewrote the URL itself, so
+    # ``https://x/__init__.py`` or a backtick in the URL put <b>/<code> tags
+    # inside href. The URL is final here; only the label goes on.
     def _replace_link(m: re.Match) -> str:  # type: ignore[type-arg]
-        label = m.group(1)
-        url = m.group(2)
+        label: str = m.group(1)
+        # A code-span placeholder inside the URL stands for characters that
+        # are literal in a link destination: put the original back.
+        url = _PLACEHOLDER_RE.sub(
+            lambda p: sources.get(p.group(0), p.group(0)), m.group(2)
+        )
         # Allowlist URL schemes: only http(s) and tg are clickable.
         # Reject javascript:, data:, etc. to prevent unsafe href injection.
         scheme = url.split(":", 1)[0].strip().lower() if ":" in url else ""
         if scheme not in ("http", "https", "tg"):
-            # Disallowed/relative scheme: emit label as plain (already-escaped) text.
+            # Disallowed/relative scheme: keep only the label, as text.
             return str(label)
-        url = url.replace('"', "&quot;")
-        return f'<a href="{url}">{label}</a>'
+        href = escape_html(url).replace('"', "&quot;")
+        return (
+            _make_placeholder(f'<a href="{href}">') + label + _make_placeholder("</a>")
+        )
 
     text = re.sub(
         r"\[([^\]]+)\]\(([^)]+)\)",
         _replace_link,
         text,
     )
+
+    # --- 4. HTML-escape remaining text ---
+    text = escape_html(text)
+
+    # --- 5. Bold: **text** or __text__ ---
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    # __text__ only at word boundaries (avoid some_var__thing__more)
+    text = re.sub(r"(?<!\w)__(\S.*?\S|\S)__(?!\w)", r"<b>\1</b>", text)
+
+    # --- 6. Italic: *text* (require non-space after/before) ---
+    text = re.sub(r"\*(\S.*?\S|\S)\*", r"<i>\1</i>", text)
+    # _text_ only at word boundaries (avoid my_var_name)
+    text = re.sub(r"(?<!\w)_(\S.*?\S|\S)_(?!\w)", r"<i>\1</i>", text)
 
     # --- 7. Headers: # Header -> <b>Header</b> ---
     text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)

@@ -153,6 +153,13 @@ class TestResponseFormatter:
         assert "50%" in msg.text
         assert "▓" in msg.text  # Progress bar
 
+    @pytest.mark.parametrize("percentage", [-20.0, 150.0])
+    def test_format_progress_message_bar_stays_ten_cells(self, formatter, percentage):
+        """Out-of-range percentages are clamped, not drawn as a longer bar."""
+        msg = formatter.format_progress_message("Processing", percentage)
+
+        assert msg.text.count("▓") + msg.text.count("░") == 10
+
     def test_format_progress_message_no_percentage(self, formatter):
         """Test progress message without percentage."""
         msg = formatter.format_progress_message("Loading")
@@ -386,6 +393,28 @@ class TestMarkdownToTelegramHtml:
         result = markdown_to_telegram_html('[text](https://x.com/a?q="b")')
         # The double-quote in the URL must be escaped so the href stays valid
         assert '<a href="https://x.com/a?q=&quot;b&quot;">text</a>' in result
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://a/`b`",
+            "https://e.com/_init_",
+            "https://e.com/__init__.py",
+            "https://e.com/a*b*c",
+        ],
+    )
+    def test_link_url_is_not_reformatted(self, url):
+        """Code spans and emphasis markers in a URL stay literal, never tags."""
+        result = markdown_to_telegram_html(f"see [x]({url}) ok")
+        assert result == f'see <a href="{url}">x</a> ok'
+
+    def test_link_label_keeps_formatting(self):
+        result = markdown_to_telegram_html("[**bold** `code`](https://e.com)")
+        assert result == '<a href="https://e.com"><b>bold</b> <code>code</code></a>'
+
+    def test_link_syntax_inside_code_span_stays_code(self):
+        result = markdown_to_telegram_html("`arr[0](x)`")
+        assert result == "<code>arr[0](x)</code>"
 
     def test_fenced_code_block_non_word_language(self):
         # Languages with non-word chars (c++, objective-c) must still extract

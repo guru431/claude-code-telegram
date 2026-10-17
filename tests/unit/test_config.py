@@ -777,6 +777,14 @@ def test_feature_flags(tmp_path):
     assert features.is_feature_enabled("nonexistent") is False
 
 
+def test_mcp_config_path_to_directory_is_a_config_error(tmp_path):
+    """open() on a directory raised a raw OSError that pydantic did not wrap."""
+    with pytest.raises(ValidationError) as exc_info:
+        create_test_config(enable_mcp=True, mcp_config_path=str(tmp_path))
+
+    assert "MCP config path is not a file" in str(exc_info.value)
+
+
 def test_environment_loading(monkeypatch, tmp_path):
     """Environment overrides apply when env vars do not explicitly set them.
 

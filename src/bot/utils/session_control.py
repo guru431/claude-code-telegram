@@ -1,10 +1,13 @@
-"""Shared session-termination path for the classic handlers.
+"""Shared session bookkeeping for the classic handlers.
 
 Ending a session has two halves: clearing the Telegram-side context and
 deactivating the persisted session row. Handlers used to do only the first, so
 ``/end`` told the user the session was terminated while it stayed active in
 SQLite — still listed by ``/sessions``, still counted against
 ``max_sessions_per_user`` and still resumable by its stored id.
+
+After a run, every classic entry point records the run's session the same way
+(:func:`remember_run_session`).
 """
 
 from typing import Any, Optional
@@ -12,6 +15,20 @@ from typing import Any, Optional
 import structlog
 
 logger = structlog.get_logger()
+
+
+def remember_run_session(context: Any, response: Any, force_new: bool) -> None:
+    """Store a run's session ID and retire the one-shot ``/new`` flag.
+
+    Callers read ``force_new_session`` before the run and pass it to
+    ``run_command``; only the text handler used to, so a file, photo, voice
+    note or button right after ``/new`` auto-resumed the session the user had
+    just reset. The flag is cleared only on a run the SDK did not flag as an
+    error, so the retry after a failed first message still starts fresh.
+    """
+    if force_new and not response.is_error:
+        context.user_data["force_new_session"] = False
+    context.user_data["claude_session_id"] = response.session_id
 
 
 async def terminate_user_session(context: Any, user_id: int) -> Optional[str]:

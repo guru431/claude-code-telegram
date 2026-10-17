@@ -219,3 +219,93 @@ async def test_photo_and_voice_html_rejection_retry_as_plain_text(tmp_path):
         assert ("reply", "done", None) in events, command
         audit = context.bot_data["audit_logger"].log_command
         assert audit.await_args.kwargs["success"] is True, command
+
+
+def _document_update(events: list) -> MagicMock:
+    update = _make_update(events)
+    telegram_file = MagicMock()
+    telegram_file.file_size = None
+    telegram_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"x=1"))
+    update.message.document.file_name = "snippet.py"
+    update.message.document.file_size = 3
+    update.message.document.get_file = AsyncMock(return_value=telegram_file)
+    return update
+
+
+async def test_plain_text_fallback_drops_html_markup(tmp_path):
+    """The retry without parse_mode used to show raw <b> tags and &lt;."""
+    events: list = []
+    update = _document_update(events)
+    response = _claude_response()
+    response.content = "**done** a < b"
+    context = _make_context(tmp_path, AsyncMock(return_value=response))
+    real_reply = update.message.reply_text.side_effect
+
+    async def reject_html_answer(text, **kwargs):
+        if "done" in text and kwargs.get("parse_mode"):
+            raise RuntimeError("Can't parse entities")
+        return await real_reply(text, **kwargs)
+
+    update.message.reply_text.side_effect = reject_html_answer
+
+    await handle_document(update, context)
+
+    plain = [e[1] for e in events if isinstance(e, tuple) and e[2] is None]
+    assert any("done a < b" in text for text in plain)
+    assert not any("<b>" in text or "&lt;" in text for text in plain)
+
+
+async def test_media_runs_after_new_skip_auto_resume(tmp_path):
+    """Only the text path honoured /new; media auto-resumed the reset session."""
+    for handler, attr, features in (
+        (handle_document, None, None),
+        (handle_photo, "photo", _photo_features),
+        (handle_voice, "voice", _voice_features),
+    ):
+        events: list = []
+        update = _document_update(events)
+        if attr:
+            setattr(update.message, attr, [MagicMock()])
+        run_command = AsyncMock(return_value=_claude_response())
+        context = _make_context(tmp_path, run_command, features() if features else None)
+        context.user_data["force_new_session"] = True
+
+        await handler(update, context)
+
+        assert run_command.await_args.kwargs["force_new"] is True, handler.__name__
+        assert context.user_data["force_new_session"] is False, handler.__name__
+        assert context.user_data["claude_session_id"] == "s-1", handler.__name__
+
+
+async def test_document_audit_failure_after_answer_is_not_an_error(tmp_path):
+    """An audit write failing after the reply must not reach the error path."""
+    events: list = []
+    update = _document_update(events)
+    context = _make_context(tmp_path, AsyncMock(return_value=_claude_response()))
+    context.bot_data["audit_logger"].log_file_access.side_effect = RuntimeError(
+        "database is locked"
+    )
+
+    await handle_document(update, context)
+
+    replies = _replies(events)
+    assert any("done" in r for r in replies)
+    assert not any("Error" in r for r in replies)
+
+
+async def test_text_failure_with_failing_audit_does_not_escape(tmp_path):
+    """The outer error path audits through the guard, like the success path."""
+    events: list = []
+    update = _make_update(events)
+    # A failure outside the Claude run is what reaches the outer except.
+    update.message.chat.send_action = AsyncMock(side_effect=RuntimeError("net"))
+    context = _make_context(tmp_path, AsyncMock(return_value=_claude_response()))
+    context.bot_data["audit_logger"].log_command.side_effect = RuntimeError(
+        "database is locked"
+    )
+
+    await handle_text_message(update, context)
+
+    assert _replies(events), "the user still gets the error reply"
+    audit = context.bot_data["audit_logger"].log_command
+    assert audit.await_args.kwargs["success"] is False

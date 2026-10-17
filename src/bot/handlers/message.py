@@ -5,7 +5,7 @@ import re
 from typing import TYPE_CHECKING, Optional
 
 import structlog
-from telegram import InputMediaPhoto, Update
+from telegram import Document, InputMediaPhoto, Update
 from telegram.ext import ContextTypes
 
 from ...claude.exceptions import (
@@ -24,13 +24,14 @@ from ...security.validators import SecurityValidator
 from ..features.file_handler import FileTooLargeError
 from ..middleware.rate_limit import estimate_message_cost
 from ..utils.claude_run import persist_interaction
-from ..utils.html_format import escape_html
+from ..utils.html_format import escape_html, html_to_plain_text
 from ..utils.image_extractor import (
     MAX_IMAGES_PER_RESPONSE,
     ImageAttachment,
     should_send_as_photo,
     validate_image_path,
 )
+from ..utils.session_control import remember_run_session
 from ..utils.upload_limits import exceeds_upload_limit
 
 if TYPE_CHECKING:
@@ -361,7 +362,11 @@ async def _send_formatted_messages(
             )
             try:
                 await update.message.reply_text(
-                    message.text,
+                    (
+                        html_to_plain_text(message.text)
+                        if message.parse_mode
+                        else message.text
+                    ),
                     reply_markup=message.reply_markup,
                     reply_to_message_id=(update.message.message_id if i == 0 else None),
                 )
@@ -401,6 +406,38 @@ async def _audit_command(
             "Failed to write audit log",
             error=str(audit_err),
             command=command,
+            user_id=user_id,
+        )
+
+
+async def _audit_file_access(
+    audit_logger: Optional[AuditLogger],
+    user_id: int,
+    document: Document,
+    action: str,
+    success: bool,
+) -> None:
+    """Write a file-access audit record; like ``_audit_command``, never raises.
+
+    In ``handle_document`` an unguarded audit write after the reply fell into
+    the error path: the user got an error after a successful answer, and the
+    failure branch's own audit write could escape the handler entirely.
+    """
+    if not audit_logger:
+        return
+    try:
+        await audit_logger.log_file_access(
+            user_id=user_id,
+            file_path=document.file_name,
+            action=action,
+            success=success,
+            file_size=document.file_size,
+        )
+    except Exception as audit_err:
+        logger.warning(
+            "Failed to write audit log",
+            error=str(audit_err),
+            action=action,
             user_id=user_id,
         )
 
@@ -539,15 +576,7 @@ async def handle_text_message(
                 force_new=force_new,
             )
 
-            # Clear the one-shot flag only on a run the SDK did not flag as an
-            # error — the agentic path (_run_and_format) deliberately keeps it
-            # set on a soft error so the retry after a failed first message
-            # since /new also starts fresh instead of resuming a broken session.
-            if force_new and not claude_response.is_error:
-                context.user_data["force_new_session"] = False
-
-            # Update session ID
-            context.user_data["claude_session_id"] = claude_response.session_id
+            remember_run_session(context, claude_response, force_new)
 
             # Settled in the finally below so a later failure cannot leave the
             # hold outstanding. Charge the reported cost even on a run flagged
@@ -796,13 +825,13 @@ async def handle_text_message(
         await update.message.reply_text(_format_error_message(e), parse_mode="HTML")
 
         # Log failed processing
-        if audit_logger:
-            await audit_logger.log_command(
-                user_id=user_id,
-                command="text_message",
-                args=[update.message.text[:100]],
-                success=False,
-            )
+        await _audit_command(
+            audit_logger,
+            user_id,
+            "text_message",
+            [update.message.text[:100]],
+            success=False,
+        )
 
         logger.error("Error processing text message", error=str(e), user_id=user_id)
 
@@ -1010,6 +1039,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "current_directory", settings.approved_directory
         )
         session_id = context.user_data.get("claude_session_id")
+        force_new = bool(context.user_data.get("force_new_session"))
 
         # Hold budget for this run, sized from the actual upload; released in
         # the finally below on every path so a failure costs the user nothing.
@@ -1035,10 +1065,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 working_directory=current_dir,
                 user_id=user_id,
                 session_id=session_id,
+                force_new=force_new,
             )
 
-            # Update session ID
-            context.user_data["claude_session_id"] = claude_response.session_id
+            remember_run_session(context, claude_response, force_new)
 
             # Settled in the finally below. Charged even on a run flagged
             # is_error: it still burned tokens (same policy as the agentic path).
@@ -1082,14 +1112,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
             # Log successful file processing (only after responses are sent —
             # a Claude failure must not be audited as a success).
-            if audit_logger:
-                await audit_logger.log_file_access(
-                    user_id=user_id,
-                    file_path=document.file_name,
-                    action="upload_processed",
-                    success=True,
-                    file_size=document.file_size,
-                )
+            await _audit_file_access(
+                audit_logger, user_id, document, "upload_processed", success=True
+            )
 
         except Exception as e:
             # The progress message may already be gone (deleted above); fall
@@ -1105,14 +1130,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             logger.error("Claude file processing failed", error=str(e), user_id=user_id)
 
             # Audit the failed Claude processing.
-            if audit_logger:
-                await audit_logger.log_file_access(
-                    user_id=user_id,
-                    file_path=document.file_name,
-                    action="upload_failed",
-                    success=False,
-                    file_size=document.file_size,
-                )
+            await _audit_file_access(
+                audit_logger, user_id, document, "upload_failed", success=False
+            )
         finally:
             # Always release the hold; a failed or empty run settles at 0.0.
             if rate_limiter and reservation_id:
@@ -1130,14 +1150,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(_format_error_message(e), parse_mode="HTML")
 
         # Log failed file processing
-        if audit_logger:
-            await audit_logger.log_file_access(
-                user_id=user_id,
-                file_path=document.file_name,
-                action="upload_failed",
-                success=False,
-                file_size=document.file_size,
-            )
+        await _audit_file_access(
+            audit_logger, user_id, document, "upload_failed", success=False
+        )
 
         logger.error("Error processing document", error=str(e), user_id=user_id)
 
@@ -1197,6 +1212,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "current_directory", settings.approved_directory
             )
             session_id = context.user_data.get("claude_session_id")
+            force_new = bool(context.user_data.get("force_new_session"))
 
             # Hold budget for this run; released in the finally below on every
             # path so a failure or empty result costs the user nothing.
@@ -1220,10 +1236,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     working_directory=current_dir,
                     user_id=user_id,
                     session_id=session_id,
+                    force_new=force_new,
                 )
 
-                # Update session ID
-                context.user_data["claude_session_id"] = claude_response.session_id
+                remember_run_session(context, claude_response, force_new)
 
                 # Settled in the finally below. Charged even on a run flagged
                 # is_error: it still burned tokens (same policy as the agentic
@@ -1380,6 +1396,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "current_directory", settings.approved_directory
         )
         session_id = context.user_data.get("claude_session_id")
+        force_new = bool(context.user_data.get("force_new_session"))
 
         # Hold budget for this run; released in the finally below on every path
         # so a failure or empty result costs the user nothing.
@@ -1404,9 +1421,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 working_directory=current_dir,
                 user_id=user_id,
                 session_id=session_id,
+                force_new=force_new,
             )
 
-            context.user_data["claude_session_id"] = claude_response.session_id
+            remember_run_session(context, claude_response, force_new)
 
             # Settled in the finally below. Charged even on a run flagged
             # is_error: it still burned tokens (same policy as the agentic path).

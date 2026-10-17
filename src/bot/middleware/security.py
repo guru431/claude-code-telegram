@@ -83,8 +83,10 @@ async def security_middleware(
     )
 
     if not user_id:
+        # No sender to authorize: drop it here, as auth_middleware would. One
+        # fail-closed policy for every middleware (channel posts, polls, ...).
         logger.warning("No user information in update")
-        return await handler(event, data)
+        return
 
     # Get dependencies from context
     security_validator = data.get("security_validator")

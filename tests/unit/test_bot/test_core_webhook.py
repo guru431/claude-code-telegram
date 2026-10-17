@@ -11,6 +11,7 @@ import pytest
 
 from src.bot.core import ClaudeCodeBot
 from src.config import create_test_config
+from src.exceptions import ClaudeCodeTelegramError
 
 
 def _make_bot(settings) -> tuple[ClaudeCodeBot, MagicMock]:
@@ -87,3 +88,20 @@ async def test_start_polling_when_no_webhook_url():
 
     app.updater.start_polling.assert_awaited_once()
     app.updater.start_webhook.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_releases_app_even_if_updater_stop_fails():
+    """A failing updater.stop() must not skip app.stop() and app.shutdown()."""
+    bot, app = _make_bot(create_test_config())
+    app.updater.running = True
+    app.updater.stop = AsyncMock(side_effect=RuntimeError("network down"))
+    app.running = True
+    app.stop = AsyncMock()
+    app.shutdown = AsyncMock()
+
+    with pytest.raises(ClaudeCodeTelegramError):
+        await bot.stop()
+
+    app.stop.assert_awaited_once()
+    app.shutdown.assert_awaited_once()

@@ -13,7 +13,7 @@ import pytest
 from telegram.ext import ApplicationHandlerStop
 
 from src.bot.core import ClaudeCodeBot
-from src.bot.middleware.rate_limit import estimate_message_cost
+from src.bot.middleware.rate_limit import estimate_message_cost, estimate_prompt_cost
 from src.config import create_test_config
 from src.config.settings import Settings
 
@@ -355,11 +355,44 @@ async def test_middleware_wrapper_runs_for_non_bot_updates() -> None:
 def test_estimate_message_cost_handles_none_text() -> None:
     """Cost estimation should not fail on service-like messages without text."""
     event = MagicMock()
+    event.callback_query = None
     event.effective_message = MagicMock(text=None, document=None, photo=None)
 
     cost = estimate_message_cost(event)
 
     assert cost >= 0.01
+
+
+def test_estimate_message_cost_ignores_bot_message_on_callback() -> None:
+    """A callback's message is the bot's own reply, not user input to price."""
+    event = MagicMock()
+    event.callback_query = MagicMock(data="cd:src")
+    event.effective_message = MagicMock(text="x" * 4000, document=None, photo=None)
+
+    assert estimate_message_cost(event) == estimate_prompt_cost("")
+
+
+@pytest.mark.parametrize(
+    "module_name, func_name",
+    [
+        ("security", "security_middleware"),
+        ("auth", "auth_middleware"),
+        ("rate_limit", "rate_limit_middleware"),
+    ],
+)
+async def test_update_without_user_is_dropped_by_every_middleware(
+    bot, mock_update, mock_context, module_name, func_name
+) -> None:
+    """One fail-closed policy: no middleware passes an update with no sender."""
+    import importlib
+
+    module = importlib.import_module(f"src.bot.middleware.{module_name}")
+    mock_update.effective_user = None
+
+    wrapper = bot._create_middleware_handler(getattr(module, func_name))
+
+    with pytest.raises(ApplicationHandlerStop):
+        await wrapper(mock_update, mock_context)
 
 
 class TestRejectionAuditIsAggregated:

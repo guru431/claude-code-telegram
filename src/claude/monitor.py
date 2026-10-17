@@ -25,6 +25,9 @@ _FS_MODIFYING_COMMANDS: Set[str] = {
     "install",
     "tee",
     "cd",
+    # Change directory like cd: unclassified, ``pushd /etc`` passed unchecked.
+    "pushd",
+    "popd",
     # Destructive / permission-changing commands that take a target path and
     # could otherwise escape the boundary unchecked.
     "dd",

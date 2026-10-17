@@ -354,8 +354,7 @@ class SessionExporter:
         # Clean up empty paragraphs
         html = html.replace("<p></p>", "")
         html = html.replace("<p><h", "<h")
-        html = html.replace("</h1></p>", "</h1>")
-        html = html.replace("</h3></p>", "</h3>")
+        html = re.sub(r"</h([1-3])></p>", r"</h\1>", html)
 
         # Horizontal rules
         html = html.replace("<p>---</p>", "<hr>")

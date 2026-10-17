@@ -6,8 +6,8 @@ import pytest
 import yaml
 
 from src.projects.discovery import (
-    _make_display_name,
     discover_new_projects,
+    display_name,
     iter_project_dirs,
     path_dedupe_key,
     slugify,
@@ -36,6 +36,11 @@ class TestSlugify:
         from scripts.sync_projects_yaml import slug_from_path
 
         assert slug_from_path is slugify
+
+    @pytest.mark.parametrize("name", ["___", "-_-", "проект"])
+    def test_no_ascii_alnum_falls_back_to_placeholder(self, name: str) -> None:
+        """The fallback keeps the [a-z0-9-] contract instead of echoing input."""
+        assert slugify(name) == "project"
 
 
 class TestPathDedupeKey:
@@ -141,10 +146,16 @@ class TestDiscoveryPathNormalization:
 
 class TestDisplayName:
     def test_preserves_underscore(self) -> None:
-        assert _make_display_name("_boss") == "_boss"
+        assert display_name("_boss") == "_boss"
 
     def test_preserves_name(self) -> None:
-        assert _make_display_name("MyProject") == "MyProject"
+        assert display_name("MyProject") == "MyProject"
+
+    def test_shared_with_sync_script(self) -> None:
+        """Both writers of projects.yaml name a new entry the same way."""
+        from scripts.sync_projects_yaml import display_name as script_display_name
+
+        assert script_display_name is display_name
 
 
 class TestDiscoverNewProjects:

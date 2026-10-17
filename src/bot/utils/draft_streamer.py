@@ -112,7 +112,12 @@ class DraftStreamer:
 
         if self._tool_lines:
             visible = self._tool_lines[-_MAX_TOOL_LINES:]
-            overflow = self._tool_overflow + (len(self._tool_lines) - _MAX_TOOL_LINES)
+            # append_tool trims the list and counts the trimmed lines in
+            # _tool_overflow; the clamped second term covers a list filled
+            # without it. Unclamped, it went negative below the limit.
+            overflow = self._tool_overflow + max(
+                0, len(self._tool_lines) - _MAX_TOOL_LINES
+            )
             if overflow >= 3:
                 parts.append(f"... +{overflow} more")
             parts.extend(visible)

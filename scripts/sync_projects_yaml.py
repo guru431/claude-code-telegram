@@ -14,10 +14,12 @@ from pathlib import Path, PurePosixPath
 import yaml
 
 # Run standalone (python scripts/sync_projects_yaml.py) but still share the
-# canonical slug generator and directory scanner with src/projects/discovery.py.
+# canonical slug and name generators and the directory scanner with
+# src/projects/discovery.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.projects.discovery import (  # noqa: E402
+    display_name,
     iter_project_dirs,
     path_dedupe_key,
 )
@@ -26,12 +28,6 @@ from src.projects.discovery import (  # noqa: E402
     write_yaml_atomic,
 )
 from src.projects.registry import load_project_registry, parse_enabled  # noqa: E402
-
-
-def name_from_path(rel_path: str) -> str:
-    """Convert relative path to display name: 'update_fix' -> 'Update Fix'."""
-    base = Path(rel_path).name
-    return base.replace("_", " ").replace("-", " ").title()
 
 
 def scan_directories(approved_dir: Path) -> list[str]:
@@ -156,7 +152,7 @@ def sync(config_path: Path, approved_dir: Path, prune: bool = False) -> bool:
                 {
                     "slug": _unique(slug_from_path(rel_path), taken_slugs),
                     "name": _unique(
-                        name_from_path(rel_path), taken_names, suffix=" ({n})"
+                        display_name(rel_path), taken_names, suffix=" ({n})"
                     ),
                     "path": rel_path,
                     "enabled": True,

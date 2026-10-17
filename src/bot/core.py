@@ -274,14 +274,17 @@ class ClaudeCodeBot:
             if self.feature_registry:
                 self.feature_registry.shutdown()
 
-            # Stop the updater if it's running
-            if self.app.updater and self.app.updater.running:
-                await self.app.updater.stop()
-
-            # Stop the application if it's running, then release resources
-            if self.app.running:
-                await self.app.stop()
-            await self.app.shutdown()
+            try:
+                # Stop the updater if it's running
+                if self.app.updater and self.app.updater.running:
+                    await self.app.updater.stop()
+            finally:
+                # Even if the updater failed to stop: stop the application and
+                # release its resources (PTB's HTTP client among them). The
+                # updater's error still propagates to the except below.
+                if self.app.running:
+                    await self.app.stop()
+                await self.app.shutdown()
 
             logger.info("Bot stopped successfully")
         except Exception as e:

@@ -19,6 +19,7 @@ import pytest
 
 from src.bot.utils.html_format import (
     TELEGRAM_MAX_MESSAGE_LENGTH,
+    html_to_plain_text,
     split_telegram_html,
     tg_len,
 )
@@ -102,6 +103,29 @@ class TestPassThrough:
     def test_rejects_non_positive_limit(self) -> None:
         with pytest.raises(ValueError):
             split_telegram_html("x" * 10, 0)
+
+
+class TestQuotedAttributes:
+    def test_gt_inside_quoted_href_keeps_the_tag_whole(self) -> None:
+        """'>' in a quoted value used to end the tag token mid-attribute."""
+        opening = '<a href="https://x/?a>b">'
+        chunks = split_telegram_html(opening + "A" * 5000 + "</a>", 4096)
+
+        assert len(chunks) == 2
+        for chunk in chunks:
+            assert chunk.startswith(opening + "A")
+            assert chunk.endswith("A</a>")
+            assert tg_len(chunk) <= 4096
+
+
+class TestHtmlToPlainText:
+    def test_drops_telegram_tags_and_decodes_entities(self) -> None:
+        html = '<b>A &lt; B</b> &amp; <a href="https://x/">link</a>'
+        assert html_to_plain_text(html) == "A < B & link"
+
+    def test_keeps_text_that_only_looks_like_markup(self) -> None:
+        """Unsupported tags and a bare '<' are literal text, not formatting."""
+        assert html_to_plain_text("a < b <br> c") == "a < b <br> c"
 
 
 class TestWhitespacePreservation:

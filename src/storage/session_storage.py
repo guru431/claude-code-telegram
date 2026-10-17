@@ -28,13 +28,16 @@ class SQLiteSessionStorage(SessionStorage):
         self,
         conn: aiosqlite.Connection,
         user_id: int,
-        username: Optional[str] = None,
     ) -> None:
         """Ensure user exists in database before creating session.
 
         Runs on the caller-supplied ``conn`` so the user-insert and the
         session-upsert share a single transaction; the caller owns the commit.
         This prevents a committed orphan user row when the session upsert fails.
+
+        The username is not written here: ``ClaudeSession`` does not carry one,
+        and ``UserRepository.record_identity`` (called by the auth middleware
+        before any handler runs) is the single writer of ``telegram_username``.
         """
         # Check if user exists
         cursor = await conn.execute(
@@ -53,13 +56,12 @@ class SQLiteSessionStorage(SessionStorage):
             cursor = await conn.execute(
                 """
                 INSERT INTO users
-                (user_id, telegram_username, first_seen, last_active)
-                VALUES (?, ?, ?, ?)
+                (user_id, first_seen, last_active)
+                VALUES (?, ?, ?)
                 ON CONFLICT(user_id) DO NOTHING
                 """,
                 (
                     user_id,
-                    username,
                     now,
                     now,
                 ),
@@ -68,11 +70,7 @@ class SQLiteSessionStorage(SessionStorage):
             # Only log a genuine insert: ON CONFLICT DO NOTHING reports
             # rowcount 0 when a concurrent insert already created the row.
             if cursor.rowcount:
-                logger.info(
-                    "Created user record for session",
-                    user_id=user_id,
-                    username=username,
-                )
+                logger.info("Created user record for session", user_id=user_id)
 
     async def save_session(self, session: ClaudeSession) -> None:
         """Save session to database."""

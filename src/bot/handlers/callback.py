@@ -19,7 +19,7 @@ from ..features.git_integration import GitError
 from ..middleware.rate_limit import estimate_prompt_cost
 from ..utils.claude_run import run_claude_for_user
 from ..utils.html_format import escape_html, split_telegram_html, tg_len
-from ..utils.session_control import terminate_user_session
+from ..utils.session_control import remember_run_session, terminate_user_session
 from ..utils.upload_limits import format_file_size
 
 # session_export is imported lazily inside the export callback to keep the
@@ -1149,6 +1149,11 @@ async def handle_quick_action_callback(
     current_dir = context.user_data.get(
         "current_directory", settings.approved_directory
     )
+    # Same session as every other classic run: without these the action
+    # auto-resumed the newest session in the directory, ignoring one picked
+    # with /sessions and a /new just issued.
+    session_id = context.user_data.get("claude_session_id")
+    force_new = bool(context.user_data.get("force_new_session"))
 
     try:
         # Get the action from the manager
@@ -1173,7 +1178,11 @@ async def handle_quick_action_callback(
         # budget and lands in history like a typed message would.
         async def _run():
             return await claude_integration.run_command(
-                prompt=action.prompt, working_directory=current_dir, user_id=user_id
+                prompt=action.prompt,
+                working_directory=current_dir,
+                user_id=user_id,
+                session_id=session_id,
+                force_new=force_new,
             )
 
         claude_response, budget_error = await run_claude_for_user(
@@ -1191,6 +1200,8 @@ async def handle_quick_action_callback(
             return
 
         if claude_response is not None:
+            remember_run_session(context, claude_response, force_new)
+
             # Format and send the response. Truncate the composed message, not
             # just the body -- the header also counts against Telegram's limit.
             # A run that succeeded but produced no text is not a failure; say so
@@ -1265,6 +1276,7 @@ async def handle_followup_callback(
         "current_directory", settings.approved_directory
     )
     session_id = context.user_data.get("claude_session_id")
+    force_new = bool(context.user_data.get("force_new_session"))
 
     try:
         await query.edit_message_text(
@@ -1278,6 +1290,7 @@ async def handle_followup_callback(
                 working_directory=current_dir,
                 user_id=user_id,
                 session_id=session_id,
+                force_new=force_new,
             )
 
         # Shared runner: a follow-up button is a full Claude run and must be
@@ -1297,7 +1310,7 @@ async def handle_followup_callback(
             return
 
         if claude_response is not None:
-            context.user_data["claude_session_id"] = claude_response.session_id
+            remember_run_session(context, claude_response, force_new)
 
             # An empty body would be rejected by Telegram as an empty message.
             # Secrets in tool output are redacted as on every other path.

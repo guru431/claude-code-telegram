@@ -157,7 +157,8 @@ class ResponseFormatter:
         """Format progress message with optional progress bar."""
         safe_msg = escape_html(message)
         if percentage is not None:
-            # Create simple progress bar
+            # Create simple progress bar; out-of-range input must not stretch it.
+            percentage = min(max(percentage, 0.0), 100.0)
             filled = int(percentage / 10)
             empty = 10 - filled
             progress_bar = "▓" * filled + "░" * empty

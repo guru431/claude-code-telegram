@@ -48,12 +48,15 @@ def slugify(name: str) -> str:
     yields the same slug. Slugs already present in projects.yaml are never
     recomputed (both writers dedupe by ``path``), so existing entries such as
     ``digital_me`` keep their historical slug.
+
+    A name with no ASCII letter or digit at all (``___``, a Cyrillic name)
+    gets the placeholder ``project``; both writers suffix it on collision.
     """
     slug = name.lower().strip().strip("_").strip("-")
     slug = re.sub(r"[^a-z0-9-]", "-", slug)
     slug = re.sub(r"[-]+", "-", slug)
     slug = slug.strip("-")
-    return slug or name.lower()
+    return slug or "project"
 
 
 def path_dedupe_key(approved_root: Path, rel_path: str) -> Optional[str]:
@@ -120,10 +123,13 @@ def iter_project_dirs(approved_root: Path) -> Iterator[Path]:
         yield entry
 
 
-def _make_display_name(dir_name: str) -> str:
-    """Convert directory name to a human-readable display name.
+def display_name(dir_name: str) -> str:
+    """Display name for a newly registered project directory.
 
-    Preserves leading underscores (e.g. '_boss' -> '_boss').
+    The directory name itself, unchanged (``_boss`` stays ``_boss``). Shared
+    with ``scripts/sync_projects_yaml.py`` like ``slugify``, so a new entry
+    looks the same whichever writer added it; title-casing turned ``_boss``
+    into `` Boss`` with a leading space.
     """
     return dir_name
 
@@ -245,7 +251,7 @@ def discover_new_projects(
             continue
 
         slug = slugify(dir_name)
-        name = _make_display_name(dir_name)
+        name = display_name(dir_name)
 
         # Ensure slug uniqueness
         base_slug = slug

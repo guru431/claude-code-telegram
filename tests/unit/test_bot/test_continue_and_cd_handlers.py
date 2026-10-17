@@ -211,6 +211,35 @@ async def test_followup_button_redacts_secrets(settings, monkeypatch):
     assert _FAKE_KEY not in text
 
 
+async def test_quick_action_runs_in_the_users_session(settings, monkeypatch):
+    """Quick actions dropped the selected session and a pending /new."""
+
+    async def run_inline(run, **kwargs):
+        return await run(), None
+
+    monkeypatch.setattr(callback, "run_claude_for_user", run_inline)
+    claude = MagicMock()
+    claude.run_command = AsyncMock(return_value=_response("tests pass"))
+    action = MagicMock(prompt="run the tests", icon="T")
+    action.name = "Test"
+    features = MagicMock()
+    features.get_quick_actions.return_value = MagicMock(actions={"test": action})
+    context = _continue_context(settings)
+    context.bot_data.update(claude_integration=claude, features=features)
+    context.user_data["force_new_session"] = True
+    context.bot.send_message = AsyncMock()
+    query = _cd_query()
+    query.message = None
+
+    await callback.handle_quick_action_callback(query, "test", context)
+
+    kwargs = claude.run_command.await_args.kwargs
+    assert kwargs["session_id"] == "abcdefgh1234"
+    assert kwargs["force_new"] is True
+    assert context.user_data["claude_session_id"] == "session-123456"
+    assert context.user_data["force_new_session"] is False
+
+
 async def test_continue_exception_does_not_leak_raw_error(settings, monkeypatch):
     monkeypatch.setattr(
         command,
