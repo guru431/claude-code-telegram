@@ -478,8 +478,17 @@ async def test_sync_reopen_already_open_topic_not_modified(
     assert mapping.is_active is True
 
 
+@pytest.mark.parametrize(
+    "error_text",
+    [
+        "Bad Request: message thread not found",
+        # What Telegram returns for a topic deleted in the client; it left the
+        # monitoring project without a topic on every startup sync.
+        "Topic_id_invalid",
+    ],
+)
 async def test_sync_reopen_unusable_inactive_mapping_recreates(
-    tmp_path: Path, db_manager
+    tmp_path: Path, db_manager, error_text: str
 ) -> None:
     """Inactive mapping with dead topic is recreated."""
     approved = tmp_path / "projects"
@@ -504,9 +513,7 @@ async def test_sync_reopen_unusable_inactive_mapping_recreates(
 
     manager = ProjectThreadManager(registry, repo, sync_action_interval_seconds=0.0)
     bot = AsyncMock()
-    bot.reopen_forum_topic = AsyncMock(
-        side_effect=TelegramError("Bad Request: message thread not found")
-    )
+    bot.reopen_forum_topic = AsyncMock(side_effect=TelegramError(error_text))
     bot.create_forum_topic = AsyncMock(
         return_value=SimpleNamespace(message_thread_id=3003)
     )

@@ -560,5 +560,6 @@ class ProjectThreadManager:
             "thread not found",
             "invalid message thread id",
             "forum topic not found",
+            "topic_id_invalid",
         ]
         return any(marker in text for marker in markers)
