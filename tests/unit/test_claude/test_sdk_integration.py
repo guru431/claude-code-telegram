@@ -319,6 +319,34 @@ class TestClaudeSDKManager:
                     working_directory=Path("/test"),
                 )
 
+    async def test_timeout_carries_text_written_before_it(self, sdk_manager):
+        """The text Claude streamed before a timeout travels with the error."""
+        from src.claude.exceptions import ClaudeTimeoutError
+
+        sdk_manager.config = sdk_manager.config.model_copy(
+            update={"claude_timeout_seconds": 0.05}
+        )
+        client = AsyncMock()
+        client.connect = AsyncMock()
+        client.disconnect = AsyncMock()
+        client.query = AsyncMock()
+
+        async def answer_then_hang():
+            yield _make_assistant_message("Part one of the answer")
+            await asyncio.sleep(5)  # Far past the 50 ms timeout above
+
+        query_mock = AsyncMock()
+        query_mock.receive_messages = answer_then_hang
+        client._query = query_mock
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", return_value=client):
+            with pytest.raises(ClaudeTimeoutError) as excinfo:
+                await sdk_manager.execute_command(
+                    prompt="Test prompt",
+                    working_directory=Path("/test"),
+                )
+        assert excinfo.value.partial_content == "Part one of the answer"
+
     async def test_external_cancel_stops_run_task(self, sdk_manager):
         """Cancelling the caller (bot shutdown) must not leave the shielded
         client run going in the background: it is cancelled, its teardown
@@ -579,6 +607,35 @@ class TestClaudeSDKManager:
         # Only called once - no retry for MCP errors
         assert client.query.call_count == 1
 
+    async def test_cli_start_failure_not_retried_and_explained(self, sdk_manager):
+        """A CLI that cannot start is not retried; WinError 206 is named as such.
+
+        The SDK turns any FileNotFoundError from process start into
+        CLINotFoundError, including CreateProcess's "command line too long".
+        Retrying cannot help, and "Claude Code not found" sent the user to
+        reinstall a CLI that was there all along.
+        """
+        from claude_agent_sdk import CLINotFoundError
+
+        from src.claude.exceptions import ClaudeProcessError
+
+        cause = FileNotFoundError(2, "The filename or extension is too long")
+        cause.winerror = 206
+        error = CLINotFoundError("Claude Code not found at: claude.exe")
+        error.__cause__ = cause
+
+        client = AsyncMock()
+        client.connect = AsyncMock(side_effect=error)
+        client.disconnect = AsyncMock()
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", return_value=client):
+            with pytest.raises(ClaudeProcessError, match="too long"):
+                await sdk_manager.execute_command(
+                    prompt="Test",
+                    working_directory=Path("/test"),
+                )
+        assert client.connect.call_count == 1
+
     async def test_retry_disabled_when_max_attempts_zero(self, sdk_manager):
         """Test that setting max_attempts=0 effectively disables retries (1 attempt)."""
         sdk_manager.config.claude_retry_max_attempts = 0
@@ -674,6 +731,40 @@ class TestClaudeSandboxSettings:
         opts = captured_options[0]
         assert str(tmp_path) in opts.system_prompt
         assert "relative paths" in opts.system_prompt.lower()
+
+    async def test_cli_sandbox_disabled_notice_logged_once(
+        self, sdk_manager, tmp_path
+    ):
+        """The CLI's "Sandbox disabled" notice surfaces as a warning, once.
+
+        On native Windows the CLI runs Bash without its OS sandbox even with
+        SANDBOX_ENABLED=true, and said so only in debug-level stderr logs.
+        """
+        captured_options = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("ok"),
+            _make_result_message(),
+            capture_options=captured_options,
+        )
+
+        with (
+            patch(
+                "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+            ),
+            patch("src.claude.sdk_integration.logger") as log,
+        ):
+            for _ in range(2):
+                await sdk_manager.execute_command(
+                    prompt="x", working_directory=tmp_path
+                )
+                captured_options[-1].stderr(
+                    "⚠ Sandbox disabled: windows is not supported"
+                )
+
+        notices = [
+            c for c in log.warning.call_args_list if "sandbox" in c.args[0].lower()
+        ]
+        assert len(notices) == 1
 
     async def test_disallowed_tools_passed_to_options(self, tmp_path):
         """Test that disallowed_tools from config are passed to ClaudeAgentOptions."""

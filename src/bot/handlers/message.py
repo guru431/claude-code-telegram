@@ -514,6 +514,16 @@ async def handle_text_message(
         # Throttle progress edits to at most once per 2s (mirrors the agentic
         # orchestrator) — unthrottled edits hit Telegram rate limits.
         last_edit = [0.0]
+        # The edit runs as a task, at most one at a time, never awaited in the
+        # handler: it is awaited by the loop draining Claude's output, and in a
+        # group topic each edit waits for PTB's per-group limiter.
+        edit_task: list[Optional[asyncio.Task[None]]] = [None]
+
+        async def _edit_progress(text: str) -> None:
+            try:
+                await progress_msg.edit_text(text, parse_mode="HTML")
+            except Exception as e:
+                logger.warning("Failed to update progress message", error=str(e))
 
         # Enhanced stream updates handler with progress tracking
         async def stream_handler(update_obj):
@@ -540,10 +550,12 @@ async def handle_text_message(
             now = asyncio.get_event_loop().time()
             if now - last_edit[0] < 2.0:
                 return
+            if edit_task[0] is not None and not edit_task[0].done():
+                return
             try:
                 progress_text = await _format_progress_update(update_obj)
                 if progress_text:
-                    await progress_msg.edit_text(progress_text, parse_mode="HTML")
+                    edit_task[0] = asyncio.create_task(_edit_progress(progress_text))
                     last_edit[0] = now
             except Exception as e:
                 logger.warning("Failed to update progress message", error=str(e))

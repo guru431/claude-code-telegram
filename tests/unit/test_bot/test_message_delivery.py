@@ -7,6 +7,7 @@
 - Photo and voice runs leave an audit record, like text and document runs.
 """
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -309,3 +310,35 @@ async def test_text_failure_with_failing_audit_does_not_escape(tmp_path):
     assert _replies(events), "the user still gets the error reply"
     audit = context.bot_data["audit_logger"].log_command
     assert audit.await_args.kwargs["success"] is False
+
+
+async def test_stuck_progress_edit_does_not_block_stream(tmp_path):
+    """A progress edit stuck in Telegram must not hold up the Claude run.
+
+    The stream handler is awaited by the loop draining Claude's output, and in
+    a group topic each edit waits for PTB's 20-calls-per-minute group budget.
+    """
+    from src.claude.sdk_integration import StreamUpdate
+
+    events: list = []
+    update = _make_update(events)
+    progress_msg = await update.message.reply_text("seed")
+    events.clear()
+    release = asyncio.Event()
+
+    async def stuck_edit(*args, **kwargs):
+        await release.wait()
+
+    progress_msg.edit_text = AsyncMock(side_effect=stuck_edit)
+
+    async def run_command(**kwargs):
+        await kwargs["on_stream"](StreamUpdate(type="assistant", content="reading"))
+        return _claude_response()
+
+    context = _make_context(tmp_path, AsyncMock(side_effect=run_command))
+
+    await asyncio.wait_for(handle_text_message(update, context), timeout=2)
+
+    assert any("done" in r for r in _replies(events))
+    release.set()
+    await asyncio.sleep(0)

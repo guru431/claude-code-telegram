@@ -38,7 +38,15 @@ class ClaudeError(ClaudeCodeTelegramError):
 
 
 class ClaudeTimeoutError(ClaudeError):
-    """Claude Code operation timed out."""
+    """Claude Code operation timed out.
+
+    *partial_content* is the assistant text streamed before the timeout, so a
+    caller can show what Claude had already written instead of dropping it.
+    """
+
+    def __init__(self, message: str = "", partial_content: str = "") -> None:
+        super().__init__(message)
+        self.partial_content = partial_content
 
 
 class ClaudeProcessError(ClaudeError):

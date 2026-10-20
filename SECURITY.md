@@ -17,7 +17,7 @@ The Claude Code Telegram Bot implements a defense-in-depth security model with m
 ### 2. Directory Boundaries
 - **Approved Directory**: All operations confined to a pre-configured directory tree
 - **Path Validation**: Prevents directory traversal attacks (../../../etc/passwd)
-- **Startup Readability Check**: `APPROVED_DIRECTORY` is checked for read/execute access once at startup; the bot refuses to start otherwise. There is no per-operation permission check — the boundary is enforced by path resolution and the OS sandbox
+- **Startup Readability Check**: `APPROVED_DIRECTORY` is checked for read/execute access once at startup; the bot refuses to start otherwise. There is no per-operation permission check — the boundary is enforced by path resolution and the OS sandbox (where one exists — see the Windows note below)
 
 ### 3. Input Validation
 - **Command Sanitization**: All user inputs sanitized to prevent injection attacks
@@ -35,6 +35,13 @@ The Claude Code Telegram Bot implements a defense-in-depth security model with m
 > boundaries and secret-basename blocking), `check_bash_directory_boundary`,
 > and the OS sandbox. Harden those layers (and keep `SANDBOX_ENABLED` on)
 > rather than relying on input sanitization in agentic mode.
+
+> **Windows:** the Claude CLI's OS sandbox runs on macOS, Linux and WSL2 only.
+> On native Windows `SANDBOX_ENABLED=true` has no effect — the CLI prints
+> "Sandbox disabled" and Bash runs without network or filesystem restrictions;
+> the bot logs a warning the first time the CLI reports it. There, `can_use_tool` and
+> `check_bash_directory_boundary` are the only confinement. Run the bot under
+> WSL2 if you need the sandbox layer.
 
 ### 4. Rate Limiting
 - **Request Rate Limiting**: Token bucket algorithm prevents abuse with configurable limits

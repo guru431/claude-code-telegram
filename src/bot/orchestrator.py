@@ -910,13 +910,17 @@ class MessageOrchestrator:
     @staticmethod
     def _start_typing_heartbeat(
         chat: Any,
-        interval: float = 2.0,
+        interval: float = 4.0,
     ) -> "asyncio.Task[None]":
         """Start a background typing indicator task.
 
         Sends typing every *interval* seconds, independently of
         stream events. Cancel the returned task in a ``finally``
         block.
+
+        Telegram shows "typing" for about 5 s, so 4 s keeps it continuous.
+        Every 2 s it needed 30 calls a minute, more than PTB's 20-per-minute
+        budget for a group, and the replies queued behind it.
         """
 
         async def _heartbeat() -> None:
@@ -1579,6 +1583,20 @@ class MessageOrchestrator:
             # session without the user having to run /new.
             if isinstance(e, (ClaudeTimeoutError, ClaudeProcessError)):
                 context.user_data["claude_session_id"] = None
+            # What Claude wrote before the timeout reaches the user, as a Stop's
+            # partial text does, instead of being replaced by the error alone.
+            partial = e.partial_content if isinstance(e, ClaudeTimeoutError) else ""
+            if partial:
+                notice = (
+                    f"_(Timed out after {self.settings.claude_timeout_seconds}s — "
+                    "the answer may be incomplete)_"
+                )
+                return (
+                    ResponseFormatter(self.settings).format_claude_response(
+                        f"{redact_secrets(partial)}\n\n{notice}"
+                    ),
+                    False,
+                )
             return [
                 FormattedMessage(
                     self._error_with_ref(_format_error_message(e), request_id),

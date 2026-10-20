@@ -51,6 +51,21 @@ logger = structlog.get_logger()
 _MAX_INLINE_SYSTEM_PROMPT_CHARS = 16_000
 
 
+def _assistant_text(messages: List[Any]) -> str:
+    """Join the text of every assistant message received so far."""
+    parts: List[str] = []
+    for msg in messages:
+        if isinstance(msg, AssistantMessage):
+            msg_content = getattr(msg, "content", [])
+            if msg_content and isinstance(msg_content, list):
+                for block in msg_content:
+                    if hasattr(block, "text"):
+                        parts.append(block.text)
+            elif msg_content:
+                parts.append(str(msg_content))
+    return "\n".join(parts)
+
+
 def _write_system_prompt_file(prompt: str) -> Path:
     """Write *prompt* to a temp file for ``--system-prompt-file``.
 
@@ -289,6 +304,7 @@ class ClaudeSDKManager:
         """Initialize SDK manager with configuration."""
         self.config = config
         self.security_validator = security_validator
+        self._sandbox_notice_logged = False
 
         # Without a validator, options.can_use_tool is never set below, so
         # nothing checks tool paths or secret basenames. Legitimate in tests;
@@ -313,7 +329,11 @@ class ClaudeSDKManager:
 
         asyncio.TimeoutError is intentional (user-configured timeout) — not
         retried. Only non-MCP CLIConnectionError is considered transient.
+        CLINotFoundError is a CLIConnectionError too, but a missing binary or
+        a command line Windows refuses to start fails the same way every time.
         """
+        if isinstance(exc, CLINotFoundError):
+            return False
         if isinstance(exc, CLIConnectionError):
             msg = str(exc).lower()
             return "mcp" not in msg  # "server" alone is too broad
@@ -341,6 +361,7 @@ class ClaudeSDKManager:
         )
 
         system_prompt_file: Optional[Path] = None
+        messages: List[Message] = []
         try:
             # Capture stderr from Claude CLI for better error diagnostics
             stderr_lines: List[str] = []
@@ -348,6 +369,14 @@ class ClaudeSDKManager:
             def _stderr_callback(line: str) -> None:
                 stderr_lines.append(line)
                 logger.debug("Claude CLI stderr", line=line)
+                # On native Windows the CLI has no OS sandbox and says so on
+                # every run; SANDBOX_ENABLED must not pass for protection there.
+                if "Sandbox disabled" in line and not self._sandbox_notice_logged:
+                    self._sandbox_notice_logged = True
+                    logger.warning(
+                        "Claude CLI runs Bash without the OS sandbox",
+                        cli_notice=line.strip(),
+                    )
 
             # Build system prompt, loading CLAUDE.md from working directory if present.
             # CLAUDE.md is treated as untrusted project context: it is wrapped in
@@ -494,8 +523,8 @@ class ClaudeSDKManager:
                     session_id=session_id,
                 )
 
-            # Collect messages via ClaudeSDKClient
-            messages: List[Message] = []
+            # Collect messages via ClaudeSDKClient (``messages`` is declared
+            # before the try: the timeout handler reads it)
             interrupted = False
 
             async def _run_client() -> None:
@@ -772,17 +801,7 @@ class ClaudeSDKManager:
             if result_content is not None:
                 content = result_content
             else:
-                content_parts = []
-                for msg in messages:
-                    if isinstance(msg, AssistantMessage):
-                        msg_content = getattr(msg, "content", [])
-                        if msg_content and isinstance(msg_content, list):
-                            for block in msg_content:
-                                if hasattr(block, "text"):
-                                    content_parts.append(block.text)
-                        elif msg_content:
-                            content_parts.append(str(msg_content))
-                content = "\n".join(content_parts)
+                content = _assistant_text(messages)
 
             # Claude's own count when it reported one. The fallback (no
             # ResultMessage) counts assistant messages only: tool results come
@@ -811,13 +830,30 @@ class ClaudeSDKManager:
             logger.error(
                 "Claude SDK command timed out",
                 timeout_seconds=self.config.claude_timeout_seconds,
+                messages_received=len(messages),
             )
             raise ClaudeTimeoutError(
-                f"Claude SDK timed out after {self.config.claude_timeout_seconds}s"
+                f"Claude SDK timed out after {self.config.claude_timeout_seconds}s",
+                partial_content=_assistant_text(messages),
             )
 
         except CLINotFoundError as e:
-            logger.error("Claude CLI not found", error=str(e))
+            cause = e.__cause__
+            # The SDK reports any FileNotFoundError from process start as "not
+            # found". On Windows that includes WinError 206: the command line
+            # is over the 32,767-character CreateProcess limit.
+            if getattr(cause, "winerror", None) == 206:
+                logger.error("Claude CLI command line too long", error=str(cause))
+                raise ClaudeProcessError(
+                    "Claude could not start: its command line is too long for "
+                    "Windows (WinError 206). Check the size of the tool lists, "
+                    "MCP config and system prompt passed to the CLI."
+                )
+            logger.error(
+                "Claude CLI not found",
+                error=str(e),
+                cause=repr(cause) if cause else None,
+            )
             error_msg = (
                 "Claude Code not found. Please ensure Claude is installed:\n"
                 "  npm install -g @anthropic-ai/claude-code\n\n"

@@ -1820,6 +1820,32 @@ async def test_timeout_drops_stored_session_id(agentic_settings, deps):
     assert context.user_data["claude_session_id"] is None
 
 
+async def test_timeout_delivers_text_written_before_it(agentic_settings, deps):
+    """A run that timed out still shows what Claude had already written.
+
+    The CLI finished a 5,000-char answer a minute in, the reader then hit the
+    600 s limit, and the user got only "Request Timeout": the text was lost.
+    """
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    error = ClaudeTimeoutError("timed out")
+    error.partial_content = "Questions for management: budget, team, deadlines."
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock(side_effect=error)
+    limiter = _reserving_limiter()
+    context = _cost_context(agentic_settings, claude_integration, limiter)
+    update = _cost_update()
+
+    await orchestrator.agentic_text(update, context)
+
+    sent = " ".join(
+        str(call.args[0])
+        for call in update.message.reply_text.await_args_list
+        if call.args
+    )
+    assert "Questions for management" in sent
+    assert "timed out" in sent.lower()
+
+
 async def test_generic_error_keeps_stored_session_id(agentic_settings, deps):
     """An unrelated failure says nothing about the session — keep resuming it."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
