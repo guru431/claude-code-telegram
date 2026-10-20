@@ -954,6 +954,45 @@ class TestTypingHeartbeat:
         sig = inspect.signature(orchestrator._make_stream_callback)
         assert "chat" not in sig.parameters
 
+    async def test_slow_progress_edit_does_not_block_stream(
+        self, agentic_settings, deps
+    ):
+        """A progress edit stuck in Telegram must not hold up the stream.
+
+        The callback runs inside the loop that drains Claude's output. In a
+        group topic every edit waits for PTB's per-group limiter (20 calls/min),
+        so awaiting it there made each token delta cost ~3 s and a 5,000-char
+        answer outlasted the 600 s run timeout.
+        """
+        from src.claude.sdk_integration import StreamUpdate
+
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        release = asyncio.Event()
+
+        async def stuck_edit(*args, **kwargs):
+            await release.wait()
+
+        progress_msg = MagicMock()
+        progress_msg.edit_text = AsyncMock(side_effect=stuck_edit)
+        callback = orchestrator._make_stream_callback(
+            verbose_level=1,
+            progress_msg=progress_msg,
+            tool_log=[{"kind": "tool", "name": "Read", "detail": "a.md"}],
+            start_time=0.0,
+        )
+        assert callback is not None
+
+        for _ in range(50):
+            await asyncio.wait_for(
+                callback(StreamUpdate(type="stream_delta", content="tok")),
+                timeout=1,
+            )
+            await asyncio.sleep(0)  # the real reader yields between messages
+
+        assert progress_msg.edit_text.call_count == 1
+        release.set()
+        await asyncio.sleep(0)
+
 
 class TestRequestLock:
     """Per-user request serialization lock."""

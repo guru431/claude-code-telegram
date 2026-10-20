@@ -11,6 +11,7 @@ Covers:
 - Integration with orchestrator callback
 """
 
+import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -43,6 +44,12 @@ def streamer(mock_bot):
         draft_id=42,
         throttle_interval=0.3,
     )
+
+
+async def _settle(streamer: DraftStreamer) -> None:
+    """Wait for the background send started by append_*, if any."""
+    if streamer._send_task is not None:
+        await streamer._send_task
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +87,7 @@ class TestDraftStreamerAccumulation:
         """Text is accumulated internally."""
         # First call within throttle — send happens immediately (last_send_time=0)
         await streamer.append_text("Hello ")
+        await _settle(streamer)
         assert streamer._accumulated_text == "Hello "
         mock_bot.send_message_draft.assert_called_once()
 
@@ -100,21 +108,25 @@ class TestDraftStreamerThrottle:
     async def test_throttle_prevents_rapid_sends(self, streamer, mock_bot):
         """Second append within throttle interval should not trigger send."""
         await streamer.append_text("first")
+        await _settle(streamer)
         mock_bot.send_message_draft.reset_mock()
 
         # Immediately append again — within throttle
         await streamer.append_text(" second")
+        await _settle(streamer)
         mock_bot.send_message_draft.assert_not_called()
         assert streamer._accumulated_text == "first second"
 
     async def test_sends_after_throttle_interval(self, streamer, mock_bot):
         """Send should happen once throttle interval has elapsed."""
         await streamer.append_text("first")
+        await _settle(streamer)
         mock_bot.send_message_draft.reset_mock()
 
         # Simulate time passing beyond throttle
         streamer._last_send_time = time.time() - 1.0
         await streamer.append_text(" second")
+        await _settle(streamer)
         mock_bot.send_message_draft.assert_called_once()
         call_kwargs = mock_bot.send_message_draft.call_args[1]
         assert call_kwargs["text"] == "first second"
@@ -163,16 +175,19 @@ class TestDraftStreamerSelfDisable:
         """API error should disable the streamer silently."""
         mock_bot.send_message_draft.side_effect = Exception("API error")
         await streamer.append_text("test")
+        await _settle(streamer)
         assert not streamer._enabled
 
     async def test_subsequent_sends_skipped_after_disable(self, streamer, mock_bot):
         """After disabling, no more sends should happen."""
         mock_bot.send_message_draft.side_effect = Exception("API error")
         await streamer.append_text("first")
+        await _settle(streamer)
         mock_bot.send_message_draft.reset_mock()
         mock_bot.send_message_draft.side_effect = None
 
         await streamer.append_text("second")
+        await _settle(streamer)
         mock_bot.send_message_draft.assert_not_called()
 
 
@@ -215,6 +230,7 @@ class TestDraftStreamerThreadId:
             message_thread_id=999,
         )
         await streamer.append_text("hello")
+        await _settle(streamer)
         call_kwargs = mock_bot.send_message_draft.call_args[1]
         assert call_kwargs["message_thread_id"] == 999
 
@@ -227,6 +243,7 @@ class TestDraftStreamerThreadId:
             message_thread_id=None,
         )
         await streamer.append_text("hello")
+        await _settle(streamer)
         call_kwargs = mock_bot.send_message_draft.call_args[1]
         assert "message_thread_id" not in call_kwargs
 
@@ -240,6 +257,7 @@ class TestDraftStreamerToolLines:
     async def test_append_tool_sends_draft(self, streamer, mock_bot):
         """append_tool should trigger a draft send (first call, throttle=0)."""
         await streamer.append_tool("\U0001f4d6 Read")
+        await _settle(streamer)
         mock_bot.send_message_draft.assert_called_once()
         call_kwargs = mock_bot.send_message_draft.call_args[1]
         assert call_kwargs["text"] == "\U0001f4d6 Read"
@@ -259,9 +277,11 @@ class TestDraftStreamerToolLines:
     async def test_tool_throttle(self, streamer, mock_bot):
         """Second tool within throttle should not trigger send."""
         await streamer.append_tool("\U0001f4d6 Read")
+        await _settle(streamer)
         mock_bot.send_message_draft.reset_mock()
 
         await streamer.append_tool("\U0001f527 Grep")
+        await _settle(streamer)
         mock_bot.send_message_draft.assert_not_called()
         assert len(streamer._tool_lines) == 2
 
@@ -315,14 +335,44 @@ class TestDraftStreamerComposition:
         assert "... +" not in text
 
 
+class TestDraftStreamerNonBlocking:
+    async def test_stuck_send_does_not_block_appends(self, mock_bot):
+        """A draft stuck in Telegram's rate limiter must not stall the stream.
+
+        append_* is awaited by the loop that drains Claude's output; a send
+        awaited there makes every token delta wait for the network.
+        """
+        release = asyncio.Event()
+
+        async def stuck_send(**kwargs):
+            await release.wait()
+
+        mock_bot.send_message_draft.side_effect = stuck_send
+        streamer = DraftStreamer(
+            bot=mock_bot, chat_id=123, draft_id=42, throttle_interval=0
+        )
+
+        for i in range(50):
+            await asyncio.wait_for(streamer.append_text(f"t{i} "), timeout=1)
+            await asyncio.sleep(0)  # the real reader yields between messages
+
+        # One send in flight; the rest only accumulate.
+        assert mock_bot.send_message_draft.call_count == 1
+        release.set()
+        await streamer.flush()
+        assert "t49" in mock_bot.send_message_draft.call_args[1]["text"]
+
+
 class TestDraftStreamerMidStreamDisable:
     async def test_append_noop_after_mid_stream_disable(self, streamer, mock_bot):
         """After self-disable mid-stream, append_text/append_tool don't accumulate."""
         mock_bot.send_message_draft.side_effect = [None, Exception("flake")]
         await streamer.append_tool("tool1")  # succeeds, _tool_lines=["tool1"]
+        await _settle(streamer)
         # Expire throttle so the next append actually triggers _send_draft
         streamer._last_send_time = 0.0
         await streamer.append_text("text")  # fails on send, disables
+        await _settle(streamer)
 
         assert not streamer._enabled
         mock_bot.send_message_draft.reset_mock()

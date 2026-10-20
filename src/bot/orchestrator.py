@@ -1071,6 +1071,18 @@ class MessageOrchestrator:
             return None
 
         last_edit_time = [0.0]  # mutable container for closure
+        # The progress edit runs as a task, at most one at a time, and is never
+        # awaited here: this callback is awaited by the loop draining Claude's
+        # output, and in a group topic each edit waits for PTB's per-group
+        # limiter (20 calls/min). Awaiting it made every token delta cost
+        # seconds, so a long answer outlasted the run timeout.
+        edit_task: List[Optional["asyncio.Task[None]"]] = [None]
+
+        async def _edit_progress(text: str) -> None:
+            try:
+                await progress_msg.edit_text(text, reply_markup=reply_markup)
+            except Exception:
+                pass
 
         async def _on_stream(update_obj: StreamUpdate) -> None:
             # Stop all streaming activity after interrupt
@@ -1148,17 +1160,13 @@ class MessageOrchestrator:
                 draft_streamer is None or not draft_streamer.enabled
             ):
                 now = time.time()
-                if (now - last_edit_time[0]) >= 2.0 and tool_log:
+                in_flight = edit_task[0] is not None and not edit_task[0].done()
+                if not in_flight and (now - last_edit_time[0]) >= 2.0 and tool_log:
                     last_edit_time[0] = now
                     new_text = self._format_verbose_progress(
                         tool_log, verbose_level, start_time
                     )
-                    try:
-                        await progress_msg.edit_text(
-                            new_text, reply_markup=reply_markup
-                        )
-                    except Exception:
-                        pass
+                    edit_task[0] = asyncio.create_task(_edit_progress(new_text))
 
         return _on_stream
 

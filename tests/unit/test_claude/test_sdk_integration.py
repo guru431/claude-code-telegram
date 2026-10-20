@@ -1379,6 +1379,35 @@ class TestClaudeMdLoading:
         assert "Use relative paths." in opts.system_prompt
         assert "# Project Rules" not in opts.system_prompt
 
+    async def test_large_claude_md_passed_via_file(self, sdk_manager, tmp_path):
+        """A prompt too long for a Windows command line goes through a file.
+
+        The SDK passes a string system prompt as a CLI argument. Past 32,767
+        characters CreateProcess fails with WinError 206, which surfaced as
+        "Claude Code not found" for a project with a 44k-char CLAUDE.md.
+        """
+        (tmp_path / "CLAUDE.md").write_text(
+            "# Project Rules\n" + "x" * 40_000, encoding="utf-8"
+        )
+        seen: list = []
+        inner = _mock_client_factory(
+            _make_assistant_message("ok"), _make_result_message()
+        )
+
+        def factory(options):
+            path = Path(options.system_prompt["path"])
+            seen.append((options.system_prompt["type"], path, path.read_text("utf-8")))
+            return inner(options)
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", side_effect=factory):
+            await sdk_manager.execute_command(prompt="test", working_directory=tmp_path)
+
+        kind, path, text = seen[0]
+        assert kind == "file"
+        assert "# Project Rules" in text
+        assert str(tmp_path) in text
+        assert not path.exists()
+
     async def test_project_settings_not_trusted_by_default(self, sdk_manager, tmp_path):
         """<cwd>/.claude/settings.json is not loaded unless explicitly trusted.
 

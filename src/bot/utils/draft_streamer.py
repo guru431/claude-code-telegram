@@ -1,5 +1,7 @@
 """Stream partial responses to Telegram via sendMessageDraft."""
 
+import asyncio
+import contextlib
 import secrets
 import time
 from typing import List, Optional
@@ -43,6 +45,10 @@ class DraftStreamer:
     - Tail-truncation for messages >4096 chars: shows ``"\\u2026" + last 4093 chars``.
     - Self-disabling: any API error silently disables the streamer so the
       request continues with normal (non-streaming) delivery.
+    - Non-blocking appends: the send runs as a background task, at most one
+      at a time. ``append_*`` is awaited by the loop draining Claude's output,
+      and a send waiting there on the network or on PTB's rate limiter held up
+      every following token.
     """
 
     def __init__(
@@ -64,6 +70,7 @@ class DraftStreamer:
         self._accumulated_text = ""
         self._last_send_time = 0.0
         self._enabled = True
+        self._send_task: Optional["asyncio.Task[None]"] = None
 
     @property
     def enabled(self) -> bool:
@@ -85,21 +92,34 @@ class DraftStreamer:
             trimmed = len(self._tool_lines) - _MAX_TOOL_LINES
             self._tool_lines = self._tool_lines[-_MAX_TOOL_LINES:]
             self._tool_overflow += trimmed
-        now = time.time()
-        if (now - self._last_send_time) >= self.throttle_interval:
-            await self._send_draft()
+        self._schedule_send()
 
     async def append_text(self, text: str) -> None:
         """Append streamed text and send a draft if throttle interval elapsed."""
         if not self._enabled or not text:
             return
         self._accumulated_text += text
-        now = time.time()
-        if (now - self._last_send_time) >= self.throttle_interval:
-            await self._send_draft()
+        self._schedule_send()
+
+    def _schedule_send(self) -> None:
+        """Start a background send unless one is in flight or throttled.
+
+        Content added meanwhile is not lost: the next send composes the draft
+        from everything accumulated so far.
+        """
+        if self._send_task is not None and not self._send_task.done():
+            return
+        if (time.time() - self._last_send_time) >= self.throttle_interval:
+            self._send_task = asyncio.create_task(self._send_draft())
 
     async def flush(self) -> None:
         """Force-send the current accumulated text as a draft."""
+        if self._send_task is not None:
+            # A stale send landing after this one would roll the draft back.
+            self._send_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._send_task
+            self._send_task = None
         if not self._enabled:
             return
         if not self._accumulated_text and not self._tool_lines:

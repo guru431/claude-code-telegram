@@ -2,9 +2,11 @@
 
 import asyncio
 import json
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Literal, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Literal, Optional, Union
 
 import structlog
 from claude_agent_sdk import (
@@ -26,7 +28,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk._errors import MessageParseError
 from claude_agent_sdk._internal.message_parser import parse_message
-from claude_agent_sdk.types import StreamEvent
+from claude_agent_sdk.types import StreamEvent, SystemPromptFile
 
 from ..config.settings import Settings
 from ..security.validators import SecurityValidator
@@ -39,6 +41,25 @@ from .exceptions import (
 from .monitor import _is_claude_internal_path, check_bash_directory_boundary
 
 logger = structlog.get_logger()
+
+# The SDK passes a string system prompt as one ``--system-prompt`` argument,
+# and Windows caps a whole command line at 32,767 characters. A large
+# CLAUDE.md overflowed it: CreateProcess failed with WinError 206, which Python
+# raises as FileNotFoundError and the SDK reports as "Claude Code not found".
+# A longer prompt goes through ``--system-prompt-file``; the margin leaves room
+# for the other arguments (tool lists, settings and MCP JSON).
+_MAX_INLINE_SYSTEM_PROMPT_CHARS = 16_000
+
+
+def _write_system_prompt_file(prompt: str) -> Path:
+    """Write *prompt* to a temp file for ``--system-prompt-file``.
+
+    The caller deletes the file once the run is over.
+    """
+    fd, name = tempfile.mkstemp(prefix="cct-system-prompt-", suffix=".md")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(prompt)
+    return Path(name)
 
 
 @dataclass
@@ -319,6 +340,7 @@ class ClaudeSDKManager:
             continue_session=continue_session,
         )
 
+        system_prompt_file: Optional[Path] = None
         try:
             # Capture stderr from Claude CLI for better error diagnostics
             stderr_lines: List[str] = []
@@ -382,6 +404,11 @@ class ClaudeSDKManager:
                         path=str(claude_md_path),
                     )
 
+            system_prompt: Union[str, SystemPromptFile] = base_prompt
+            if len(base_prompt) > _MAX_INLINE_SYSTEM_PROMPT_CHARS:
+                system_prompt_file = _write_system_prompt_file(base_prompt)
+                system_prompt = {"type": "file", "path": str(system_prompt_file)}
+
             # ``.claude/settings.json`` in the working directory is a far more
             # direct vector than the CLAUDE.md wrapped above as untrusted data:
             # its hooks execute arbitrary commands and its permissions/env change
@@ -434,7 +461,7 @@ class ClaudeSDKManager:
                     "autoAllowBashIfSandboxed": True,
                     "excludedCommands": self.config.sandbox_excluded_commands or [],
                 },
-                system_prompt=base_prompt,
+                system_prompt=system_prompt,
                 setting_sources=setting_sources,
                 stderr=_stderr_callback,
                 env=sdk_env,
@@ -855,6 +882,17 @@ class ClaudeSDKManager:
                 error_type=type(e).__name__,
             )
             raise ClaudeProcessError(f"Unexpected error: {str(e)}")
+
+        finally:
+            if system_prompt_file is not None:
+                try:
+                    system_prompt_file.unlink(missing_ok=True)
+                except OSError as unlink_err:
+                    logger.warning(
+                        "Could not delete system prompt file",
+                        path=str(system_prompt_file),
+                        error=str(unlink_err),
+                    )
 
     async def _handle_stream_message(
         self, message: Message, stream_callback: Callable[[StreamUpdate], None]
