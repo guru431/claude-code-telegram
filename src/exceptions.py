@@ -1,5 +1,7 @@
 """Custom exceptions for Claude Code Telegram Bot."""
 
+from typing import Optional
+
 
 class ClaudeCodeTelegramError(Exception):
     """Base exception for Claude Code Telegram Bot."""
@@ -42,11 +44,19 @@ class ClaudeTimeoutError(ClaudeError):
 
     *partial_content* is the assistant text streamed before the timeout, so a
     caller can show what Claude had already written instead of dropping it.
+    *session_id* is the session the CLI reported; it holds the conversation up
+    to the timeout, so the next message can continue it.
     """
 
-    def __init__(self, message: str = "", partial_content: str = "") -> None:
+    def __init__(
+        self,
+        message: str = "",
+        partial_content: str = "",
+        session_id: Optional[str] = None,
+    ) -> None:
         super().__init__(message)
         self.partial_content = partial_content
+        self.session_id = session_id
 
 
 class ClaudeProcessError(ClaudeError):

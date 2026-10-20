@@ -1804,8 +1804,33 @@ async def test_media_run_persists_soft_error_run(agentic_settings, deps):
     limiter.settle_reservation.assert_awaited_once_with("rid-1", 0.5)
 
 
-async def test_timeout_drops_stored_session_id(agentic_settings, deps):
-    """Resuming a timed-out session just reproduces the timeout."""
+async def test_timeout_keeps_the_session_for_the_next_message(
+    agentic_settings, deps
+):
+    """After a timeout the next message continues the same conversation.
+
+    Dropping the session made a follow-up like "why didn't you answer?" start
+    from scratch, without the question that timed out (owner's call,
+    2026-10-20). A session id reported by the timed-out run wins.
+    """
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock(
+        side_effect=ClaudeTimeoutError("timed out", session_id="forked-2")
+    )
+    limiter = _reserving_limiter()
+    context = _cost_context(agentic_settings, claude_integration, limiter)
+    context.user_data["claude_session_id"] = "stuck-1"
+
+    await orchestrator.agentic_text(_cost_update(), context)
+
+    assert context.user_data["claude_session_id"] == "forked-2"
+
+
+async def test_timeout_without_reported_session_keeps_stored_one(
+    agentic_settings, deps
+):
+    """A run that timed out before reporting a session keeps the stored one."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     claude_integration = AsyncMock()
     claude_integration.run_command = AsyncMock(
@@ -1817,7 +1842,7 @@ async def test_timeout_drops_stored_session_id(agentic_settings, deps):
 
     await orchestrator.agentic_text(_cost_update(), context)
 
-    assert context.user_data["claude_session_id"] is None
+    assert context.user_data["claude_session_id"] == "stuck-1"
 
 
 async def test_timeout_delivers_text_written_before_it(agentic_settings, deps):

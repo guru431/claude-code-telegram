@@ -13,7 +13,7 @@ from ..config.settings import Settings
 from .exceptions import ClaudeProcessError, ClaudeTimeoutError
 from .local_sessions import find_latest_local_session
 from .sdk_integration import ClaudeResponse, ClaudeSDKManager, StreamUpdate
-from .session import SessionManager
+from .session import ClaudeSession, SessionManager
 
 logger = structlog.get_logger()
 
@@ -226,7 +226,42 @@ class ClaudeIntegration:
                 user_id=user_id,
                 session_id=session.session_id,
             )
+            if isinstance(e, ClaudeTimeoutError) and e.session_id:
+                await self._keep_timed_out_session(session, e)
             raise
+
+    async def _keep_timed_out_session(
+        self, session: ClaudeSession, error: ClaudeTimeoutError
+    ) -> None:
+        """Make the session of a timed-out run resumable.
+
+        The CLI saved the conversation up to the timeout. Persisting its id
+        lets the next message continue it instead of starting over without the
+        question that timed out (owner's call, 2026-10-20). Mirrors the success
+        path: assign the id to a new session, re-key a forked one.
+        """
+        response = ClaudeResponse(
+            content=error.partial_content,
+            session_id=error.session_id or "",
+            cost=0.0,
+            duration_ms=0,
+            num_turns=0,
+            is_error=True,
+            error_type="timeout",
+        )
+        try:
+            await self.session_manager.update_session(session, response)
+            if response.session_id != session.session_id:
+                await self.session_manager.migrate_session_id(
+                    session, response.session_id
+                )
+        except Exception as keep_error:
+            # The timeout is what the caller has to see; this is best effort.
+            logger.warning(
+                "Could not keep the timed-out session resumable",
+                session_id=error.session_id,
+                error=str(keep_error),
+            )
 
     async def _execute(
         self,

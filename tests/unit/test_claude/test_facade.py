@@ -129,6 +129,36 @@ class TestForceNewSkipsAutoResume:
             spy.assert_not_called()
 
 
+class TestTimedOutSessionStaysResumable:
+    """A run that timed out leaves a session the next message continues."""
+
+    async def test_new_session_from_timed_out_run_is_resumable(
+        self, facade, session_manager
+    ):
+        """The CLI saved the conversation up to the timeout; keep it.
+
+        Without this the next message ("why didn't you answer?") started a new
+        session that had never seen the question.
+        """
+        from src.claude.exceptions import ClaudeTimeoutError
+
+        project = Path("/test/project")
+        user_id = 123
+        error = ClaudeTimeoutError(
+            "timed out", partial_content="partial", session_id="sess-timeout"
+        )
+
+        with patch.object(facade, "_execute", side_effect=error):
+            with pytest.raises(ClaudeTimeoutError):
+                await facade.run_command(
+                    prompt="hello", working_directory=project, user_id=user_id
+                )
+
+        found = await facade._find_resumable_session(user_id, project)
+        assert found is not None
+        assert found.session_id == "sess-timeout"
+
+
 class TestForceNewSurvivesFailure:
     """Verify the handler-level contract: force_new_session flag stays set
     when run_command fails, so the next retry still starts a fresh session."""

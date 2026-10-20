@@ -1577,12 +1577,17 @@ class MessageOrchestrator:
                 error=str(e),
                 user_id=user_id,
             )
-            # A timeout or a dead CLI process leaves the resumed session in an
-            # unknown state; resuming it on the next message just reproduces the
-            # failure. Drop the stored id so the next message starts a fresh
-            # session without the user having to run /new.
-            if isinstance(e, (ClaudeTimeoutError, ClaudeProcessError)):
+            # A dead CLI process leaves the resumed session in an unknown state;
+            # resuming it on the next message just reproduces the failure. Drop
+            # the stored id so the next message starts a fresh session without
+            # the user having to run /new.
+            if isinstance(e, ClaudeProcessError):
                 context.user_data["claude_session_id"] = None
+            # A timeout keeps the session: the CLI saved the conversation up to
+            # it, and a follow-up ("continue", "why no answer?") needs that
+            # context (owner's call, 2026-10-20). A forked id from the run wins.
+            if isinstance(e, ClaudeTimeoutError) and e.session_id:
+                context.user_data["claude_session_id"] = e.session_id
             # What Claude wrote before the timeout reaches the user, as a Stop's
             # partial text does, instead of being replaced by the error alone.
             partial = e.partial_content if isinstance(e, ClaudeTimeoutError) else ""

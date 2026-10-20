@@ -332,7 +332,9 @@ class TestClaudeSDKManager:
         client.query = AsyncMock()
 
         async def answer_then_hang():
-            yield _make_assistant_message("Part one of the answer")
+            message = _make_assistant_message("Part one of the answer")
+            message.session_id = "sess-timed-out"
+            yield message
             await asyncio.sleep(5)  # Far past the 50 ms timeout above
 
         query_mock = AsyncMock()
@@ -346,6 +348,9 @@ class TestClaudeSDKManager:
                     working_directory=Path("/test"),
                 )
         assert excinfo.value.partial_content == "Part one of the answer"
+        # The CLI keeps the conversation up to the timeout; its id lets the
+        # next message continue it.
+        assert excinfo.value.session_id == "sess-timed-out"
 
     async def test_external_cancel_stops_run_task(self, sdk_manager):
         """Cancelling the caller (bot shutdown) must not leave the shielded

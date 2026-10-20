@@ -66,6 +66,15 @@ def _assistant_text(messages: List[Any]) -> str:
     return "\n".join(parts)
 
 
+def _streamed_session_id(messages: List[Any]) -> Optional[str]:
+    """Session id reported by the stream before (or without) a ResultMessage."""
+    for msg in messages:
+        msg_session_id = getattr(msg, "session_id", None)
+        if msg_session_id and not isinstance(msg, ResultMessage):
+            return str(msg_session_id)
+    return None
+
+
 def _write_system_prompt_file(prompt: str) -> Path:
     """Write *prompt* to a temp file for ``--system-prompt-file``.
 
@@ -750,15 +759,12 @@ class ClaudeSDKManager:
             # Fallback: extract session_id from StreamEvent messages if
             # ResultMessage didn't provide one (can happen with some CLI versions)
             if not claude_session_id:
-                for message in messages:
-                    msg_session_id = getattr(message, "session_id", None)
-                    if msg_session_id and not isinstance(message, ResultMessage):
-                        claude_session_id = msg_session_id
-                        logger.info(
-                            "Got session ID from stream event (fallback)",
-                            session_id=claude_session_id,
-                        )
-                        break
+                claude_session_id = _streamed_session_id(messages)
+                if claude_session_id:
+                    logger.info(
+                        "Got session ID from stream event (fallback)",
+                        session_id=claude_session_id,
+                    )
 
             # If no ResultMessage ever arrived (e.g. the final one hit a
             # MessageParseError and was skipped), cost/session_id are lost and
@@ -835,6 +841,7 @@ class ClaudeSDKManager:
             raise ClaudeTimeoutError(
                 f"Claude SDK timed out after {self.config.claude_timeout_seconds}s",
                 partial_content=_assistant_text(messages),
+                session_id=_streamed_session_id(messages),
             )
 
         except CLINotFoundError as e:
