@@ -93,6 +93,8 @@ markers = [
     "manual: запускается руками, в свипе не участвует",
 ]
 asyncio_mode = "auto"
+# tmp_path — только у упавших тестов: три прогона по умолчанию в pytest-of-<user> забивали C: (2026-10-21)
+tmp_path_retention_policy = "failed"
 
 [tool.mypy]
 python_version = "3.11"
