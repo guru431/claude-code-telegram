@@ -1804,9 +1804,7 @@ async def test_media_run_persists_soft_error_run(agentic_settings, deps):
     limiter.settle_reservation.assert_awaited_once_with("rid-1", 0.5)
 
 
-async def test_timeout_keeps_the_session_for_the_next_message(
-    agentic_settings, deps
-):
+async def test_timeout_keeps_the_session_for_the_next_message(agentic_settings, deps):
     """After a timeout the next message continues the same conversation.
 
     Dropping the session made a follow-up like "why didn't you answer?" start

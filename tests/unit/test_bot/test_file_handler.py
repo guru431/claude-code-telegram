@@ -1,5 +1,7 @@
 """Tests for FileHandler archive extraction and content truncation."""
 
+import os
+import stat
 import zipfile
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -97,6 +99,23 @@ async def test_small_file_not_truncated(handler: FileHandler, tmp_path: Path):
     assert "print('ok')" in result.prompt
 
 
+@pytest.mark.parametrize(
+    "length, truncated",
+    [(MAX_INLINE_CONTENT, False), (MAX_INLINE_CONTENT + 1, True)],
+)
+def test_read_inline_marks_only_a_real_cut(
+    tmp_path: Path, length: int, truncated: bool
+) -> None:
+    """The read stops at the cap; the one extra char tells a cut from a fit."""
+    path = tmp_path / "edge.txt"
+    path.write_text("я" * length, encoding="utf-8")
+
+    content = FileHandler._read_inline(path)
+
+    assert content.count("я") == MAX_INLINE_CONTENT
+    assert content.endswith("...[truncated]") is truncated
+
+
 class TestUploadSizeLimit:
     """The enhanced handler must enforce MAX_FILE_UPLOAD_SIZE_MB itself.
 
@@ -154,3 +173,13 @@ class TestUploadSizeLimit:
         path = await sized_handler._download_file(document)
 
         assert path.read_bytes() == b"print(1)\n"
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+    async def test_download_dir_is_private(self, sized_handler):
+        """The shared parent sits in the system temp dir; the upload must not
+        be readable by other local users."""
+        document = self._document(b"secret\n", declared_size=None)
+
+        path = await sized_handler._download_file(document)
+
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700

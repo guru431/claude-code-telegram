@@ -329,6 +329,9 @@ class ProgressIndicator:
         empty_char: str = "░",
     ) -> str:
         """Create a progress bar."""
+        # Clamped like format_progress_message: outside 0-100% the bar came
+        # out longer than ``length``.
+        percentage = min(max(percentage, 0.0), 100.0)
         filled = int((percentage / 100) * length)
         empty = length - filled
         return filled_char * filled + empty_char * empty

@@ -4,6 +4,10 @@
 Additive by default: adds newly discovered directories and never drops an entry
 whose directory still exists on disk. Pass --prune to also drop entries whose
 directory is gone. Preserves manually set slug/name/enabled for existing entries.
+
+Exit codes: 0 - no changes, 3 - projects.yaml was rewritten (the .cmd wrapper
+restarts the bot on it), 1 - error. Not 2: argparse exits with 2 on a usage
+error, which would then look like a change.
 """
 
 import argparse
@@ -65,6 +69,7 @@ def sync(config_path: Path, approved_dir: Path, prune: bool = False) -> bool:
             data = yaml.safe_load(f) or {}
         existing = data.get("projects", []) or []
     else:
+        data = {}
         existing = []
 
     # Index existing entries by canonical directory identity, NOT by the raw
@@ -189,7 +194,12 @@ def sync(config_path: Path, approved_dir: Path, prune: bool = False) -> bool:
     if removed:
         print(f"Removed: {', '.join(sorted(removed))}")
 
-    _write_config(config_path, {"projects": new_norm}, approved_dir)
+    # Write the normalized fields over each entry instead of the bare
+    # normalized dict, and keep the other top-level keys: auto-discovery writes
+    # the loaded data back as is, so dropping hand-added fields here made the
+    # two writers of this file undo each other.
+    payload = {**data, "projects": [{**e, **_normalize(e)} for e in new_projects]}
+    _write_config(config_path, payload, approved_dir)
 
     print(f"Updated {config_path} ({len(new_projects)} projects)")
     return True
@@ -260,7 +270,7 @@ def main() -> None:
         # Refuse to rewrite the file from a config we could not parse.
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
-    sys.exit(2 if changed else 0)
+    sys.exit(3 if changed else 0)
 
 
 if __name__ == "__main__":

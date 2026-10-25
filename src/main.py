@@ -559,7 +559,10 @@ async def run_application(app: Dict[str, Any]) -> int:
                 """Discover new project dirs and sync Telegram topics."""
                 _log = structlog.get_logger()
                 try:
-                    new_projects, total = discover_new_projects(
+                    # Directory scan and YAML rewrite: off the event loop, so
+                    # the bot keeps answering while they run.
+                    new_projects, total = await asyncio.to_thread(
+                        discover_new_projects,
                         approved_directory=config.approved_directory,
                         config_path=config.projects_config_path,  # type: ignore[arg-type]
                     )
@@ -574,7 +577,8 @@ async def run_application(app: Dict[str, Any]) -> int:
                     )
 
                     # Reload registry from updated YAML
-                    fresh_registry = load_project_registry(
+                    fresh_registry = await asyncio.to_thread(
+                        load_project_registry,
                         config_path=config.projects_config_path,  # type: ignore[arg-type]
                         approved_directory=config.approved_directory,
                     )
@@ -611,13 +615,18 @@ async def run_application(app: Dict[str, Any]) -> int:
             discovery_scheduler = _DiscoveryScheduler(
                 job_defaults={"misfire_grace_time": 3600, "coalesce": True},
             )
+            # 03:30, not 03:00: scripts/sync_projects_yaml.cmd is scheduled for
+            # 03:00 on the deployment host and restarts the bot whenever it
+            # changes projects.yaml. A topic sync started here at the same minute
+            # could die between creating a topic and recording it, and the
+            # startup sync would then create that topic a second time.
             discovery_scheduler.add_job(
                 _nightly_project_discovery,
-                trigger=_DiscoveryCronTrigger(hour=3, minute=0),
+                trigger=_DiscoveryCronTrigger(hour=3, minute=30),
                 name="nightly_project_discovery",
             )
             discovery_scheduler.start()
-            logger.info("Nightly project discovery cron enabled (03:00 daily)")
+            logger.info("Nightly project discovery cron enabled (03:30 daily)")
 
         # Shutdown task
         shutdown_task = asyncio.create_task(shutdown_event.wait())

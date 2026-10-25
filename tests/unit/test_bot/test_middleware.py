@@ -373,6 +373,25 @@ def test_estimate_message_cost_ignores_bot_message_on_callback() -> None:
 
 
 @pytest.mark.parametrize(
+    "prompt, complex_run",
+    [
+        ("what is the latest news", False),
+        ("they protest the contest", False),
+        ("recreate it", False),
+        ("Run the tests", True),
+        ("created a module", True),
+        ("debug this", True),
+    ],
+)
+def test_complex_keyword_matches_word_start_only(
+    prompt: str, complex_run: bool
+) -> None:
+    """Regression: substring matching priced "latest" as a test run."""
+    surcharge = estimate_prompt_cost(prompt) - estimate_prompt_cost("x" * len(prompt))
+    assert (round(surcharge, 6) == 0.03) is complex_run
+
+
+@pytest.mark.parametrize(
     "module_name, func_name",
     [
         ("security", "security_middleware"),

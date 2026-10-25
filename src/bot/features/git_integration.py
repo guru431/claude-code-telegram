@@ -98,6 +98,14 @@ class GitIntegration:
     # Options that take an otherwise read-only subcommand outside the
     # repository: ``diff --no-index A B`` prints any two files on the host,
     # ``--output=FILE`` writes the result wherever it is told.
+    #
+    # Commands set in the repository's own .git/config (diff drivers, textconv,
+    # clean filters, core.fsmonitor) run under these read-only forms too, with
+    # or without ``--ext-diff``/``--textconv``: ``git diff`` applies them by
+    # default and ``--no-ext-diff --no-textconv`` still leave the clean filter.
+    # No option list closes that, so repo config is trusted exactly as a git
+    # client in a terminal trusts it; a repository copied in together with a
+    # foreign .git directory is as unsafe here as there.
     FORBIDDEN_OPTIONS = ("--no-index", "--output")
 
     # ``branch`` and ``remote`` only list with these arguments. Any other form
@@ -282,8 +290,9 @@ class GitIntegration:
                 worktree_col,
             ):
                 # Rename or copy: tree changed — record the new path. Treated
-                # as a modification so is_clean reports dirty. With ``-z`` the
-                # original path follows as an entry of its own; skip it.
+                # as a modification so is_clean reports dirty. ``-z`` reverses
+                # the line format's "old -> new": this entry holds the new path
+                # and the original follows as an entry of its own; skip it.
                 modified.append(path)
                 position += 1
             elif "D" in (index_col, worktree_col):
@@ -305,6 +314,8 @@ class GitIntegration:
                 ["git", "rev-list", "--count", "--left-right", "HEAD...@{upstream}"],
                 repo_path,
             )
+            # With --count the output is two bare numbers, "ahead<TAB>behind";
+            # the "<"/">" marks of --left-right belong to listed commits only.
             if rev_out.strip():
                 parts = rev_out.strip().split("\t")
                 if len(parts) == 2:

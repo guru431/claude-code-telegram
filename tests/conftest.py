@@ -13,8 +13,7 @@ _DOTENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 
 if sys.platform == "win32":
 
-    @pytest.fixture(scope="session")
-    def event_loop_policy():
+    def pytest_asyncio_loop_factories(config, item):
         """Run the suite on the selector loop instead of the proactor loop.
 
         pytest-asyncio drives one ``asyncio.Runner`` — i.e. one event loop —
@@ -38,12 +37,12 @@ if sys.platform == "win32":
         the proactor loop: ``asyncio`` subprocesses are used only by
         ``src/bot/features/git_integration.py``, which no test executes.
 
-        Event-loop policies are deprecated and go away in Python 3.16; the
-        ``DeprecationWarning`` in the run is expected. When they do go, replace
-        this with whatever pytest-asyncio offers for choosing the loop
-        (a loop factory) — the reason for choosing the selector loop stands.
+        A loop factory, not the ``event_loop_policy`` fixture this used to
+        override: event-loop policies are deprecated and go away in Python
+        3.16, and pytest-asyncio 1.4 deprecated overriding that fixture in
+        favour of this hook. One factory keeps the test names unchanged.
         """
-        return asyncio.WindowsSelectorEventLoopPolicy()
+        return {"selector": asyncio.SelectorEventLoop}
 
 
 def _dotenv_keys() -> list[str]:

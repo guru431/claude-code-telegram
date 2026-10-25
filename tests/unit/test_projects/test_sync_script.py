@@ -164,6 +164,36 @@ class TestSyncIsAdditive:
         assert data[0]["slug"] == "zeta"
         assert data[0]["enabled"] is False
 
+    def test_keeps_extra_fields_and_top_level_keys(
+        self, approved: Path, tmp_path: Path
+    ) -> None:
+        """Regression: the rewrite kept only slug/name/path/enabled, while
+        auto-discovery writes such fields back untouched."""
+        config = tmp_path / "projects.yaml"
+        config.write_text(
+            yaml.dump(
+                {
+                    "version": 1,
+                    "projects": [
+                        {
+                            "slug": "alpha",
+                            "name": "Alpha",
+                            "path": "alpha",
+                            "enabled": True,
+                            "note": "kept by hand",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        assert sync(config, approved) is True
+
+        data = yaml.safe_load(config.read_text(encoding="utf-8"))
+        assert data["version"] == 1
+        assert data["projects"][0]["note"] == "kept by hand"
+
     def test_quoted_false_is_not_flipped_to_true(
         self, approved: Path, tmp_path: Path
     ) -> None:

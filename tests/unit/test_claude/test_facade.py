@@ -1,6 +1,6 @@
 """Test ClaudeIntegration facade — force_new skips auto-resume."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict
 from unittest.mock import MagicMock, patch
@@ -81,8 +81,8 @@ class TestForceNewSkipsAutoResume:
             session_id="real-session-id",
             user_id=user_id,
             project_path=project,
-            created_at=datetime.utcnow(),
-            last_used=datetime.utcnow(),
+            created_at=datetime.now(UTC),
+            last_used=datetime.now(UTC),
         )
         await session_manager.storage.save_session(existing)
         session_manager.active_sessions[existing.session_id] = existing
@@ -102,8 +102,8 @@ class TestForceNewSkipsAutoResume:
             session_id="real-session-id",
             user_id=user_id,
             project_path=project,
-            created_at=datetime.utcnow(),
-            last_used=datetime.utcnow(),
+            created_at=datetime.now(UTC),
+            last_used=datetime.now(UTC),
         )
         await session_manager.storage.save_session(existing)
         session_manager.active_sessions[existing.session_id] = existing
@@ -173,8 +173,8 @@ class TestForceNewSurvivesFailure:
             session_id="old-session-id",
             user_id=user_id,
             project_path=project,
-            created_at=datetime.utcnow(),
-            last_used=datetime.utcnow(),
+            created_at=datetime.now(UTC),
+            last_used=datetime.now(UTC),
         )
         await session_manager.storage.save_session(existing)
         session_manager.active_sessions[existing.session_id] = existing
@@ -374,6 +374,28 @@ class TestLocalSessionDiscoveryIsAdminOnly:
             "src.claude.facade.find_latest_local_session",
             return_value=self._local_session(),
         ):
+            found = await facade._find_resumable_session(111, Path("/test/project"))
+
+        assert found is not None
+        assert found.session_id == "local-cli-session"
+
+    async def test_cwd_spelled_in_other_case_matches_on_case_insensitive_fs(
+        self, config, tmp_path, monkeypatch
+    ):
+        """Same identity rule as the project registry (macOS: resolve() keeps
+        the spelling, so a plain Path comparison missed the session)."""
+        monkeypatch.setattr("src.projects.registry._CASE_INSENSITIVE_FS", True)
+        config.allowed_users = [111]
+        config.admin_users = [111]
+        facade = ClaudeIntegration(
+            config=config,
+            sdk_manager=MagicMock(),
+            session_manager=SessionManager(config, InMemorySessionStorage()),
+        )
+        local = self._local_session()
+        local.cwd = str(Path("/Test/PROJECT"))
+
+        with patch("src.claude.facade.find_latest_local_session", return_value=local):
             found = await facade._find_resumable_session(111, Path("/test/project"))
 
         assert found is not None

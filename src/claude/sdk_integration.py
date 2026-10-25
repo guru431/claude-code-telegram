@@ -1007,10 +1007,13 @@ class ClaudeSDKManager:
         The new claude-agent-sdk expects mcp_servers as a dict, not a file path.
         """
         try:
-            with open(config_path) as f:
+            # Explicit UTF-8: the locale default on Windows is a legacy code
+            # page, and the UnicodeDecodeError it raised on a non-ASCII config
+            # escaped this handler and failed the whole run.
+            with open(config_path, encoding="utf-8") as f:
                 config_data = json.load(f)
             return config_data.get("mcpServers", {})
-        except (json.JSONDecodeError, OSError) as e:
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
             logger.error(
                 "Failed to load MCP config", path=str(config_path), error=str(e)
             )

@@ -468,6 +468,11 @@ class TestProgressIndicator:
 
         assert bar == "░" * 10
 
+    def test_create_progress_bar_clamps_out_of_range(self):
+        """Regression: 150% and -10% both gave bars longer than ``length``."""
+        assert ProgressIndicator.create_bar(150, 10) == "▓" * 10
+        assert ProgressIndicator.create_bar(-10, 10) == "░" * 10
+
     def test_create_spinner(self):
         """Test spinner creation."""
         spinner1 = ProgressIndicator.create_spinner(0)

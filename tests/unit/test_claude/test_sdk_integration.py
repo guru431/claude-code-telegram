@@ -431,6 +431,26 @@ class TestClaudeSDKManager:
             "test-server": {"command": "echo", "args": ["hello"]}
         }
 
+    def test_mcp_config_is_read_as_utf8(self, tmp_path):
+        """Regression: read in the locale code page, the UTF-8 of "И" (D0 98)
+        failed both the settings check and the load on a cp1251 host."""
+        mcp_config_file = tmp_path / "mcp_config.json"
+        mcp_config_file.write_text(
+            '{"mcpServers": {"s": {"command": "echo", "args": ["Итог"]}}}',
+            encoding="utf-8",
+        )
+        config = Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            enable_mcp=True,
+            mcp_config_path=str(mcp_config_file),
+        )
+
+        servers = ClaudeSDKManager(config)._load_mcp_config(mcp_config_file)
+
+        assert servers["s"]["args"] == ["Итог"]
+
     async def test_execute_command_no_mcp_when_disabled(self, sdk_manager):
         """Test that MCP config is NOT passed when MCP is disabled."""
         captured_options = []
@@ -737,9 +757,7 @@ class TestClaudeSandboxSettings:
         assert str(tmp_path) in opts.system_prompt
         assert "relative paths" in opts.system_prompt.lower()
 
-    async def test_cli_sandbox_disabled_notice_logged_once(
-        self, sdk_manager, tmp_path
-    ):
+    async def test_cli_sandbox_disabled_notice_logged_once(self, sdk_manager, tmp_path):
         """The CLI's "Sandbox disabled" notice surfaces as a warning, once.
 
         On native Windows the CLI runs Bash without its OS sandbox even with

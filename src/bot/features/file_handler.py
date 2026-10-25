@@ -214,9 +214,11 @@ class FileHandler:
                 f"Max: {max_mb}MB."
             )
 
-        # Per-request directory isolates this download from every other
+        # Per-request directory isolates this download from every other. 0700:
+        # the shared parent lives in the system temp dir, where other local
+        # users of a POSIX host could otherwise read the upload.
         download_dir = self.temp_dir / str(uuid.uuid4())
-        download_dir.mkdir()
+        download_dir.mkdir(mode=0o700)
 
         # Sanitize the user-controlled filename to a bare name within the subdir
         file_name = document.file_name or f"file_{uuid.uuid4()}"
@@ -277,7 +279,7 @@ class FileHandler:
 
         # Create extraction directory
         extract_dir = self.temp_dir / f"extract_{uuid.uuid4()}"
-        extract_dir.mkdir()
+        extract_dir.mkdir(mode=0o700)  # private, as the download dir
 
         try:
             extract_dir_resolved = extract_dir.resolve()
@@ -497,9 +499,7 @@ class FileHandler:
 
     def _process_code_file_sync(self, file_path: Path, context: str) -> ProcessedFile:
         """Process single code file (synchronous worker)."""
-        content = file_path.read_text(encoding="utf-8", errors="ignore")
-        if len(content) > MAX_INLINE_CONTENT:
-            content = content[:MAX_INLINE_CONTENT] + "\n...[truncated]"
+        content = self._read_inline(file_path)
 
         # Detect language
         language = self._detect_language(file_path.suffix)
@@ -523,9 +523,7 @@ class FileHandler:
 
     def _process_text_file_sync(self, file_path: Path, context: str) -> ProcessedFile:
         """Process text file (synchronous worker)."""
-        content = file_path.read_text(encoding="utf-8", errors="ignore")
-        if len(content) > MAX_INLINE_CONTENT:
-            content = content[:MAX_INLINE_CONTENT] + "\n...[truncated]"
+        content = self._read_inline(file_path)
 
         # Create prompt
         prompt = f"{context}\n\nFile: {file_path.name}\n\n{content}"
@@ -538,6 +536,20 @@ class FileHandler:
                 "size": file_path.stat().st_size,
             },
         )
+
+    @staticmethod
+    def _read_inline(file_path: Path) -> str:
+        """Read the part of an upload that goes into the prompt.
+
+        Only ``MAX_INLINE_CONTENT`` characters are kept, so only that many (and
+        one more, to tell whether anything was cut) are read: an upload may be
+        as large as MAX_FILE_UPLOAD_SIZE_MB.
+        """
+        with open(file_path, encoding="utf-8", errors="ignore") as fh:
+            content = fh.read(MAX_INLINE_CONTENT + 1)
+        if len(content) > MAX_INLINE_CONTENT:
+            content = content[:MAX_INLINE_CONTENT] + "\n...[truncated]"
+        return content
 
     def _build_file_tree(
         self, directory: Path, prefix: str = "", depth: int = 0

@@ -527,7 +527,9 @@ class Settings(BaseSettings):
             raise ValueError(f"MCP config path is not a file: {v}")
         # Validate that the file contains valid JSON with mcpServers
         try:
-            with open(v) as f:
+            # UTF-8 as ClaudeSDKManager._load_mcp_config reads it, not the
+            # locale code page (cp1251 cannot decode the UTF-8 of "И").
+            with open(v, encoding="utf-8") as f:
                 config_data = json.load(f)
         except json.JSONDecodeError as e:
             raise ValueError(f"MCP config file is not valid JSON: {e}")

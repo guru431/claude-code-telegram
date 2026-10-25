@@ -1,5 +1,6 @@
 """Rate limiting middleware for Telegram bot."""
 
+import re
 from typing import Any, Callable, Dict
 
 import structlog
@@ -7,6 +8,13 @@ import structlog
 from ...security.rate_limiter import COST_LIMIT_MESSAGE_PREFIX
 
 logger = structlog.get_logger()
+
+# Words that mark a prompt as a heavier run. Anchored at the start of a word
+# only: "tests" and "created" still count, but "latest", "protest" and
+# "recreate" no longer raise the estimate of an ordinary message.
+_COMPLEX_KEYWORDS = re.compile(
+    r"\b(?:analyze|generate|create|build|compile|test|debug|refactor|optimize|explain)"
+)
 
 
 async def rate_limit_middleware(
@@ -168,20 +176,7 @@ def estimate_prompt_cost(prompt: str) -> float:
         return base_cost + length_cost + 0.02
 
     # Check for complex operations keywords
-    complex_keywords = [
-        "analyze",
-        "generate",
-        "create",
-        "build",
-        "compile",
-        "test",
-        "debug",
-        "refactor",
-        "optimize",
-        "explain",
-    ]
-
-    if any(keyword in prompt.lower() for keyword in complex_keywords):
+    if _COMPLEX_KEYWORDS.search(prompt.lower()):
         return base_cost + length_cost + 0.03
 
     return base_cost + length_cost

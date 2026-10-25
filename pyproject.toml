@@ -60,7 +60,7 @@ voice = ["mistralai", "openai"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.4.0"
-pytest-asyncio = "^1.0.0"
+pytest-asyncio = "^1.4.0"
 pytest-cov = "^6.1.1"
 pytest-mock = "^3.14.1"
 pytest-timeout = "^2.4.0"

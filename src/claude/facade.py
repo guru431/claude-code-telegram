@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional
 import structlog
 
 from ..config.settings import Settings
+from ..projects.registry import canonical_path_key
 from .exceptions import ClaudeProcessError, ClaudeTimeoutError
 from .local_sessions import find_latest_local_session
 from .sdk_integration import ClaudeResponse, ClaudeSDKManager, StreamUpdate
@@ -354,8 +355,12 @@ class ClaudeIntegration:
         # before resuming, or we'd resume cross-project history into the wrong
         # context. A blank/unresolvable cwd is rejected (fail closed).
         if local and local.cwd:
+            # Compared as the registry compares project paths: case folds on
+            # macOS too, where resolve() keeps the spelling it was given.
             try:
-                same_dir = Path(local.cwd).resolve() == working_directory.resolve()
+                same_dir = canonical_path_key(
+                    Path(local.cwd).resolve()
+                ) == canonical_path_key(working_directory.resolve())
             except (ValueError, OSError):
                 same_dir = False
             if not same_dir:
@@ -367,6 +372,11 @@ class ClaudeIntegration:
                 )
                 local = None
         elif local:
+            logger.info(
+                "Ignoring local session without a recorded cwd",
+                session_id=local.session_id,
+                requested=str(working_directory),
+            )
             local = None
         if local:
             logger.info(
