@@ -342,7 +342,7 @@ APPROVED_DIRECTORY=/path/to/your/test/projects
 # Claude Authentication (choose one method)
 # Option 1: Use existing Claude CLI auth (no API key needed)
 # Option 2: Direct API key
-# ANTHROPIC_API_KEY=sk-ant-api03-your-development-key
+# ANTHROPIC_API_KEY=sk-ant-api03-...    # your development key
 
 # Development settings
 DEBUG=true

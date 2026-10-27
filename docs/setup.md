@@ -36,7 +36,7 @@ Uses the SDK with a direct API key, no CLI auth needed.
 ```bash
 # 1. Get your API key from https://console.anthropic.com/
 # 2. Configure bot
-ANTHROPIC_API_KEY=sk-ant-api03-your-key-here
+ANTHROPIC_API_KEY=sk-ant-api03-...    # your key
 ```
 
 ### 3. Install the Bot
