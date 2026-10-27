@@ -2,6 +2,7 @@
 
 import os
 import stat
+import tarfile
 import zipfile
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -46,6 +47,23 @@ async def test_zip_with_directory_entries_extracts(
     assert "pkg" in result.prompt
     # Both real code files should be discoverable (dir entries skipped).
     assert result.metadata["code_files"] == 2
+
+
+@pytest.mark.parametrize("suffix, mode", [(".tgz", "w:gz"), (".txz", "w:xz")])
+async def test_short_tar_suffixes_are_archives(
+    handler: FileHandler, tmp_path: Path, suffix: str, mode: str
+):
+    """.tgz/.txz were classified as binary and rejected, though the extractor
+    handles them."""
+    source = tmp_path / "main.py"
+    source.write_text("print('hello')\n", encoding="utf-8")
+    archive = tmp_path / f"proj{suffix}"
+    with tarfile.open(archive, mode) as tf:
+        tf.add(source, arcname="pkg/main.py")
+
+    assert handler._detect_file_type(archive) == "archive"
+    result = await handler._process_archive(archive, "Review:")
+    assert result.metadata["code_files"] == 1
 
 
 def test_file_tree_is_cut_off_at_depth_limit(

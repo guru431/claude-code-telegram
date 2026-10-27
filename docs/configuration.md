@@ -229,7 +229,8 @@ UPLOAD_EXTRA_EXTENSIONS=.parquet,svg
 #### Tool Path Boundary
 
 ```bash
-# What file tools and bash path checks are confined to.
+# What file tools, bash path checks and images sent via send_image_to_user
+# are confined to.
 #   approved (default) — APPROVED_DIRECTORY, as before
 #   working            — the run's own project directory, so in project-thread
 #                        mode a topic cannot read or write a sibling project
@@ -435,7 +436,7 @@ without a voice provider.
 
 #### Option 2: Direct API Key
 ```bash
-ANTHROPIC_API_KEY=sk-ant-api03-your-key-here
+ANTHROPIC_API_KEY=sk-ant-api03-...    # your key
 ```
 
 ## Troubleshooting

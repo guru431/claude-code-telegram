@@ -1,6 +1,7 @@
 """Git integration for safe repository operations."""
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -202,9 +203,6 @@ class GitIntegration:
             )
 
         except asyncio.TimeoutError:
-            if process is not None:
-                process.kill()
-                await process.wait()
             raise GitError("Git command timed out")
         except GitError:
             # Git's own refusal (non-zero exit, e.g. no upstream configured) is
@@ -214,6 +212,14 @@ class GitIntegration:
         except Exception as e:
             logger.error(f"Git command error: {e}")
             raise GitError(f"Failed to execute git command: {e}")
+        finally:
+            # Any exit before git finished — the timeout, a cancelled task
+            # (CancelledError is not an Exception), a failed communicate() —
+            # would otherwise leave the git process running as an orphan.
+            if process is not None and process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                await process.wait()
 
     def _validate_arguments(self, subcommand: str, args: List[str]) -> None:
         """Reject arguments that make an allowed subcommand unsafe.

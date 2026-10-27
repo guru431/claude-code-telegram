@@ -539,7 +539,9 @@ async def handle_text_message(
                         file_path = tc_input.get("file_path", "")
                         caption = tc_input.get("caption", "")
                         img = validate_image_path(
-                            file_path, settings.approved_directory, caption
+                            file_path,
+                            settings.file_tool_boundary(current_dir),
+                            caption,
                         )
                         # Cap as the agentic path does: an unbounded stream of
                         # send_image_to_user calls would otherwise turn into an
@@ -547,7 +549,7 @@ async def handle_text_message(
                         if img and len(mcp_images) < MAX_IMAGES_PER_RESPONSE:
                             mcp_images.append(img)
 
-            now = asyncio.get_event_loop().time()
+            now = asyncio.get_running_loop().time()
             if now - last_edit[0] < 2.0:
                 return
             if edit_task[0] is not None and not edit_task[0].done():

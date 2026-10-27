@@ -160,6 +160,13 @@ class SecurityValidator:
         "sudoers",
     }
 
+    # Lowercased once: the checks run per path and, from the bash boundary
+    # check, per token of every command.
+    FORBIDDEN_FILENAMES_LOWER = frozenset(n.lower() for n in FORBIDDEN_FILENAMES)
+    SYSTEM_ONLY_FORBIDDEN_FILENAMES_LOWER = frozenset(
+        n.lower() for n in SYSTEM_ONLY_FORBIDDEN_FILENAMES
+    )
+
     # Dangerous file patterns
     DANGEROUS_FILE_PATTERNS = [
         r".*\.key$",  # Key files
@@ -390,7 +397,7 @@ class SecurityValidator:
                 return False, "Invalid filename: contains forbidden pattern"
 
         # Check for forbidden filenames
-        if filename.lower() in {name.lower() for name in self.FORBIDDEN_FILENAMES}:
+        if filename.lower() in self.FORBIDDEN_FILENAMES_LOWER:
             logger.warning("Forbidden filename", filename=filename)
             return False, f"Forbidden filename: {filename}"
 
@@ -454,12 +461,13 @@ class SecurityValidator:
         name = filename.strip()
         lowered = name.lower()
 
-        if lowered in {n.lower() for n in self.FORBIDDEN_FILENAMES}:
+        if lowered in self.FORBIDDEN_FILENAMES_LOWER:
             return True, f"Forbidden filename: {name}"
 
-        if not within_approved and lowered in {
-            n.lower() for n in self.SYSTEM_ONLY_FORBIDDEN_FILENAMES
-        }:
+        if (
+            not within_approved
+            and lowered in self.SYSTEM_ONLY_FORBIDDEN_FILENAMES_LOWER
+        ):
             return True, f"Forbidden filename: {name}"
 
         for pattern in self.DANGEROUS_FILE_PATTERNS:
@@ -556,7 +564,7 @@ class SecurityValidator:
             return False
 
         # Check for forbidden names
-        if dirname.lower() in {name.lower() for name in self.FORBIDDEN_FILENAMES}:
+        if dirname.lower() in self.FORBIDDEN_FILENAMES_LOWER:
             return False
 
         # Check for hidden directories

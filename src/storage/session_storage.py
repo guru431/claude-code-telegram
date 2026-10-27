@@ -279,6 +279,15 @@ class SQLiteSessionStorage(SessionStorage):
 
             return sessions
 
+    async def session_known(self, session_id: str) -> bool:
+        """Whether a row exists for *session_id*, whoever owns it and whether
+        or not it is still active (``delete_session`` keeps the row)."""
+        async with self.db_manager.get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT 1 FROM sessions WHERE session_id = ? LIMIT 1", (session_id,)
+            )
+            return await cursor.fetchone() is not None
+
     async def cleanup_expired_sessions(self, timeout_hours: int) -> int:
         """Mark expired sessions as inactive."""
         async with self.db_manager.get_connection() as conn:

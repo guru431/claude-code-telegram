@@ -45,6 +45,11 @@ MAX_ARCHIVE_FILES = 10000
 # Cap on total bytes an archive may expand to on disk (zip-bomb mitigation).
 MAX_ARCHIVE_BYTES = 100 * 1024 * 1024
 
+# Compressed tarball names, matched against the whole lowercased file name
+# (``Path.suffix`` sees only ``.gz`` of ``.tar.gz``). Shared by type detection
+# and extraction: with two lists ``.tgz`` was extractable but never detected.
+TAR_SUFFIXES = (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz")
+
 # Cap on inlined file content per file (chars) to keep prompts bounded,
 # matching the fallback in handlers/message.py.
 MAX_INLINE_CONTENT = 50000
@@ -248,7 +253,9 @@ class FileHandler:
         ext = file_path.suffix.lower()
 
         # Check if archive
-        if ext in {".zip", ".tar", ".gz", ".bz2", ".xz", ".7z"}:
+        if ext in {".zip", ".tar", ".gz", ".bz2", ".xz", ".7z"} or (
+            file_path.name.lower().endswith(TAR_SUFFIXES)
+        ):
             return "archive"
 
         # Check if code
@@ -354,9 +361,7 @@ class FileHandler:
                                     raise ValueError("Archive too large")
                                 target.write(chunk)
 
-            elif ext == ".tar" or name_lower.endswith(
-                (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz")
-            ):
+            elif ext == ".tar" or name_lower.endswith(TAR_SUFFIXES):
                 with tarfile.open(archive_path) as tf:
                     members = tf.getmembers()
                     if len(members) > MAX_ARCHIVE_FILES:

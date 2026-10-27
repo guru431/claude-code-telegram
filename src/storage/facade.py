@@ -234,8 +234,8 @@ class Storage:
 
     async def get_session_history(
         self, session_id: str, limit: int = 50
-    ) -> Dict[str, Any]:
-        """Get session history with messages and tools."""
+    ) -> Optional[Dict[str, Any]]:
+        """Get session history with messages and tools (None: no such session)."""
         session = await self.sessions.get_session(session_id)
         if not session:
             return None
@@ -345,8 +345,8 @@ class Storage:
         )
         return tool_usage_purged, messages_purged
 
-    async def get_user_dashboard(self, user_id: int) -> Dict[str, Any]:
-        """Get comprehensive user dashboard data."""
+    async def get_user_dashboard(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Get comprehensive user dashboard data (None: no such user)."""
         # Get user info
         user = await self.users.get_user(user_id)
         if not user:

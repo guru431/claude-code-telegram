@@ -90,7 +90,8 @@ class Settings(BaseSettings):
     tool_path_boundary: Literal["approved", "working"] = Field(
         "approved",
         description=(
-            "What file tools and bash path checks are confined to. 'approved' "
+            "What file tools, bash path checks and images sent via "
+            "send_image_to_user are confined to. 'approved' "
             "(default, backwards compatible) uses APPROVED_DIRECTORY; 'working' "
             "narrows it to the run's own project directory, so in project-thread "
             "mode a topic cannot read or write a sibling project."
@@ -693,6 +694,18 @@ class Settings(BaseSettings):
         if user_id == AUTOMATION_USER_ID:
             return self.automation_max_cost_per_day
         return self.claude_max_cost_per_user
+
+    def file_tool_boundary(self, working_directory: Path) -> Path:
+        """Root that file access on behalf of a run in *working_directory* is
+        confined to, per ``TOOL_PATH_BOUNDARY``.
+
+        The bot itself reads files Claude names (``send_image_to_user``); those
+        reads must stop where ``can_use_tool`` stops the file tools, or
+        ``working`` mode would let a topic send a sibling project's image.
+        """
+        if self.tool_path_boundary == "working":
+            return working_directory
+        return self.approved_directory
 
     @property
     def database_path(self) -> Optional[Path]:

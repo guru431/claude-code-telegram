@@ -1,8 +1,9 @@
 """Tests for GitIntegration: path validation, the command gate, status parsing."""
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -165,3 +166,23 @@ class TestCommandGate:
 
         assert str(raised.value) == "Git command failed: fatal: no upstream"
         assert caplog.records == []
+
+    async def test_cancelled_run_kills_git(
+        self, git: GitIntegration, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cancelled task must not leave git running: only a timeout killed it."""
+        process = SimpleNamespace(
+            returncode=None,
+            communicate=AsyncMock(side_effect=asyncio.CancelledError),
+            kill=Mock(),
+            wait=AsyncMock(),
+        )
+        monkeypatch.setattr(
+            "asyncio.create_subprocess_exec", AsyncMock(return_value=process)
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await git.execute_git_command(["git", "status"], tmp_path)
+
+        process.kill.assert_called_once()
+        process.wait.assert_awaited_once()

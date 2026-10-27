@@ -369,6 +369,18 @@ class TestSessionManager:
         assert session.user_id == 123
         assert session.is_new_session is True
 
+    async def test_unrecorded_session_id_is_resumed(self, session_manager):
+        """A VS Code / CLI session id was dropped and a new conversation began."""
+        session = await session_manager.get_or_create_session(
+            user_id=123,
+            project_path=Path("/test/project"),
+            session_id="local-cli-session",
+        )
+
+        assert session.session_id == "local-cli-session"
+        assert session.user_id == 123
+        assert session.is_new_session is False
+
 
 class TestUpdateSessionNewWithoutId:
     """Edge case: Claude returns no session_id for a brand-new session."""

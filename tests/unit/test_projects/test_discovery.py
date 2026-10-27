@@ -305,6 +305,36 @@ class TestDiscoverNewProjects:
         assert "_boss" in names
         assert "_admin" in names
 
+    def test_does_not_add_parent_of_registered_nested_path(
+        self, tmp_path: Path
+    ) -> None:
+        """Same rule as sync_projects_yaml: 'site/lingva' covers 'site'."""
+        approved = tmp_path / "projects"
+        (approved / "site" / "lingva").mkdir(parents=True)
+        (approved / "other").mkdir()
+
+        config = tmp_path / "projects.yaml"
+        config.write_text(
+            yaml.dump(
+                {
+                    "projects": [
+                        {
+                            "slug": "lingva",
+                            "name": "Lingva",
+                            "path": "site/lingva",
+                            "enabled": True,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        new, total = discover_new_projects(approved, config)
+
+        assert [p["path"] for p in new] == ["other"]
+        assert total == 2
+
     def test_skips_files(self, tmp_path: Path) -> None:
         approved = tmp_path / "projects"
         approved.mkdir()

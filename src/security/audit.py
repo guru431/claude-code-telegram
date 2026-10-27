@@ -510,13 +510,21 @@ class AuditLogger:
             return "low"
 
     def _assess_file_access_risk(self, file_path: str, action: str) -> str:
-        """Assess risk level of file access."""
+        """Assess risk level of file access.
+
+        The path is matched with forward slashes: the bot runs on Windows, where
+        ``C:\\Users\\me\\.ssh\\id_rsa`` never contained ``/.ssh/`` and every
+        system path was rated low.
+        """
         sensitive_paths = [
             "/etc/",
             "/var/",
             "/usr/",
             "/sys/",
             "/proc/",
+            "/windows/",
+            "/program files",
+            "/programdata/",
             "/.env",
             "/.ssh/",
             "/.aws/",
@@ -529,7 +537,7 @@ class AuditLogger:
 
         risky_actions = {"delete", "write"}
 
-        path_lower = file_path.lower()
+        path_lower = file_path.replace("\\", "/").lower()
 
         # High risk: sensitive paths with write/delete
         if action in risky_actions and any(

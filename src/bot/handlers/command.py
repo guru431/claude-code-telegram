@@ -37,11 +37,14 @@ def _display_relative_path(current_dir: Path, settings: Settings) -> str:
     a ``current_directory`` left in ``user_data`` from before APPROVED_DIRECTORY
     was changed. Every command that prints the path used to die on that
     ValueError with no reply at all, so fall back to the absolute path instead.
+
+    HTML-escaped: every caller puts it into an HTML message, where a raw ``&``
+    or ``<`` from a directory name is not valid markup.
     """
     try:
-        return str(current_dir.relative_to(settings.approved_directory))
+        return escape_html(str(current_dir.relative_to(settings.approved_directory)))
     except ValueError:
-        return str(current_dir)
+        return escape_html(str(current_dir))
 
 
 def _is_within_root(path: Path, root: Path) -> bool:
@@ -403,7 +406,8 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not claude_integration:
             await update.message.reply_text(
                 "❌ <b>Claude Integration Not Available</b>\n\n"
-                "Claude integration is not properly configured."
+                "Claude integration is not properly configured.",
+                parse_mode="HTML",
             )
             return
 
@@ -494,12 +498,11 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     redact_secrets(claude_response.content or "")
                 )
 
-            for msg in formatted_messages:
-                await update.message.reply_text(
-                    msg.text,
-                    parse_mode=msg.parse_mode,
-                    reply_markup=msg.reply_markup,
-                )
+            # The shared sender: plain-text retry on a malformed-HTML 400 and a
+            # pause between chunks, as on every other reply path.
+            from .message import _send_formatted_messages
+
+            await _send_formatted_messages(update, formatted_messages)
 
             # Log successful continue
             if audit_logger:
@@ -809,7 +812,7 @@ async def change_directory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             relative_display = f"{resolved_path}/"
         await update.message.reply_text(
             f"✅ <b>Directory Changed</b>\n\n"
-            f"📂 Current directory: <code>{relative_display}</code>"
+            f"📂 Current directory: <code>{escape_html(relative_display)}</code>"
             f"{resumed_session_info}",
             parse_mode="HTML",
         )
@@ -844,7 +847,7 @@ async def print_working_directory(
     )
 
     relative_path = _display_relative_path(current_dir, settings)
-    absolute_path = str(current_dir)
+    absolute_path = escape_html(str(current_dir))
 
     # Add quick navigation buttons
     keyboard = [
@@ -920,7 +923,8 @@ async def show_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await update.message.reply_text(
                 "📁 <b>No Projects Found</b>\n\n"
                 "No subdirectories found in your approved directory.\n"
-                "Create some directories to organize your projects!"
+                "Create some directories to organize your projects!",
+                parse_mode="HTML",
             )
             return
 
@@ -1085,7 +1089,8 @@ async def export_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "• Export conversation history\n"
             "• Save session state\n"
             "• Share conversations\n"
-            "• Create session backups"
+            "• Create session backups",
+            parse_mode="HTML",
         )
         return
 
@@ -1099,7 +1104,8 @@ async def export_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "<b>What you can do:</b>\n"
             "• Start a new session with <code>/new</code>\n"
             "• Continue an existing session with <code>/continue</code>\n"
-            "• Check your status with <code>/status</code>"
+            "• Check your status with <code>/status</code>",
+            parse_mode="HTML",
         )
         return
 
@@ -1140,7 +1146,8 @@ async def end_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "<b>What you can do:</b>\n"
             "• Use <code>/new</code> to start a new session\n"
             "• Use <code>/status</code> to check your session status\n"
-            "• Send any message to start a conversation"
+            "• Send any message to start a conversation",
+            parse_mode="HTML",
         )
         return
 
@@ -1198,7 +1205,8 @@ async def quick_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(
             "❌ <b>Quick Actions Disabled</b>\n\n"
             "Quick actions feature is not enabled.\n"
-            "Contact your administrator to enable this feature."
+            "Contact your administrator to enable this feature.",
+            parse_mode="HTML",
         )
         return
 
@@ -1212,7 +1220,8 @@ async def quick_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if not quick_action_manager:
             await update.message.reply_text(
                 "❌ <b>Quick Actions Unavailable</b>\n\n"
-                "Quick actions service is not available."
+                "Quick actions service is not available.",
+                parse_mode="HTML",
             )
             return
 
@@ -1235,7 +1244,8 @@ async def quick_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "<b>Try:</b>\n"
                 "• Navigating to a project directory with <code>/cd</code>\n"
                 "• Creating some code files\n"
-                "• Starting a Claude session with <code>/new</code>"
+                "• Starting a Claude session with <code>/new</code>",
+                parse_mode="HTML",
             )
             return
 
@@ -1271,7 +1281,8 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(
             "❌ <b>Git Integration Disabled</b>\n\n"
             "Git integration feature is not enabled.\n"
-            "Contact your administrator to enable this feature."
+            "Contact your administrator to enable this feature.",
+            parse_mode="HTML",
         )
         return
 
@@ -1285,7 +1296,8 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not git_integration:
             await update.message.reply_text(
                 "❌ <b>Git Integration Unavailable</b>\n\n"
-                "Git integration service is not available."
+                "Git integration service is not available.",
+                parse_mode="HTML",
             )
             return
 
@@ -1298,7 +1310,8 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"<b>Options:</b>\n"
                 f"• Navigate to a git repository with <code>/cd</code>\n"
                 f"• Initialize a new repository (ask Claude to help)\n"
-                f"• Clone an existing repository (ask Claude to help)"
+                f"• Clone an existing repository (ask Claude to help)",
+                parse_mode="HTML",
             )
             return
 

@@ -879,8 +879,9 @@ class MessageOrchestrator:
         if tool_name in ("Read", "Write", "Edit", "MultiEdit"):
             path = tool_input.get("file_path") or tool_input.get("path", "")
             if path:
-                # Show just the filename, not the full path
-                return path.rsplit("/", 1)[-1]
+                # Show just the filename, not the full path (either separator:
+                # the bot runs on Windows)
+                return re.split(r"[\\/]", path)[-1]
         if tool_name in ("Glob", "Grep"):
             pattern = tool_input.get("pattern", "")
             if pattern:
@@ -1468,7 +1469,7 @@ class MessageOrchestrator:
             tool_log,
             time.monotonic(),
             mcp_images=mcp_images,
-            approved_directory=self.settings.approved_directory,
+            approved_directory=self.settings.file_tool_boundary(current_dir),
             draft_streamer=draft_streamer,
             reply_markup=stop_kb,
             interrupt_event=interrupt_event,
@@ -1487,7 +1488,7 @@ class MessageOrchestrator:
             )
             if reserve_error:
                 await progress_msg.edit_text(
-                    escape_html(reserve_error), reply_markup=None
+                    escape_html(reserve_error), parse_mode="HTML", reply_markup=None
                 )
                 return [], False
 

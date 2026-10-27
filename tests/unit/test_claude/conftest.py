@@ -40,3 +40,6 @@ class InMemorySessionStorage(SessionStorage):
 
     async def get_all_sessions(self) -> List[ClaudeSession]:
         return list(self.sessions.values())
+
+    async def session_known(self, session_id: str) -> bool:
+        return session_id in self.sessions

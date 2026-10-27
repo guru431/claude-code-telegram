@@ -602,6 +602,56 @@ class _Operator(str):
 # ``$'…`` up to, not including, its closing quote, as bash reads it.
 _ANSI_C_STRING_RE = re.compile(r"\$'(?:[^'\\]|\\.)*")
 
+# The backslash escapes bash expands inside ``$'…'``. Anything else after a
+# backslash (``\q``, a bare ``\x``) stays literal, as in bash.
+_ANSI_C_ESCAPE_RE = re.compile(
+    r"\\(?:(?P<simple>[abeEfnrtv\\'\"?])|(?P<oct>[0-7]{1,3})"
+    r"|x(?P<hex>[0-9A-Fa-f]{1,2})|u(?P<u4>[0-9A-Fa-f]{1,4})"
+    r"|U(?P<u8>[0-9A-Fa-f]{1,8})|c(?P<ctrl>.))",
+    re.DOTALL,
+)
+_ANSI_C_SIMPLE = {
+    "a": "\a",
+    "b": "\b",
+    "e": "\x1b",
+    "E": "\x1b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+    "?": "?",
+}
+
+
+def _decode_ansi_c(body: str) -> str:
+    """Expand the escapes of a ``$'…'`` body the way bash does.
+
+    Read literally, ``cat $'src\\x2f..\\x2f..\\x2f.env'`` named a harmless file
+    inside the working directory while bash read ``src/../../.env``.
+    """
+
+    def _expand(match: "re.Match[str]") -> str:
+        if match["simple"] is not None:
+            return _ANSI_C_SIMPLE[match["simple"]]
+        if match["oct"] is not None:
+            return chr(int(match["oct"], 8) & 0xFF)
+        if match["hex"] is not None:
+            return chr(int(match["hex"], 16))
+        if match["ctrl"] is not None:
+            return chr(ord(match["ctrl"]) & 0x1F)
+        try:
+            return chr(int(match["u4"] or match["u8"], 16))
+        except ValueError:  # beyond U+10FFFF
+            return match.group()
+
+    # bash ends the string at the first NUL, and a NUL left in would also
+    # forge the operator mark the tokenizer relies on.
+    return _ANSI_C_ESCAPE_RE.sub(_expand, body).split("\x00", 1)[0]
+
 
 # Character devices that are legitimate redirection targets even though they sit
 # outside the approved root. ``2>/dev/null`` appears in a large share of ordinary
@@ -670,8 +720,14 @@ def _normalize_shell_operators(line: str) -> str:
             ansi_c = _ANSI_C_STRING_RE.match(line, i)
             if ansi_c and "'" in ansi_c.group()[2:]:
                 raise ValueError("escaped quote inside ANSI-C quoting")
-            # ``$'…'`` and ``$"…"`` stand for the quoted text itself. Kept, the
-            # ``$`` made ``cat $'/etc/passwd'`` a relative ``$/etc/passwd``.
+            if ansi_c and line.startswith("'", ansi_c.end()):
+                # A closed ``$'…'`` is checked as the text bash makes of it.
+                out.append(shlex.quote(_decode_ansi_c(ansi_c.group()[2:])))
+                i = ansi_c.end() + 1
+                continue
+            # ``$"…"`` stands for the quoted text itself, and an unclosed
+            # ``$'…`` is left for ``shlex`` to reject. Kept, the ``$`` made
+            # ``cat $"/etc/passwd"`` a relative ``$/etc/passwd``.
             i += 1
             continue
         if ch == "'":
@@ -1240,7 +1296,7 @@ def _is_forbidden_secret_basename(name: str) -> Tuple[bool, Optional[str]]:
     if not name:
         return False, None
     name = name.strip()
-    if name.lower() in {n.lower() for n in SecurityValidator.FORBIDDEN_FILENAMES}:
+    if name.lower() in SecurityValidator.FORBIDDEN_FILENAMES_LOWER:
         return True, f"Forbidden filename: {name}"
     for pattern in SecurityValidator.DANGEROUS_FILE_PATTERNS:
         if re.match(pattern, name, re.IGNORECASE):

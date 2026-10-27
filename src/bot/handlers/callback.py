@@ -70,13 +70,14 @@ def _relative_to_root(
 ) -> Path:
     """Return ``current_dir`` relative to the root that applies to this chat.
 
-    In thread mode the project root comes from projects.yaml and may live
-    outside ``approved_directory``, so a plain
-    ``relative_to(settings.approved_directory)`` raises ValueError and takes the
-    whole button handler into the generic error path. ``handle_cd_callback``
-    already picks the base correctly; every other handler shares that choice
-    here. If the directory is under neither root, fall back to its own name
-    rather than exposing the absolute host path.
+    In thread mode paths are shown relative to the topic's project root, as
+    ``handle_cd_callback`` shows them; every other handler shares that choice
+    here. A project root always lies inside ``approved_directory``
+    (``load_project_registry`` refuses any other), so this is about display,
+    not about reaching a root the approved directory does not cover. A
+    ``current_directory`` under neither root (one left in ``user_data`` from
+    before APPROVED_DIRECTORY changed) falls back to its own name rather than
+    exposing the absolute host path.
     """
     base = _get_thread_project_root(settings, context) or settings.approved_directory
     try:

@@ -379,6 +379,34 @@ class TestLocalSessionDiscoveryIsAdminOnly:
         assert found is not None
         assert found.session_id == "local-cli-session"
 
+    async def test_admin_run_continues_local_session(self, config, tmp_path):
+        """Finding the session was not enough: the run started a new one."""
+        config.allowed_users = [111]
+        config.admin_users = [111]
+        facade = ClaudeIntegration(
+            config=config,
+            sdk_manager=MagicMock(),
+            session_manager=SessionManager(config, InMemorySessionStorage()),
+        )
+
+        with (
+            patch(
+                "src.claude.facade.find_latest_local_session",
+                return_value=self._local_session(),
+            ),
+            patch.object(
+                facade,
+                "_execute",
+                return_value=_make_mock_response("local-cli-session"),
+            ) as execute,
+        ):
+            await facade.run_command(
+                prompt="hello", working_directory=Path("/test/project"), user_id=111
+            )
+
+        assert execute.call_args.kwargs["session_id"] == "local-cli-session"
+        assert execute.call_args.kwargs["continue_session"] is True
+
     async def test_cwd_spelled_in_other_case_matches_on_case_insensitive_fs(
         self, config, tmp_path, monkeypatch
     ):

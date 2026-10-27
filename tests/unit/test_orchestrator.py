@@ -866,6 +866,14 @@ class TestRedactSecrets:
         )
         assert result == ".env"
 
+    def test_summarize_tool_input_windows_path(self, agentic_settings, deps):
+        """A backslash path is cut to the file name too, not shown whole."""
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        result = orchestrator._summarize_tool_input(
+            "Edit", {"file_path": "C:\\work\\proj\\src\\main.py"}
+        )
+        assert result == "main.py"
+
 
 # --- Typing heartbeat tests ---
 

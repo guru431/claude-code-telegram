@@ -7,8 +7,8 @@ and adds them automatically.
 import os
 import re
 import tempfile
-from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 import structlog
 import yaml
@@ -94,6 +94,26 @@ def path_dedupe_key(approved_root: Path, rel_path: str) -> Optional[str]:
         return None
 
     return canonical_path_key(resolved)
+
+
+def covered_parent_keys(approved_root: Path, rel_paths: Iterable[str]) -> Set[str]:
+    """Keys of top-level directories already covered by a nested entry.
+
+    A registered ``site/lingva`` makes ``site`` a container, not a project, so
+    neither writer of projects.yaml may add ``site`` as an entry of its own.
+    Only nested entries whose directory is still on disk count. Shared with
+    ``scripts/sync_projects_yaml.py``; auto-discovery used to skip this check
+    and registered ``site`` next to ``site/lingva``.
+    """
+    covered: Set[str] = set()
+    for rel_path in rel_paths:
+        raw = rel_path.strip().replace("\\", "/")
+        parts = PurePosixPath(raw).parts
+        if len(parts) > 1 and (approved_root / raw).is_dir():
+            key = path_dedupe_key(approved_root, parts[0])
+            if key:
+                covered.add(key)
+    return covered
 
 
 def iter_project_dirs(approved_root: Path) -> Iterator[Path]:
@@ -214,6 +234,7 @@ def discover_new_projects(
     existing_paths: Set[str] = set()
     existing_slugs: Set[str] = set()
     existing_names: Set[str] = set()
+    existing_rel_paths: List[str] = []
 
     for idx, proj in enumerate(existing_projects):
         # A hand-edited entry can be a bare string; fail with the same message
@@ -222,6 +243,7 @@ def discover_new_projects(
             raise ValueError(f"Project entry at index {idx} must be an object")
         p = str(proj.get("path", "")).strip()
         if p:
+            existing_rel_paths.append(p)
             key = path_dedupe_key(approved_root, p)
             if key:
                 existing_paths.add(key)
@@ -242,12 +264,18 @@ def discover_new_projects(
         )
         return [], len(existing_projects)
 
+    covered_parents = covered_parent_keys(approved_root, existing_rel_paths)
+
     for entry in iter_project_dirs(approved_root):
         dir_name = entry.name
         rel_path = dir_name  # first-level only
 
         path_key = path_dedupe_key(approved_root, rel_path)
-        if path_key is None or path_key in existing_paths:
+        if (
+            path_key is None
+            or path_key in existing_paths
+            or path_key in covered_parents
+        ):
             continue
 
         slug = slugify(dir_name)

@@ -59,6 +59,16 @@ class TestSoftDeletedSessions:
         # Consistent with the listings, which already filtered on is_active.
         assert await session_storage.get_user_sessions(555001) == []
 
+    async def test_deleted_session_stays_known(self, session_storage, sample_session):
+        """SessionManager resumes only ids the bot never recorded, so an ended
+        session must still count as recorded or its stale id would revive it."""
+        assert not await session_storage.session_known("sqlite-session")
+
+        await session_storage.save_session(sample_session)
+        await session_storage.delete_session("sqlite-session")
+
+        assert await session_storage.session_known("sqlite-session")
+
     async def test_expired_session_does_not_load(self, session_storage, sample_session):
         """A session retired by cleanup is likewise not resurrected."""
         await session_storage.save_session(sample_session)

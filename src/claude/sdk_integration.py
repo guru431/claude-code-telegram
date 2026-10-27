@@ -360,7 +360,7 @@ class ClaudeSDKManager:
         interrupt_event: Optional[asyncio.Event] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
-        start_time = asyncio.get_event_loop().time()
+        start_time = asyncio.get_running_loop().time()
 
         logger.info(
             "Starting Claude SDK command",
@@ -738,7 +738,7 @@ class ClaudeSDKManager:
                     # as success (cost/session would otherwise look clean).
                     is_error = bool(getattr(message, "is_error", False))
                     error_type = getattr(message, "subtype", None)
-                    current_time = asyncio.get_event_loop().time()
+                    current_time = asyncio.get_running_loop().time()
                     for msg in messages:
                         if isinstance(msg, AssistantMessage):
                             msg_content = getattr(msg, "content", [])
@@ -791,7 +791,7 @@ class ClaudeSDKManager:
                 )
 
             # Calculate duration
-            duration_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
+            duration_ms = int((asyncio.get_running_loop().time() - start_time) * 1000)
 
             # Use Claude's session_id if available, otherwise fall back
             final_session_id = claude_session_id or session_id or ""

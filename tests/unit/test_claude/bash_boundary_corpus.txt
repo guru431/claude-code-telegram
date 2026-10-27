@@ -169,5 +169,14 @@ ALLOW	{ echo a; echo b; } > out.txt
 DENY	echo $'\'' ; rm -rf /etc #'
 DENY	cat $'/etc/passwd'
 DENY	cat $"/etc/passwd"
+# --- ANSI-C escapes are what bash runs: \057 and \x2f are '/', \x2e is '.' ---
+DENY	cat $'\057etc\057passwd'
+DENY	cat $'src\x2f..\x2f..\x2f..\x2fother\x2fsecret.txt'
+DENY	cat $'src\057..\057.env'
+DENY	echo hi >$'\x2fetc/cron.d/x'
+DENY	cat src$'\x2f..\x2f..\x2f..'/x
 ALLOW	sort -t$'\t' -k2 data.tsv
+ALLOW	tr -d $'\r' < in.txt > out.txt
+ALLOW	printf $'a\nb\n' > out.txt
+ALLOW	cat $'notes\x2etxt'
 ALLOW	grep 'foo$' file.txt

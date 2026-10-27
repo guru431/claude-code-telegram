@@ -30,8 +30,12 @@ class FeatureFlags:
 
     @property
     def quick_actions_enabled(self) -> bool:
-        """Check if quick action buttons are enabled."""
-        return self.settings.enable_quick_actions
+        """Check if quick action buttons are enabled.
+
+        Classic mode only, as in ``FeatureRegistry``: agentic mode builds no
+        ``QuickActionManager``, so the flag must not report it enabled there.
+        """
+        return self.settings.enable_quick_actions and not self.settings.agentic_mode
 
     @property
     def webhook_enabled(self) -> bool:

@@ -75,15 +75,13 @@ class ImageHandler:
         # Detect image type
         image_type = self._detect_image_type(caption)
 
-        # Create appropriate prompt
-        if image_type == "screenshot":
-            prompt = self._create_screenshot_prompt(caption)
-        elif image_type == "diagram":
+        # Create appropriate prompt (_detect_image_type returns only these three)
+        if image_type == "diagram":
             prompt = self._create_diagram_prompt(caption)
         elif image_type == "ui_mockup":
             prompt = self._create_ui_prompt(caption)
         else:
-            prompt = self._create_generic_prompt(caption)
+            prompt = self._create_screenshot_prompt(caption)
 
         base64_image = base64.b64encode(image_bytes).decode("utf-8")
 
@@ -169,16 +167,6 @@ class ImageHandler:
 """
         if caption:
             base_prompt += f"Specific request: {caption}"
-
-        return base_prompt
-
-    def _create_generic_prompt(self, caption: Optional[str]) -> str:
-        """Create generic image analysis prompt"""
-        base_prompt = """I'm sharing an image with you. Please analyze it and provide relevant insights.
-
-"""
-        if caption:
-            base_prompt += f"Context: {caption}"
 
         return base_prompt
 

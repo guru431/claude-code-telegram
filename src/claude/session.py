@@ -118,6 +118,11 @@ class SessionStorage:
         """Get all sessions."""
         raise NotImplementedError
 
+    async def session_known(self, session_id: str) -> bool:
+        """Whether the bot ever recorded *session_id*, for any user, active or
+        not."""
+        raise NotImplementedError
+
 
 class SessionManager:
     """Manage Claude Code sessions."""
@@ -197,6 +202,26 @@ class SessionManager:
                 "Removed oldest session due to limit",
                 removed_session_id=oldest.session_id,
                 user_id=user_id,
+            )
+
+        # An id the bot never recorded belongs to a session Claude Code started
+        # outside the bot (VS Code, the CLI), which auto-resume and the
+        # /sessions resume button hand to admins only. Resume it: dropping the
+        # id started a new conversation while /cd and /repo said "session
+        # resumed". An id that has a row — another user's, ended, expired —
+        # stays refused by the checks above.
+        if session_id and not await self.storage.session_known(session_id):
+            logger.info(
+                "Resuming session started outside the bot",
+                session_id=session_id,
+                user_id=user_id,
+            )
+            return ClaudeSession(
+                session_id=session_id,
+                user_id=user_id,
+                project_path=project_path,
+                created_at=datetime.now(UTC),
+                last_used=datetime.now(UTC),
             )
 
         # Create session with empty ID — Claude will provide the real one

@@ -427,6 +427,25 @@ class TestAuditLogger:
         low_risk_event = events[0]  # Most recent
         assert low_risk_event.risk_level == "low"
 
+    @pytest.mark.parametrize(
+        "file_path",
+        [
+            "C:\\Windows\\System32\\drivers\\etc\\hosts",
+            "C:\\Users\\me\\.ssh\\id_ed25519",
+            "C:\\Program Files\\App\\app.dll",
+        ],
+    )
+    async def test_windows_sensitive_paths_are_rated_high(
+        self, audit_logger, storage, file_path
+    ):
+        """Backslash paths never matched the POSIX-style sensitive prefixes."""
+        await audit_logger.log_file_access(
+            user_id=123, file_path=file_path, action="write", success=True
+        )
+
+        events = await storage.get_events()
+        assert events[0].risk_level == "high"
+
     async def test_log_security_violation(self, audit_logger, storage):
         """Test logging security violations."""
         await audit_logger.log_security_violation(

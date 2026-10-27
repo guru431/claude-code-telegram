@@ -13,7 +13,7 @@ error, which would then look like a change.
 import argparse
 import os
 import sys
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import yaml
 
@@ -23,6 +23,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.projects.discovery import (  # noqa: E402
+    covered_parent_keys,
     display_name,
     iter_project_dirs,
     path_dedupe_key,
@@ -109,13 +110,9 @@ def sync(config_path: Path, approved_dir: Path, prune: bool = False) -> bool:
 
     # Never re-add a top-level dir that a kept nested entry already covers
     # (e.g. do not add 'site' when only 'site/lingva' is registered).
-    covered_parents: set[str] = set()
-    for key in kept_keys:
-        parts = PurePosixPath(_path_of(key)).parts
-        if len(parts) > 1:
-            parent_key = path_dedupe_key(approved_root, parts[0])
-            if parent_key:
-                covered_parents.add(parent_key)
+    covered_parents = covered_parent_keys(
+        approved_root, [_path_of(k) for k in kept_keys]
+    )
 
     # Scan top-level directories with .git
     discovered: dict[str, str] = {}

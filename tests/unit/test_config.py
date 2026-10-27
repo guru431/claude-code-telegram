@@ -555,6 +555,50 @@ def test_voice_flags_and_registry_agree(tmp_path, provider, extra, expected):
     assert registry.is_enabled("voice_handler") is expected
 
 
+@pytest.mark.parametrize(
+    "agentic, expected",
+    [(False, True), (True, False)],
+)
+def test_quick_actions_flag_and_registry_agree(tmp_path, agentic, expected):
+    """Regression: agentic mode flagged quick actions on, registry built none."""
+    from unittest.mock import MagicMock
+
+    from src.bot.features.registry import FeatureRegistry
+
+    project_dir = tmp_path / "projects"
+    project_dir.mkdir()
+    settings = Settings(
+        _env_file=None,
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(project_dir),
+        enable_quick_actions=True,
+        agentic_mode=agentic,
+    )
+
+    assert FeatureFlags(settings).quick_actions_enabled is expected
+    registry = FeatureRegistry(settings, storage=MagicMock(), security=MagicMock())
+    assert registry.is_enabled("quick_actions") is expected
+
+
+@pytest.mark.parametrize("boundary", ["approved", "working"])
+def test_file_tool_boundary_follows_tool_path_boundary(tmp_path, boundary):
+    """send_image_to_user reads stop where can_use_tool stops the file tools."""
+    project_dir = tmp_path / "projects"
+    working = project_dir / "alpha"
+    working.mkdir(parents=True)
+    settings = Settings(
+        _env_file=None,
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(project_dir),
+        tool_path_boundary=boundary,
+    )
+
+    expected = working if boundary == "working" else settings.approved_directory
+    assert settings.file_tool_boundary(working) == expected
+
+
 def test_database_path_slices_prefix_like_database_manager(tmp_path):
     """Only the leading ``sqlite:///`` is stripped, as DatabaseManager does."""
     from src.storage.database import DatabaseManager
