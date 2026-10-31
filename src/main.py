@@ -12,6 +12,9 @@ from typing import Any, Dict, Optional
 import structlog
 
 from src import __version__
+from src.agents.codex import CodexIntegration, CodexManager
+from src.agents.router import AgentRouter
+from src.agents.storage import AgentState, ProviderSessionStorage
 from src.bot.core import ClaudeCodeBot
 from src.claude import (
     ClaudeIntegration,
@@ -244,16 +247,29 @@ async def create_application(config: Settings) -> Dict[str, Any]:
 
     # Create Claude integration components with persistent storage
     session_storage = SQLiteSessionStorage(storage.db_manager)
-    session_manager = SessionManager(config, session_storage)
+    session_manager = SessionManager(
+        config, ProviderSessionStorage(session_storage, "claude")
+    )
 
     # Create Claude SDK manager and integration facade
     logger.info("Using Claude Python SDK integration")
     sdk_manager = ClaudeSDKManager(config, security_validator=security_validator)
 
-    claude_integration = ClaudeIntegration(
+    claude_backend = ClaudeIntegration(
         config=config,
         sdk_manager=sdk_manager,
         session_manager=session_manager,
+    )
+    agent_state = AgentState(storage.db_manager)
+    codex_backend = CodexIntegration(
+        config=config,
+        sdk_manager=CodexManager(config, security_validator, agent_state),
+        session_manager=SessionManager(
+            config, ProviderSessionStorage(session_storage, "codex")
+        ),
+    )
+    claude_integration = AgentRouter(
+        config, agent_state, {"claude": claude_backend, "codex": codex_backend}
     )
 
     # --- Event bus and agentic platform components ---

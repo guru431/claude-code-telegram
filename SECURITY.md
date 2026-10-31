@@ -60,6 +60,27 @@ The Claude Code Telegram Bot implements a defense-in-depth security model with m
 - **Deduplication**: Atomic `INSERT OR IGNORE` on delivery ID prevents replay attacks
 - **Audit Logging (log-only)**: `WebhookAuditLogger` records every webhook event reaching the bus. It is **not** an enforcement gate and cannot veto a run — the bus dispatches handlers concurrently with `return_exceptions=True`. Enforcement for webhook-driven runs is the signature check above plus the read-only tool set (`_WEBHOOK_READONLY_TOOLS`), `can_use_tool` and `check_bash_directory_boundary`
 
+### Codex backend
+
+Codex runs through a separate app-server process for each request. Native shell,
+hooks, apps, plugins and unrelated user MCP servers are disabled. The bot exposes
+project tools whose paths, secret filenames and Bash commands use the existing
+security validators. Native file-change approvals and permission expansion cannot
+bypass these checks. Only MCP servers explicitly configured for the bot are enabled.
+
+Shell commands run through app-server's OS sandbox with network access disabled
+and writes limited to the configured boundary. On native Windows the legacy
+sandbox requires broad read access to launch commands: arbitrary executable project
+scripts do not have complete OS read isolation. Direct file tools remain confined
+by the bot; command checks are required as with Claude on Windows. Git Bash is used
+explicitly so the command validator and the executing shell agree.
+
+Unattended Codex runs expose only read/list tools and no shell, write, external MCP
+or network. User decisions are scoped to the originating Telegram user, chat and
+message. Only registered answers bypass the sequential queue; authentication still
+applies. Stop terminates active command jobs, falling back to killing that run's
+process tree on Windows CLI versions without command-termination RPC support.
+
 ## Current Security Status
 
 All planned security features are implemented and active:

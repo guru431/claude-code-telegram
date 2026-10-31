@@ -88,8 +88,9 @@ class Storage:
         )
 
         now = datetime.now(UTC)
-        has_session = bool(session_id)
-        if not has_session:
+        ephemeral = getattr(response, "ephemeral", False)
+        has_session = bool(session_id) and not ephemeral
+        if not has_session and not ephemeral:
             logger.error(
                 "Empty session_id for Claude interaction; skipping FK-bound "
                 "message/tool rows, persisting cost and audit only",
@@ -106,15 +107,34 @@ class Storage:
                 "duration_ms": response.duration_ms,
                 "num_turns": response.num_turns,
                 "is_error": response.is_error,
+                "provider": getattr(response, "provider", "claude"),
+                "model": getattr(response, "model", None),
+                "token_usage": getattr(response, "token_usage", {}),
+                "cost_known": getattr(response, "cost_known", True),
                 "tools_used": [t["name"] for t in response.tools_used],
             },
             success=not response.is_error,
             timestamp=now,
             ip_address=ip_address,
         )
+        if ephemeral:
+            # One-shot runs have no sessions row. Keep their history in the
+            # audit record instead of violating messages' session foreign key.
+            audit_event.event_data = {
+                **(audit_event.event_data or {}),
+                "ephemeral": True,
+                "prompt": prompt,
+                "response": response.content,
+            }
 
         async with self.db_manager.get_connection() as conn:
             try:
+                if ephemeral:
+                    await conn.execute(
+                        "INSERT INTO users (user_id, first_seen, last_active) "
+                        "VALUES (?, ?, ?) ON CONFLICT(user_id) DO NOTHING",
+                        (user_id, now, now),
+                    )
                 if has_session:
                     # Save message (FK-bound to sessions).
                     message = MessageModel(
@@ -127,6 +147,10 @@ class Storage:
                         cost=response.cost,
                         duration_ms=response.duration_ms,
                         error=response.error_type if response.is_error else None,
+                        provider=getattr(response, "provider", "claude"),
+                        model=getattr(response, "model", None),
+                        token_usage=getattr(response, "token_usage", {}),
+                        cost_known=getattr(response, "cost_known", True),
                     )
                     message_id = await self.messages.save_message(message, conn=conn)
 

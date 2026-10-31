@@ -161,6 +161,10 @@ class MessageModel:
     cost: float = 0.0
     duration_ms: Optional[int] = None
     error: Optional[str] = None
+    provider: str = "claude"
+    model: Optional[str] = None
+    token_usage: Optional[Dict[str, int]] = None
+    cost_known: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -177,6 +181,10 @@ class MessageModel:
 
         # Parse datetime fields
         data["timestamp"] = _parse_datetime(data.get("timestamp"))
+        if isinstance(data.get("token_usage"), str):
+            data["token_usage"] = json.loads(data["token_usage"])
+        if "cost_known" in data:
+            data["cost_known"] = bool(data["cost_known"])
 
         return cls(**data)
 

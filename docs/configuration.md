@@ -66,6 +66,68 @@ DISABLE_SECURITY_PATTERNS=false
 DISABLE_TOOL_VALIDATION=false
 ```
 
+### Codex
+
+Codex is an optional second backend. Install Codex CLI (tested: `0.163.0`) and
+run `codex login` as the operating-system account that runs the bot. The CLI
+uses its existing ChatGPT login or API-key authentication; the bot never copies
+authentication files or requires the optional Python `openai` package.
+
+Use `/agent` to inspect the current backend, `/agent codex` to select Codex,
+and `/agent claude` to return to Claude. Selection persists in SQLite for each
+Telegram user and canonical working directory, including project topics.
+Each backend keeps its own sessions; switching does not transfer conversation
+history. `/new`, streaming, Stop, image inputs and session export work with both.
+`/sessions` labels Codex sessions and restores their backend when selected.
+Discovery of sessions created outside the bot remains Claude-only.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DEFAULT_AGENT` | `claude` | Initial backend for user requests |
+| `AUTOMATION_AGENT` | `claude` | Backend for webhook and scheduled runs |
+| `CODEX_ENABLED` | `true` | Allow selecting Codex |
+| `CODEX_CLI_PATH` | auto-detect | Codex executable or standard npm shim |
+| `CODEX_HOME` | CLI default | Optional separate state directory; log in there separately |
+| `CODEX_MODEL` | CLI default | Model identifier |
+| `CODEX_REASONING_EFFORT` | CLI default | Reasoning effort |
+| `CODEX_TIMEOUT_SECONDS` | `600` | Total run deadline, including user questions |
+| `CODEX_MAX_TOKENS_PER_REQUEST` | `200000` | Soft limit on input + output tokens |
+| `CODEX_MAX_TOKENS_PER_USER_PER_DAY` | `1000000` | Persistent UTC daily token limit |
+| `CODEX_INPUT_COST_PER_MILLION` | unset | Optional input-token price estimate |
+| `CODEX_CACHED_INPUT_COST_PER_MILLION` | unset | Optional cached-input price estimate |
+| `CODEX_OUTPUT_COST_PER_MILLION` | unset | Optional output-token price estimate |
+
+Codex reports tokens rather than a billed dollar amount. `/cost` shows Codex's
+daily token count and explicitly identifies unpriced usage. Set all three prices
+only when a rate-based estimate is appropriate. Token limits are checked as usage
+events arrive; one model response can overshoot a limit. Usage on failed and
+interrupted turns also counts when the CLI reports it. No automatic replay is
+performed after a timeout or a process failure.
+
+Codex receives application-owned dynamic tools for reading, listing, writing,
+editing and running commands. Every operation passes the existing path/secret
+checks; commands additionally pass `check_bash_directory_boundary` and execute
+through app-server's OS sandbox with network access disabled. Native shell and
+patch escalation cannot bypass these tools. On native Windows, Git Bash is
+required and the legacy OS sandbox provides write isolation, not complete read
+isolation for arbitrary project scripts; the application's command checks remain
+necessary, as with the Claude backend. Direct file tools reject outside paths
+and secret files. Do not use untrusted executable project scripts as a substitute
+for direct file tools.
+
+User hooks, apps, plugins, memories and unrelated MCP servers are disabled for
+bot runs. Only servers explicitly configured through the bot's `MCP_CONFIG_PATH`
+are enabled. Webhook and scheduled Codex runs are ephemeral and expose only
+read/list tools, with no shell, writes, external MCP or network. Permission
+expansion requests are rejected. Questions are delivered to Telegram; only the
+requesting user can answer, and stale buttons stop working after completion.
+
+The adapter requires permission profiles. If an existing Codex configuration
+sets legacy `sandbox_mode`, use a separate `CODEX_HOME` without that setting and
+authenticate there; the bot refuses to silently replace the restriction with
+full access. App-server and dynamic tools are experimental, so verify compatibility
+before updating the CLI.
+
 #### Claude Configuration
 
 ```bash

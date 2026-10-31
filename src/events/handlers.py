@@ -11,6 +11,7 @@ from typing import Any, Coroutine, Dict, List, Optional, Set
 
 import structlog
 
+from ..agents.router import AgentRouter
 from ..bot.utils.claude_run import run_claude_for_user
 from ..bot.utils.html_format import markdown_to_telegram_html
 from ..claude.facade import ClaudeIntegration
@@ -59,7 +60,7 @@ class AgentHandler:
     def __init__(
         self,
         event_bus: EventBus,
-        claude_integration: ClaudeIntegration,
+        claude_integration: ClaudeIntegration | AgentRouter,
         default_working_directory: Path,
         default_user_id: int = AUTOMATION_USER_ID,
         db_manager: Optional[DatabaseManager] = None,

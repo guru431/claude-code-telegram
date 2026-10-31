@@ -107,6 +107,25 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Agent selection. Claude remains the default for existing installations.
+    default_agent: Literal["claude", "codex"] = Field("claude")
+    automation_agent: Literal["claude", "codex"] = Field("claude")
+    codex_enabled: bool = Field(True, description="Expose the Codex backend")
+    codex_cli_path: Optional[str] = Field(None, description="Codex executable or shim")
+    codex_home: Optional[Path] = Field(
+        None, description="Optional Codex state directory"
+    )
+    codex_model: Optional[str] = Field(
+        None, description="Model; unset uses Codex default"
+    )
+    codex_reasoning_effort: Optional[str] = Field(None)
+    codex_timeout_seconds: int = Field(600, gt=0)
+    codex_max_tokens_per_request: int = Field(200_000, gt=0)
+    codex_max_tokens_per_user_per_day: int = Field(1_000_000, gt=0)
+    codex_input_cost_per_million: Optional[float] = Field(None, ge=0)
+    codex_cached_input_cost_per_million: Optional[float] = Field(None, ge=0)
+    codex_output_cost_per_million: Optional[float] = Field(None, ge=0)
+
     # Claude settings
     claude_binary_path: Optional[str] = Field(
         None, description="Path to Claude CLI binary (deprecated)"
@@ -467,6 +486,20 @@ class Settings(BaseSettings):
         return v  # type: ignore[no-any-return]
 
     @field_validator(
+        "codex_cli_path",
+        "codex_home",
+        "codex_model",
+        "codex_reasoning_effort",
+        mode="before",
+    )
+    @classmethod
+    def blank_codex_options(cls, value: Any) -> Any:
+        """Empty optional .env entries retain the CLI's defaults."""
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @field_validator(
         "claude_allowed_tools",
         "claude_disallowed_tools",
         "sandbox_excluded_commands",
@@ -621,6 +654,20 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_cross_field_dependencies(self) -> "Settings":
         """Validate dependencies between fields."""
+        if not self.codex_enabled and "codex" in (
+            self.default_agent,
+            self.automation_agent,
+        ):
+            raise ValueError("CODEX_ENABLED is required when a default agent is codex")
+        codex_prices = (
+            self.codex_input_cost_per_million,
+            self.codex_cached_input_cost_per_million,
+            self.codex_output_cost_per_million,
+        )
+        if any(price is not None for price in codex_prices) and not all(
+            price is not None for price in codex_prices
+        ):
+            raise ValueError("Set all three Codex token prices or leave all unset")
         # Check MCP requirements
         if self.enable_mcp and not self.mcp_config_path:
             raise ValueError("mcp_config_path required when enable_mcp is True")

@@ -44,7 +44,19 @@ async def rate_limit_middleware(
     if (
         event.callback_query
         and event.callback_query.data
-        and event.callback_query.data.startswith("stop:")
+        and event.callback_query.data.startswith(("stop:", "agent_decision:"))
+    ):
+        return await handler(event, data)
+
+    processor = data.get("update_processor")
+    message = event.effective_message
+    reply = getattr(message, "reply_to_message", None) if message else None
+    if (
+        processor is not None
+        and reply
+        and event.effective_user
+        and processor.priority_replies.get((message.chat_id, reply.message_id))
+        == event.effective_user.id
     ):
         return await handler(event, data)
 

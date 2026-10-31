@@ -104,7 +104,8 @@ def test_agentic_registers_expected_commands(agentic_settings, deps):
     ]
     commands = [h[0][0].commands for h in cmd_handlers]
 
-    assert len(cmd_handlers) == 10
+    assert len(cmd_handlers) == 11
+    assert frozenset({"agent"}) in commands
     assert frozenset({"start"}) in commands
     assert frozenset({"cost"}) in commands
     assert frozenset({"new"}) in commands
@@ -117,8 +118,8 @@ def test_agentic_registers_expected_commands(agentic_settings, deps):
     assert frozenset({"restart"}) in commands
 
 
-def test_classic_registers_14_commands(classic_settings, deps):
-    """Classic mode registers all 14 commands."""
+def test_classic_registers_expected_commands(classic_settings, deps):
+    """Classic mode registers all commands, including agent selection."""
     orchestrator = MessageOrchestrator(classic_settings, deps)
     app = MagicMock()
     app.add_handler = MagicMock()
@@ -133,7 +134,7 @@ def test_classic_registers_14_commands(classic_settings, deps):
         if isinstance(call[0][0], CommandHandler)
     ]
 
-    assert len(cmd_handlers) == 14
+    assert len(cmd_handlers) == 15
 
 
 def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
@@ -159,8 +160,8 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
 
     # 5 message handlers (text, unknown-command passthrough, document, photo, voice)
     assert len(msg_handlers) == 5
-    # 3 callback handlers (stop:, cd: for repo switch, resume: for /sessions)
-    assert len(cb_handlers) == 3
+    # Agent decisions bypass the queue alongside the existing Stop callback.
+    assert len(cb_handlers) == 4
 
 
 async def test_agentic_bot_commands(agentic_settings, deps):
@@ -172,6 +173,7 @@ async def test_agentic_bot_commands(agentic_settings, deps):
     assert cmd_names == [
         "start",
         "new",
+        "agent",
         "status",
         "cost",
         "verbose",
@@ -184,11 +186,11 @@ async def test_agentic_bot_commands(agentic_settings, deps):
 
 
 async def test_classic_bot_commands(classic_settings, deps):
-    """Classic mode returns 14 bot commands."""
+    """Classic mode includes agent selection in its command menu."""
     orchestrator = MessageOrchestrator(classic_settings, deps)
     commands = await orchestrator.get_bot_commands()
 
-    assert len(commands) == 14
+    assert len(commands) == 15
     cmd_names = [c.command for c in commands]
     assert "start" in cmd_names
     assert "help" in cmd_names
@@ -451,7 +453,7 @@ async def test_agentic_callbacks_scoped_to_cd_and_resume_patterns(
         if isinstance(call[0][0], CallbackQueryHandler)
     ]
 
-    assert len(cb_handlers) == 3
+    assert len(cb_handlers) == 4
     # Every handler is scoped to a specific prefix (no catch-all).
     assert all(h.pattern is not None for h in cb_handlers)
     assert any(h.pattern.match("cd:my_project") for h in cb_handlers)

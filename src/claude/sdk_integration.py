@@ -4,7 +4,6 @@ import asyncio
 import json
 import os
 import tempfile
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Literal, Optional, Union
 
@@ -30,6 +29,8 @@ from claude_agent_sdk._errors import MessageParseError
 from claude_agent_sdk._internal.message_parser import parse_message
 from claude_agent_sdk.types import StreamEvent, SystemPromptFile
 
+from ..agents.types import AgentResponse as ClaudeResponse
+from ..agents.types import StreamUpdate
 from ..config.settings import Settings
 from ..security.validators import SecurityValidator
 from .exceptions import (
@@ -86,21 +87,6 @@ def _write_system_prompt_file(prompt: str) -> Path:
     return Path(name)
 
 
-@dataclass
-class ClaudeResponse:
-    """Response from Claude Code SDK."""
-
-    content: str
-    session_id: str
-    cost: float
-    duration_ms: int
-    num_turns: int
-    is_error: bool = False
-    error_type: Optional[str] = None
-    tools_used: List[Dict[str, Any]] = field(default_factory=list)
-    interrupted: bool = False
-
-
 def _last_streamed_cost(messages: List[Any]) -> float:
     """Best-effort cost for a run cancelled before its ``ResultMessage``.
 
@@ -139,16 +125,6 @@ def _declared_hook_names(working_directory: Path) -> List[str]:
         return []
     hooks = data.get("hooks") if isinstance(data, dict) else None
     return sorted(hooks) if isinstance(hooks, dict) else []
-
-
-@dataclass
-class StreamUpdate:
-    """Streaming update from Claude SDK."""
-
-    type: str  # 'assistant', 'user', 'system', 'result', 'stream_delta'
-    content: Optional[str] = None
-    tool_calls: Optional[List[Dict]] = None
-    metadata: Optional[Dict] = None
 
 
 def _make_can_use_tool_callback(
@@ -358,6 +334,7 @@ class ClaudeSDKManager:
         allowed_tools_override: Optional[List[str]] = None,
         images: Optional[List[Dict[str, str]]] = None,
         interrupt_event: Optional[asyncio.Event] = None,
+        ephemeral: bool = False,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_running_loop().time()

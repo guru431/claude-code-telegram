@@ -45,7 +45,7 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
     queued.
     """
 
-    _PRIORITY_PREFIXES = ("stop:",)
+    _PRIORITY_PREFIXES = ("stop:", "agent_decision:")
     # Sized far above any realistic backlog so a stop: callback is never starved
     # of a semaphore slot by regular updates queued on _sequential_lock.
     _MAX_CONCURRENT = 100_000
@@ -67,6 +67,7 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
         # Lock.locked() — see _evict_idle_locks.
         self._lock_refs: dict[int, int] = {}
         self._fallback_lock = asyncio.Lock()
+        self.priority_replies: dict[tuple[int, int], int] = {}
 
     @classmethod
     def _is_priority_callback(cls, update: object) -> bool:
@@ -86,7 +87,16 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
         coroutine: Awaitable[Any],
     ) -> None:
         """Process an update, applying sequential lock for non-priority updates."""
-        if self._is_priority_callback(update):
+        is_answer = False
+        if isinstance(update, Update) and update.effective_message:
+            message = update.effective_message
+            reply = message.reply_to_message
+            if reply and update.effective_user:
+                is_answer = (
+                    self.priority_replies.get((message.chat_id, reply.message_id))
+                    == update.effective_user.id
+                )
+        if self._is_priority_callback(update) or is_answer:
             # Run immediately -- no sequential lock
             await coroutine
         else:

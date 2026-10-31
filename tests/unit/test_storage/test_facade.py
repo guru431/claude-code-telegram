@@ -1,7 +1,8 @@
 """Tests for storage facade."""
 
+import json
 import tempfile
-from datetime import datetime  # noqa: F401
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,51 @@ class TestStorageFacade:
         """Test storage initialization."""
         # Should be able to perform health check
         assert await storage.health_check()
+
+    async def test_ephemeral_agent_run_keeps_audit_and_cost_without_session(
+        self, storage, monkeypatch
+    ):
+        """Automation must not lose all accounting to a sessions FK failure."""
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(
+            "src.storage.facade.datetime",
+            SimpleNamespace(now=lambda _: datetime(2026, 10, 30, 12, tzinfo=UTC)),
+        )
+        response = ClaudeResponse(
+            content="summary",
+            session_id="codex:one-shot",
+            cost=0.25,
+            duration_ms=10,
+            num_turns=1,
+            provider="codex",
+            ephemeral=True,
+            token_usage={"inputTokens": 100},
+        )
+        await storage.save_claude_interaction(
+            -1, response.session_id, "event", response
+        )
+        async with storage.db_manager.get_connection() as conn:
+            assert (
+                await (await conn.execute("SELECT COUNT(*) FROM sessions")).fetchone()
+            )[0] == 0
+            row = await (
+                await conn.execute(
+                    "SELECT event_data FROM audit_log WHERE user_id = -1"
+                )
+            ).fetchone()
+            data = json.loads(row[0])
+            assert (
+                data["response"] == "summary"
+                and data["token_usage"]["inputTokens"] == 100
+            )
+            assert (
+                await (
+                    await conn.execute(
+                        "SELECT daily_cost FROM cost_tracking WHERE user_id = -1"
+                    )
+                ).fetchone()
+            )[0] == 0.25
 
     async def test_get_or_create_user(self, storage):
         """Test getting or creating user."""

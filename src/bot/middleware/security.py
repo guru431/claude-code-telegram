@@ -128,7 +128,17 @@ async def security_middleware(
     # gets the same checks — validating only ``text`` left captions as a bypass.
     message = event.effective_message
     user_text = (message.text or message.caption) if message else None
-    if user_text and not agentic_mode and not is_callback:
+    processor = data.get("update_processor")
+    reply = getattr(message, "reply_to_message", None) if message else None
+    registered_answer = bool(
+        processor is not None
+        and message
+        and message.text
+        and reply
+        and processor.priority_replies.get((message.chat_id, reply.message_id))
+        == user_id
+    )
+    if user_text and not agentic_mode and not is_callback and not registered_answer:
         is_safe, violation_type = await validate_message_content(
             user_text, security_validator, user_id, audit_logger
         )

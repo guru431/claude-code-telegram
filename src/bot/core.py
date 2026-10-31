@@ -61,7 +61,9 @@ class ClaudeCodeBot:
         # so the Stop button can interrupt a running handler.
         from .update_processor import StopAwareUpdateProcessor
 
-        builder.concurrent_updates(StopAwareUpdateProcessor())
+        update_processor = StopAwareUpdateProcessor()
+        self.deps["update_processor"] = update_processor
+        builder.concurrent_updates(update_processor)
 
         # Configure connection settings
         builder.connect_timeout(30)

@@ -9,11 +9,12 @@ from typing import Any, Callable, Dict, List, Optional
 
 import structlog
 
+from ..agents.types import AgentBackend
 from ..config.settings import Settings
 from ..projects.registry import canonical_path_key
 from .exceptions import ClaudeProcessError, ClaudeTimeoutError
 from .local_sessions import find_latest_local_session
-from .sdk_integration import ClaudeResponse, ClaudeSDKManager, StreamUpdate
+from .sdk_integration import ClaudeResponse, StreamUpdate
 from .session import ClaudeSession, SessionManager
 
 logger = structlog.get_logger()
@@ -53,7 +54,7 @@ class ClaudeIntegration:
     def __init__(
         self,
         config: Settings,
-        sdk_manager: Optional[ClaudeSDKManager] = None,
+        sdk_manager: Optional[AgentBackend] = None,
         session_manager: Optional[SessionManager] = None,
     ):
         """Initialize Claude integration facade."""
@@ -151,6 +152,7 @@ class ClaudeIntegration:
                     allowed_tools_override=allowed_tools_override,
                     images=images,
                     interrupt_event=interrupt_event,
+                    ephemeral=ephemeral,
                 )
             except Exception as resume_error:
                 # If resume failed *because the session is gone* (expired/missing
@@ -185,10 +187,12 @@ class ClaudeIntegration:
                         allowed_tools_override=allowed_tools_override,
                         images=images,
                         interrupt_event=interrupt_event,
+                        ephemeral=ephemeral,
                     )
                 else:
                     raise
 
+            response.ephemeral = ephemeral
             # Update session (assigns real session_id for new sessions)
             await self.session_manager.update_session(session, response)
 
@@ -274,6 +278,7 @@ class ClaudeIntegration:
         allowed_tools_override: Optional[List[str]] = None,
         images: Optional[List[Dict[str, str]]] = None,
         interrupt_event: Optional[asyncio.Event] = None,
+        ephemeral: bool = False,
     ) -> ClaudeResponse:
         """Execute command via SDK."""
         return await self.sdk_manager.execute_command(
@@ -285,6 +290,7 @@ class ClaudeIntegration:
             allowed_tools_override=allowed_tools_override,
             images=images,
             interrupt_event=interrupt_event,
+            ephemeral=ephemeral,
         )
 
     async def find_resumable_session(

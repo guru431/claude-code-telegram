@@ -29,6 +29,7 @@ import structlog
 from structlog.contextvars import bind_contextvars, unbind_contextvars
 from telegram import (
     BotCommand,
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
@@ -43,6 +44,9 @@ from telegram.ext import (
     filters,
 )
 
+from ..agents.requests import decision_handler, preference_directory
+from ..agents.router import AgentRouter
+from ..agents.storage import CODEX_PREFIX, session_provider
 from ..claude.exceptions import ClaudeProcessError, ClaudeTimeoutError
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
@@ -138,6 +142,15 @@ class ActiveRequest:
     progress_msg: Any = None  # telegram Message object
 
 
+@dataclass
+class AgentDecision:
+    user_id: int
+    chat_id: int
+    future: asyncio.Future
+    choices: List[str]
+    message: Any = None
+
+
 class MessageOrchestrator:
     """Routes messages based on mode. Single entry point for all Telegram updates."""
 
@@ -155,6 +168,7 @@ class MessageOrchestrator:
         # show the same silent "Working..." as the running one, so there was no
         # way to tell a queued request from a hung bot.
         self._queued_requests: Dict[int, int] = {}
+        self._agent_decisions: Dict[str, AgentDecision] = {}
 
     _MAX_REQUEST_LOCKS = 10_000
 
@@ -199,9 +213,13 @@ class MessageOrchestrator:
         """Wrap handler to inject dependencies into context.bot_data."""
 
         async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            if context.user_data is None:
+                return
             for key, value in self.deps.items():
                 context.bot_data[key] = value
             context.bot_data["settings"] = self.settings
+            if await self._consume_agent_reply(update):
+                return
             context.user_data.pop("_thread_context", None)
 
             is_sync_bypass = handler.__name__ == "sync_threads"
@@ -222,9 +240,18 @@ class MessageOrchestrator:
                 if not allowed:
                     return
 
+            token = decision_handler.set(
+                lambda kind, params: self._agent_request(update, context, kind, params)
+            )
+            thread_context = context.user_data.get("_thread_context")
+            preference_token = preference_directory.set(
+                Path(thread_context["project_root"]) if thread_context else None
+            )
             try:
                 await handler(update, context)
             finally:
+                decision_handler.reset(token)
+                preference_directory.reset(preference_token)
                 if should_enforce:
                     self._persist_thread_state(context)
 
@@ -378,6 +405,11 @@ class MessageOrchestrator:
 
     def register_handlers(self, app: Application) -> None:
         """Register handlers based on mode."""
+        app.add_handler(
+            CallbackQueryHandler(
+                self._agent_decision_callback, pattern=r"^agent_decision:"
+            )
+        )
         if self.settings.agentic_mode:
             self._register_agentic_handlers(app)
         else:
@@ -391,6 +423,7 @@ class MessageOrchestrator:
         handlers = [
             ("start", self.agentic_start),
             ("new", self.agentic_new),
+            ("agent", self.agent_command),
             ("status", self.agentic_status),
             ("cost", self.agentic_cost),
             ("verbose", self.agentic_verbose),
@@ -499,6 +532,7 @@ class MessageOrchestrator:
             ("start", command.start_command),
             ("help", command.help_command),
             ("new", command.new_session),
+            ("agent", self.agent_command),
             ("continue", command.continue_session),
             ("end", command.end_session),
             ("ls", command.list_files),
@@ -571,6 +605,7 @@ class MessageOrchestrator:
             commands = [
                 BotCommand("start", "Start the bot"),
                 BotCommand("new", "Start a fresh session"),
+                BotCommand("agent", "Choose Claude or Codex for this project"),
                 BotCommand("status", "Show session status"),
                 BotCommand("cost", "Show today's spend and remaining budget"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
@@ -588,6 +623,7 @@ class MessageOrchestrator:
                 BotCommand("start", "Start bot and show help"),
                 BotCommand("help", "Show available commands"),
                 BotCommand("new", "Clear context and start fresh session"),
+                BotCommand("agent", "Choose Claude or Codex for this project"),
                 BotCommand("continue", "Explicitly continue last session"),
                 BotCommand("end", "End current session and clear context"),
                 BotCommand("ls", "List files in current directory"),
@@ -605,6 +641,198 @@ class MessageOrchestrator:
             return commands
 
     # --- Agentic handlers ---
+
+    async def agent_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Show or persist /agent claude|codex for the current project."""
+        if (
+            update.message is None
+            or update.effective_user is None
+            or context.user_data is None
+        ):
+            return
+        router = context.bot_data.get("claude_integration")
+        if not isinstance(router, AgentRouter):
+            await update.message.reply_text("Agent selection is not available.")
+            return
+        directory = Path(
+            context.user_data.get("current_directory", self.settings.approved_directory)
+        )
+        user_id = update.effective_user.id
+        args = (update.message.text or "").split()[1:]
+        if not args:
+            provider = await router.get_provider(user_id, directory)
+            await update.message.reply_text(
+                f"Agent: <b>{escape_html(provider)}</b>\n"
+                "Choose <code>/agent claude</code> or <code>/agent codex</code>.\n"
+                "The choice is saved for this project; each agent keeps its own history.",
+                parse_mode="HTML",
+            )
+            return
+        try:
+            if len(args) != 1:
+                raise ValueError("Usage: /agent claude|codex")
+            provider = args[0].lower()
+            await router.set_provider(user_id, directory, provider)
+            session = await router.find_resumable_session(user_id, directory)
+        except (ValueError, ClaudeProcessError) as exc:
+            await update.message.reply_text(escape_html(str(exc)), parse_mode="HTML")
+            return
+        context.user_data["claude_session_id"] = session.session_id if session else None
+        context.user_data.pop("force_new_session", None)
+        await update.message.reply_text(
+            f"Agent: <b>{provider}</b>. "
+            + ("Previous session restored." if session else "Ready for a new session."),
+            parse_mode="HTML",
+        )
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id, command="agent", args=[provider], success=True
+            )
+
+    async def _agent_request(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        kind: str,
+        params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if kind == "approval":
+            selected = await self._ask_agent_decision(
+                update,
+                context,
+                "Codex requests approval:\n\n" + params.get("preview", ""),
+                ["Approve", "Decline"],
+            )
+            return {"decision": "accept" if selected == "Approve" else "decline"}
+        answers: Dict[str, Any] = {}
+        for question in params.get("questions", []):
+            choices = [option["label"] for option in (question.get("options") or [])]
+            answer = await self._ask_agent_decision(
+                update,
+                context,
+                question.get("question", "Codex needs your input"),
+                choices,
+            )
+            if answer is not None:
+                answers[question["id"]] = {"answers": [answer]}
+        return {"answers": answers}
+
+    async def _ask_agent_decision(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        prompt: str,
+        choices: List[str],
+    ) -> Optional[str]:
+        if (
+            update.effective_user is None
+            or update.effective_chat is None
+            or update.effective_message is None
+        ):
+            return None
+        token = uuid4().hex[:16]
+        future = asyncio.get_running_loop().create_future()
+        pending = AgentDecision(
+            update.effective_user.id, update.effective_chat.id, future, choices
+        )
+        self._agent_decisions[token] = pending
+        keyboard = (
+            InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            choice[:60], callback_data=f"agent_decision:{token}:{i}"
+                        )
+                    ]
+                    for i, choice in enumerate(choices)
+                ]
+            )
+            if choices
+            else ForceReply(selective=True)
+        )
+        processor = context.bot_data.get("update_processor")
+        stop_task = None
+        try:
+            pending.message = await update.effective_message.reply_text(
+                escape_html(redact_secrets(prompt)[:3000])
+                + "\n\nReply to this message to enter your own answer.",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            reply_key = (pending.chat_id, pending.message.message_id)
+            if processor is not None:
+                processor.priority_replies[reply_key] = pending.user_id
+            active = self._active_requests.get(pending.user_id)
+            if active is not None:
+                stop_task = asyncio.create_task(active.interrupt_event.wait())
+            waits = [future] + ([stop_task] if stop_task else [])
+            done, _ = await asyncio.wait(
+                waits, timeout=300, return_when=asyncio.FIRST_COMPLETED
+            )
+            return future.result() if future in done else None
+        finally:
+            self._agent_decisions.pop(token, None)
+            if not future.done():
+                future.cancel()
+            if stop_task:
+                stop_task.cancel()
+                await asyncio.gather(stop_task, return_exceptions=True)
+            if pending.message:
+                if processor is not None:
+                    processor.priority_replies.pop(
+                        (pending.chat_id, pending.message.message_id), None
+                    )
+                with contextlib.suppress(Exception):
+                    await pending.message.edit_reply_markup(reply_markup=None)
+
+    async def _consume_agent_reply(self, update: Update) -> bool:
+        message = update.effective_message
+        if (
+            not message
+            or not message.reply_to_message
+            or not message.text
+            or update.effective_user is None
+            or update.effective_chat is None
+        ):
+            return False
+        for pending in self._agent_decisions.values():
+            if (
+                pending.message is not None
+                and pending.user_id == update.effective_user.id
+                and pending.chat_id == update.effective_chat.id
+                and pending.message.message_id == message.reply_to_message.message_id
+                and not pending.future.done()
+            ):
+                pending.future.set_result(message.text)
+                return True
+        return False
+
+    async def _agent_decision_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        parts = (query.data or "").split(":")
+        pending = self._agent_decisions.get(parts[1]) if len(parts) == 3 else None
+        if (
+            pending is None
+            or pending.future.done()
+            or pending.user_id != query.from_user.id
+            or query.message is None
+            or pending.chat_id != query.message.chat.id
+            or pending.message.message_id != query.message.message_id
+            or not parts[2].isascii()
+            or not parts[2].isdigit()
+            or int(parts[2]) >= len(pending.choices)
+        ):
+            await query.answer("This request is not available to you.", show_alert=True)
+            return
+        pending.future.set_result(pending.choices[int(parts[2])])
+        await query.answer()
 
     async def agentic_start(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -674,6 +902,8 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Compact one-line status, no buttons."""
+        if update.effective_user is None:
+            return
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
@@ -681,6 +911,12 @@ class MessageOrchestrator:
 
         session_id = context.user_data.get("claude_session_id")
         session_status = "active" if session_id else "none"
+        router = context.bot_data.get("claude_integration")
+        if isinstance(router, AgentRouter):
+            provider = await router.get_provider(
+                update.effective_user.id, Path(current_dir)
+            )
+            session_status += f" · Agent: {provider}"
 
         # Cost info
         cost_str = ""
@@ -780,6 +1016,25 @@ class MessageOrchestrator:
                         first_line = (row.prompt or "").strip().splitlines()
                         label = first_line[0][:60] if first_line else "(no prompt)"
                         lines.append(f"· ${row.cost:.2f} — {escape_html(label)}")
+                router = context.bot_data.get("claude_integration")
+                if isinstance(router, AgentRouter):
+                    tokens = await router.state.daily_codex_tokens(user_id)
+                    lines.append(
+                        f"\nCodex today: {tokens:,} tokens / "
+                        f"{self.settings.codex_max_tokens_per_user_per_day:,}."
+                    )
+                    if any(
+                        rate is None
+                        for rate in (
+                            self.settings.codex_input_cost_per_million,
+                            self.settings.codex_cached_input_cost_per_million,
+                            self.settings.codex_output_cost_per_million,
+                        )
+                    ):
+                        lines.append(
+                            "Codex dollar cost is unavailable; the dollar totals "
+                            "above exclude unpriced Codex usage."
+                        )
             except Exception as exc:
                 logger.warning("Failed to build cost report", error=str(exc))
                 lines.append("")
@@ -1534,13 +1789,21 @@ class MessageOrchestrator:
             # generic "Claude returned an error" instead — the interrupted branch
             # below was unreachable for a real Stop.
             if claude_response.is_error and not claude_response.interrupted:
+                detail = _format_error_message(
+                    claude_response.error_type or "Agent returned an error."
+                )
+                if getattr(claude_response, "provider", "claude") == "codex":
+                    detail = "Codex: " + escape_html(
+                        redact_secrets(
+                            claude_response.content
+                            or claude_response.error_type
+                            or "Run failed"
+                        )[:2500]
+                    )
                 return [
                     FormattedMessage(
                         self._error_with_ref(
-                            _format_error_message(
-                                claude_response.error_type
-                                or "Claude returned an error."
-                            ),
+                            detail,
                             request_id,
                         ),
                         parse_mode="HTML",
@@ -2623,7 +2886,13 @@ class MessageOrchestrator:
         # a path do not tell two sessions in the same project apart. The JSONL
         # for a known session is at a computable path, so filling them in is a
         # couple of bounded reads per row rather than a directory walk.
-        needs_preview = [e for e in entries if not e.preview and not e.last_preview]
+        needs_preview = [
+            e
+            for e in entries
+            if not e.preview
+            and not e.last_preview
+            and session_provider(e.session_id) == "claude"
+        ]
         if needs_preview:
             previews = await asyncio.to_thread(
                 lambda rows=needs_preview: [
@@ -2662,7 +2931,7 @@ class MessageOrchestrator:
             except ValueError:
                 display_path = Path(sess.cwd).name or sess.cwd
 
-            short_id = sess.session_id[:8]
+            short_id = sess.session_id.removeprefix(CODEX_PREFIX)[:8]
             age = datetime.now(UTC) - sess.when
             if age.days > 0:
                 age_str = f"{age.days}d ago"
@@ -2681,6 +2950,8 @@ class MessageOrchestrator:
             else:
                 marker = ""
             origin = " · local" if sess.is_local else ""
+            if session_provider(sess.session_id) == "codex":
+                origin += " · Codex"
             preview = ""
             if sess.preview:
                 first_line = escape_html(_truncate(sess.preview, 40))
@@ -2730,6 +3001,8 @@ class MessageOrchestrator:
         ``query.from_user.id`` server-side rather than trusting the payload.
         """
         query = update.callback_query
+        if query is None or not query.data:
+            return
         await query.answer()
 
         _, session_id = query.data.split(":", 1)
@@ -2820,10 +3093,20 @@ class MessageOrchestrator:
 
         context.user_data["current_directory"] = Path(cwd)
 
+        router = context.bot_data.get("claude_integration")
+        if isinstance(router, AgentRouter):
+            try:
+                await router.set_provider(
+                    user_id, Path(cwd), session_provider(session_id)
+                )
+            except (ValueError, ClaudeProcessError) as exc:
+                await query.edit_message_text(escape_html(str(exc)), parse_mode="HTML")
+                return
+
         context.user_data["claude_session_id"] = session_id
         context.user_data.pop("force_new_session", None)
 
-        short_id = session_id[:8]
+        short_id = session_id.removeprefix(CODEX_PREFIX)[:8]
         dir_display = f" in <code>{escape_html(cwd)}</code>"
 
         await query.edit_message_text(

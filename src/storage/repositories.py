@@ -504,8 +504,9 @@ class MessageRepository:
                 """
                 INSERT INTO messages
                 (session_id, user_id, timestamp, prompt,
-                 response, cost, duration_ms, error)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 response, cost, duration_ms, error, provider, model,
+                 token_usage, cost_known)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     message.session_id,
@@ -516,6 +517,10 @@ class MessageRepository:
                     message.cost,
                     message.duration_ms,
                     message.error,
+                    message.provider,
+                    message.model,
+                    json.dumps(message.token_usage or {}),
+                    message.cost_known,
                 ),
             )
             return cursor.lastrowid

@@ -1,12 +1,13 @@
 # Claude Code Telegram
 
-Telegram-бот для удалённого доступа к [Claude Code](https://claude.ai/code). Позволяет общаться с Claude о проектах из любого устройства через Telegram -- без терминала.
+Telegram-бот для удалённого доступа к [Claude Code](https://claude.ai/code) и [Codex](https://learn.chatgpt.com/docs/app-server). Позволяет работать с проектами из любого устройства через Telegram -- без терминала.
 
 ## Стек
 
 - **Python 3.11+**, Poetry
 - **python-telegram-bot** v22 -- Telegram API
 - **claude-agent-sdk** + **anthropic** -- интеграция с Claude Code (SDK-режим, стриминг)
+- **Codex CLI app-server** -- второй движок, JSON-RPC по stdio, без дополнительного Python SDK
 - **FastAPI / Uvicorn** -- webhook-сервер для внешних событий
 - **APScheduler** -- планировщик cron-задач
 - **Pydantic Settings v2** -- конфигурация через .env
@@ -32,6 +33,7 @@ src/
     session.py             -- управление сессиями
     local_sessions.py      -- обнаружение сессий из VS Code / CLI
     monitor.py             -- валидация tool calls
+  agents/                  -- Codex, общий контракт ответов, выбор движка и инструменты проекта
   config/                  -- Pydantic Settings, feature flags, YAML-загрузчик
   storage/                 -- SQLite: repository pattern, миграции
   security/                -- auth (whitelist по Telegram ID), валидация, rate limiter, аудит
@@ -48,7 +50,8 @@ docs/                      -- документация (setup, configuration, to
 
 ## Ключевые возможности
 
-- **Два режима работы**: agentic (по умолчанию, естественный язык) и classic (13 команд, inline-клавиатуры)
+- **Два режима работы**: agentic (по умолчанию, естественный язык) и classic (команды и inline-клавиатуры)
+- **Выбор движка**: `/agent claude` или `/agent codex`, отдельно для пользователя и проекта; истории сохраняются раздельно
 - **Стриминг ответов** через DraftStreamer с индикатором набора
 - **Автоматическое сохранение сессий** per user+directory в SQLite
 - **Загрузка файлов и изображений** с анализом, распаковка архивов
@@ -58,7 +61,7 @@ docs/                      -- документация (setup, configuration, to
 - **Планировщик** -- cron-задачи с персистентным хранилищем
 - **Уведомления** -- проактивная доставка в Telegram с rate limiting
 - **Мульти-проектные топики** -- маршрутизация по проектам через Telegram topics
-- **MCP-сервер** -- отправка изображений пользователю из Claude
+- **MCP-сервер** -- отправка изображений пользователю
 - **5-уровневая безопасность**: auth -> directory isolation -> input validation -> rate limiting -> audit
   (input validation работает только в classic-режиме; в agentic-режиме, который включён по умолчанию, текст — это промт к Claude, и защита переносится на уровень инструментов — см. [SECURITY.md](SECURITY.md))
 
@@ -76,6 +79,24 @@ ALLOWED_USERS=123456789       # Telegram user ID (через запятую)
 Основные опции: `ANTHROPIC_API_KEY`, `AGENTIC_MODE` (default true), `VERBOSE_LEVEL` (0-2), `ENABLE_API_SERVER`, `ENABLE_SCHEDULER`, `ENABLE_PROJECT_THREADS`, `ENABLE_VOICE_MESSAGES`.
 
 Полный список -- см. `.env.example` и `docs/configuration.md`.
+
+## Codex
+
+Установите Codex CLI и выполните `codex login` от учётной записи, запускающей бота.
+После запуска бота отправьте `/agent codex` в нужном проекте. `/agent` показывает
+текущий выбор, `/agent claude` возвращает Claude и его прежнюю сессию.
+По умолчанию используется Claude; `DEFAULT_AGENT=codex` меняет начальный выбор.
+
+Поддерживаются потоковый вывод, остановка, продолжение сессии, входящие изображения,
+отправка изображений и ответы на вопросы агента через кнопки или ответ на сообщение.
+Токены Codex отображаются в `/cost`. Стоимость подписки в долларах CLI не сообщает;
+для API-доступа можно настроить расчёт по тарифам.
+
+Проверено с Codex CLI **0.163.0**. App-server и динамические инструменты остаются
+экспериментальными. Файлы и команды проходят через инструменты бота с проверками
+каталогов и секретов. На Windows для команд требуется Git Bash; сеть команд
+отключена, повышение разрешений запрещено. Автоматические запуски Codex получают
+только чтение файлов. Подробнее: [конфигурация](docs/configuration.md#codex).
 
 ## Запуск
 

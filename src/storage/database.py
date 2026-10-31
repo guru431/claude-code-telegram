@@ -548,6 +548,38 @@ class DatabaseManager:
                 FROM users u;
                 """,
             ),
+            (
+                11,
+                """
+                -- Provider-prefixed session IDs preserve existing Claude IDs.
+                -- Preferences are per Telegram user and canonical project path.
+                CREATE TABLE agent_preferences (
+                    user_id INTEGER NOT NULL,
+                    project_path TEXT NOT NULL,
+                    provider TEXT NOT NULL CHECK(provider IN ('claude', 'codex')),
+                    PRIMARY KEY (user_id, project_path)
+                );
+                CREATE TABLE agent_thread_usage (
+                    session_id TEXT PRIMARY KEY,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    cached_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE agent_daily_usage (
+                    user_id INTEGER NOT NULL,
+                    date TEXT NOT NULL,
+                    tokens INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (user_id, date)
+                );
+                ALTER TABLE messages ADD COLUMN provider TEXT NOT NULL
+                    DEFAULT 'claude';
+                ALTER TABLE messages ADD COLUMN model TEXT;
+                ALTER TABLE messages ADD COLUMN token_usage TEXT NOT NULL
+                    DEFAULT '{}';
+                ALTER TABLE messages ADD COLUMN cost_known BOOLEAN NOT NULL
+                    DEFAULT TRUE;
+                """,
+            ),
         ]
 
     async def _init_pool(self):
