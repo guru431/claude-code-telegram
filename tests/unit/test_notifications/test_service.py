@@ -1,11 +1,11 @@
 """Tests for the notification service."""
 
 import asyncio
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from telegram.error import RetryAfter
+from telegram.error import Forbidden, NetworkError, RetryAfter
 
 import src.notifications.service as service_module
 from src.events.bus import EventBus
@@ -15,6 +15,7 @@ from src.notifications.service import (
     NotificationService,
     _retry_delay_seconds,
 )
+from src.storage.database import DatabaseManager
 
 
 @pytest.fixture
@@ -38,6 +39,18 @@ def service(event_bus: EventBus, mock_bot: AsyncMock) -> NotificationService:
     )
     svc.register()
     return svc
+
+
+@pytest.fixture
+async def notification_db(tmp_path, migrated_db):
+    database = DatabaseManager(
+        f"sqlite:///{migrated_db(tmp_path / 'notifications.db')}"
+    )
+    await database.initialize()
+    try:
+        yield database
+    finally:
+        await database.close()
 
 
 class TestNotificationService:
@@ -167,6 +180,146 @@ class TestNotificationService:
         assert call_kwargs["chat_id"] == 123
         assert call_kwargs["text"] == "hello world"
 
+    async def test_transient_failure_resumes_chunk_without_repeating_prefix(
+        self, service: NotificationService, mock_bot: AsyncMock, monkeypatch
+    ) -> None:
+        """A failed middle chunk is retried before delivering the remaining tail."""
+        monkeypatch.setattr(service_module, "SEND_INTERVAL_SECONDS", 0)
+        monkeypatch.setattr(service_module, "RETRY_BACKOFF_SECONDS", 0)
+        chunks = ["A" * 4096, "B" * 4096, "C" * 20]
+        mock_bot.send_message.side_effect = [None, NetworkError("offline"), None, None]
+
+        await service._rate_limited_send(
+            123, AgentResponseEvent(chat_id=123, text="".join(chunks))
+        )
+
+        assert [
+            call.kwargs["text"] for call in mock_bot.send_message.call_args_list
+        ] == [chunks[0], chunks[1], chunks[1], chunks[2]]
+
+    async def test_exhausted_tail_survives_restart_and_resumes_from_checkpoint(
+        self, notification_db, event_bus, mock_bot, monkeypatch
+    ) -> None:
+        """Pending chunks survive a new sender instance without replaying the agent."""
+        monkeypatch.setattr(service_module, "SEND_INTERVAL_SECONDS", 0)
+        monkeypatch.setattr(service_module, "RETRY_BACKOFF_SECONDS", 0)
+        sender = NotificationService(event_bus, mock_bot, db_manager=notification_db)
+        fake_key = "sk-" "ant-" + "0123456789abcdef0123"
+        chunks = ["A" * 4096, "B" * 4096, "C" * 20 + fake_key]
+        event = AgentResponseEvent(chat_id=123, text="".join(chunks))
+        await sender.handle_response(event)
+        mock_bot.send_message.side_effect = [
+            None,
+            NetworkError(fake_key),
+            NetworkError(fake_key),
+            NetworkError(fake_key),
+        ]
+
+        await sender._deliver(await sender._send_queue.get())
+
+        async with notification_db.get_connection() as conn:
+            cursor = await conn.execute("SELECT * FROM notification_outbox")
+            pending = dict(await cursor.fetchone())
+        assert pending["next_chunk"] == 1
+        assert pending["retry_at"] is not None
+        assert fake_key not in pending["chunks"]
+        assert fake_key not in pending["last_error"]
+
+        mock_bot.send_message.reset_mock(side_effect=True)
+        restarted = NotificationService(event_bus, mock_bot, db_manager=notification_db)
+        await restarted.start()
+        await restarted.stop()
+
+        delivered = [
+            call.kwargs["text"] for call in mock_bot.send_message.call_args_list
+        ]
+        assert delivered[0] == chunks[1]
+        assert fake_key not in delivered[1]
+        assert delivered[1].startswith("C" * 20)
+        assert "***" in delivered[1]
+        async with notification_db.get_connection() as conn:
+            cursor = await conn.execute("SELECT COUNT(*) FROM notification_outbox")
+            assert (await cursor.fetchone())[0] == 0
+
+    async def test_failed_tail_is_requeued_after_delay_and_claimed_once(
+        self, notification_db, event_bus, mock_bot, monkeypatch
+    ) -> None:
+        """Sweeps retain exhausted sends during backoff, then claim one retry."""
+
+        class FrozenDateTime(datetime):
+            current = datetime(2030, 1, 1, tzinfo=UTC)
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current
+
+        monkeypatch.setattr(service_module, "datetime", FrozenDateTime)
+        sender = NotificationService(event_bus, mock_bot, db_manager=notification_db)
+        mock_bot.send_message.side_effect = RetryAfter(0)
+        await sender.handle_response(AgentResponseEvent(chat_id=123, text="retry me"))
+        await sender._deliver(await sender._send_queue.get())
+        assert mock_bot.send_message.call_count == 3
+
+        await sender._requeue_pending(only_due=True)
+        assert sender._send_queue.empty()
+        FrozenDateTime.current += timedelta(seconds=300)
+        await sender._requeue_pending(only_due=True)
+        await sender._requeue_pending(only_due=True)
+        assert sender._send_queue.qsize() == 1
+
+        mock_bot.send_message.reset_mock(side_effect=True)
+        await sender._deliver(await sender._send_queue.get())
+        mock_bot.send_message.assert_awaited_once()
+
+    async def test_permanent_error_is_retained_without_repeated_retries(
+        self, notification_db, event_bus, mock_bot
+    ) -> None:
+        """A blocked chat remains recoverable without hammering Telegram."""
+        sender = NotificationService(event_bus, mock_bot, db_manager=notification_db)
+        mock_bot.send_message.side_effect = Forbidden("blocked")
+        await sender.handle_response(AgentResponseEvent(chat_id=123, text="pending"))
+        await sender._deliver(await sender._send_queue.get())
+
+        mock_bot.send_message.assert_awaited_once()
+        await sender._requeue_pending(only_due=True)
+        assert sender._send_queue.empty()
+        async with notification_db.get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT next_chunk, last_error FROM notification_outbox"
+            )
+            row = await cursor.fetchone()
+        assert row["next_chunk"] == 0
+        assert row["last_error"] == "blocked"
+
+    async def test_stop_timeout_keeps_in_flight_and_queued_deliveries(
+        self, notification_db, event_bus, mock_bot, monkeypatch
+    ) -> None:
+        """A forced sender stop leaves both queued and in-flight work recoverable."""
+        monkeypatch.setattr(service_module, "_STOP_TIMEOUT_SECONDS", 0.01)
+        monkeypatch.setattr(service_module, "SEND_INTERVAL_SECONDS", 0)
+        started = asyncio.Event()
+
+        async def hanging_send(**kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        mock_bot.send_message.side_effect = hanging_send
+        sender = NotificationService(event_bus, mock_bot, db_manager=notification_db)
+        await sender.start()
+        await sender.handle_response(AgentResponseEvent(chat_id=100, text="in flight"))
+        await sender.handle_response(AgentResponseEvent(chat_id=200, text="queued"))
+        await started.wait()
+        await sender.stop()
+
+        mock_bot.send_message.reset_mock(side_effect=True)
+        restarted = NotificationService(event_bus, mock_bot, db_manager=notification_db)
+        await restarted.start()
+        await restarted.stop()
+        assert {
+            (call.kwargs["chat_id"], call.kwargs["text"])
+            for call in mock_bot.send_message.call_args_list
+        } == {(100, "in flight"), (200, "queued")}
+
     async def test_stop_drains_pending_sends(
         self, service: NotificationService, mock_bot: AsyncMock
     ) -> None:
@@ -263,7 +416,7 @@ class TestNotificationService:
         # (an earlier entry may be the per-chat send interval).
         assert slept[-1] == 1.0
 
-    async def test_retry_after_bounded_to_two_attempts(
+    async def test_retry_after_attempts_are_bounded(
         self, service: NotificationService, mock_bot: AsyncMock
     ) -> None:
         """Persistent RetryAfter is bounded — it does not retry forever."""
@@ -274,7 +427,7 @@ class TestNotificationService:
         # Re-raised RetryAfter is caught by the TelegramError handler (no raise).
         await service._rate_limited_send(123, event)
 
-        assert mock_bot.send_message.call_count == 2
+        assert mock_bot.send_message.call_count == 3
 
     @pytest.mark.parametrize(
         "raw,expected",

@@ -182,7 +182,12 @@ class MessageModel:
         # Parse datetime fields
         data["timestamp"] = _parse_datetime(data.get("timestamp"))
         if isinstance(data.get("token_usage"), str):
-            data["token_usage"] = json.loads(data["token_usage"])
+            try:
+                data["token_usage"] = json.loads(data["token_usage"])
+            except (json.JSONDecodeError, TypeError):
+                data["token_usage"] = None
+        if not isinstance(data.get("token_usage"), dict):
+            data["token_usage"] = None
         if "cost_known" in data:
             data["cost_known"] = bool(data["cost_known"])
 

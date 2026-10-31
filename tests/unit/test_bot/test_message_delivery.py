@@ -11,6 +11,8 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from src.bot.handlers.message import (
     handle_document,
     handle_photo,
@@ -20,6 +22,48 @@ from src.bot.handlers.message import (
 from src.config import create_test_config
 
 USER_ID = 4242
+
+
+@pytest.mark.parametrize("run_fails", [False, True])
+async def test_text_cancels_progress_edit_before_deleting_message(tmp_path, run_fails):
+    events = []
+    update = _make_update(events)
+    progress = await update.message.reply_text("seed")
+    started = asyncio.Event()
+    edit_tasks = []
+
+    async def blocked_edit(*args, **kwargs):
+        edit_tasks.append(asyncio.current_task())
+        started.set()
+        await asyncio.Event().wait()
+
+    async def run(**kwargs):
+        await kwargs["on_stream"](SimpleNamespace(tool_calls=[]))
+        await started.wait()
+        if run_fails:
+            raise RuntimeError("run failed")
+        return _claude_response()
+
+    async def delete_progress():
+        assert edit_tasks and edit_tasks[0].cancelled()
+        events.append("delete")
+
+    from unittest.mock import patch
+
+    progress.edit_text = AsyncMock(side_effect=blocked_edit)
+    progress.delete = AsyncMock(side_effect=delete_progress)
+    context = _make_context(tmp_path, AsyncMock(side_effect=run))
+    try:
+        with patch(
+            "src.bot.handlers.message._format_progress_update",
+            AsyncMock(return_value="working"),
+        ):
+            await handle_text_message(update, context)
+        assert edit_tasks and edit_tasks[0].cancelled()
+    finally:
+        for task in edit_tasks:
+            task.cancel()
+        await asyncio.gather(*edit_tasks, return_exceptions=True)
 
 
 def _claude_response() -> SimpleNamespace:

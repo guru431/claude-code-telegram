@@ -18,6 +18,30 @@ from src.storage.database import DatabaseManager
 from src.storage.repositories import ProjectThreadRepository
 
 
+async def test_stale_topic_already_deleted_is_only_deactivated(tmp_path):
+    from unittest.mock import MagicMock
+
+    from src.projects.thread_manager import TopicSyncResult
+    from src.storage.models import ProjectThreadModel
+
+    repository = MagicMock()
+    repository.set_active = AsyncMock()
+    manager = ProjectThreadManager(
+        MagicMock(), repository, sync_action_interval_seconds=0.0
+    )
+    bot = AsyncMock()
+    bot.delete_forum_topic.side_effect = TelegramError("message thread not found")
+    stale = ProjectThreadModel("gone", 123, 456, "Gone")
+    result = TopicSyncResult()
+
+    await manager._retire_stale_mapping(bot, stale, result)
+
+    assert result.closed == 0
+    assert result.deactivated == 1
+    repository.set_active.assert_awaited_once()
+    bot.close_forum_topic.assert_not_awaited()
+
+
 @pytest.fixture
 async def db_manager(migrated_db):
     """Create test database manager."""

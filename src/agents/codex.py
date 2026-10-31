@@ -10,7 +10,7 @@ import signal
 import subprocess
 from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 import structlog
@@ -24,7 +24,7 @@ from ..security.validators import SecurityValidator
 from .requests import decision_handler, run_token_limit, run_user_id
 from .storage import CODEX_PREFIX, AgentState
 from .tools import ProjectTools
-from .types import AgentResponse, StreamUpdate
+from .types import AgentResponse, StreamCallback, StreamUpdate
 
 logger = structlog.get_logger()
 _USAGE_KEYS = ("inputTokens", "cachedInputTokens", "outputTokens")
@@ -55,7 +55,9 @@ class CodexRPC:
         self.cwd = cwd
         self.env = env
         self.process: Any = None
-        self.events: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=256)
+        # The event consumer can await RPC replies (for example turn/interrupt).
+        # Never block the stdout reader behind it, or it cannot read that reply.
+        self.events: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
         self.pending: Dict[int, asyncio.Future[Any]] = {}
         self.stderr: deque[str] = deque(maxlen=20)
         self.tasks: List[asyncio.Task[Any]] = []
@@ -179,7 +181,9 @@ class CodexManager:
         self.state = state
         self.profile_name = "telegram-bot-" + uuid4().hex
 
-    def _command(self, boundary: Path, readonly: bool) -> List[str]:
+    def _command(self, boundary: Path) -> List[str]:
+        # Native access is read-only for every run. Mutations are available only
+        # through ProjectTools, which enforces each run's allowed tool set.
         filesystem: Dict[str, Any] = {
             ":root": "deny",
             ":minimal": "read",
@@ -269,7 +273,7 @@ class CodexManager:
         working_directory: Path,
         session_id: Optional[str] = None,
         continue_session: bool = False,
-        stream_callback: Optional[Callable] = None,
+        stream_callback: Optional[StreamCallback] = None,
         allowed_tools_override: Optional[List[str]] = None,
         images: Optional[List[Dict[str, str]]] = None,
         interrupt_event: Optional[asyncio.Event] = None,
@@ -283,11 +287,11 @@ class CodexManager:
             )
         if session_id and not session_id.startswith(CODEX_PREFIX):
             raise ClaudeProcessError("A Claude session cannot be resumed by Codex")
-        readonly = ephemeral or allowed_tools_override is not None
+        readonly = ephemeral
         env = os.environ.copy()
         if self.config.codex_home:
             env["CODEX_HOME"] = str(self.config.codex_home.expanduser().resolve())
-        rpc = CodexRPC(self._command(boundary, readonly), cwd, env)
+        rpc = CodexRPC(self._command(boundary), cwd, env)
         started = asyncio.get_running_loop().time()
         native_id = session_id[len(CODEX_PREFIX) :] if session_id else ""
         turn_id = ""
@@ -348,6 +352,12 @@ class CodexManager:
                 self.config.enable_mcp,
                 interrupt_event,
                 allowed_tools_override,
+                disallowed_tools=(
+                    self.config.claude_disallowed_tools
+                    if allowed_tools_override is not None
+                    or not self.config.disable_tool_validation
+                    else None
+                ),
             )
             thread_params: Dict[str, Any] = {
                 "cwd": str(cwd),
@@ -386,7 +396,12 @@ class CodexManager:
                     )
             if not self.config.trust_project_settings:
                 thread_config["projects"] = {str(cwd): {"trust_level": "untrusted"}}
-            if not readonly and self.config.enable_mcp and self.config.mcp_config_path:
+            if (
+                not readonly
+                and allowed_tools_override is None
+                and self.config.enable_mcp
+                and self.config.mcp_config_path
+            ):
                 raw = json.loads(
                     self.config.mcp_config_path.read_text(encoding="utf-8")
                 )

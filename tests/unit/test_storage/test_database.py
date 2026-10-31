@@ -57,6 +57,7 @@ class TestDatabaseManager:
                 "cost_tracking",
                 "project_threads",
                 "schema_version",
+                "notification_outbox",
             ]
 
             for table in expected_tables:
@@ -88,6 +89,7 @@ class TestDatabaseManager:
                 "idx_cost_tracking_user_date",
                 "idx_project_threads_chat_active",
                 "idx_project_threads_slug",
+                "idx_notification_outbox_retry",
             ]
 
             for index in expected_indexes:
@@ -99,6 +101,23 @@ class TestDatabaseManager:
             cursor = await conn.execute("SELECT MAX(version) FROM schema_version")
             version = await cursor.fetchone()
             assert version[0] >= 1  # At least initial migration
+
+    async def test_notification_outbox_migration_is_idempotent(self, db_manager):
+        """Migration 12 persists delivery checkpoints and can be safely rerun."""
+        migration = dict(db_manager._get_migrations())[12]
+        async with db_manager.get_connection() as conn:
+            await conn.executescript(migration)
+            cursor = await conn.execute("PRAGMA table_info(notification_outbox)")
+            columns = {row[1] for row in await cursor.fetchall()}
+            assert {
+                "event_id",
+                "chat_id",
+                "chunks",
+                "next_chunk",
+                "retry_at",
+            } <= columns
+            cursor = await conn.execute("SELECT MAX(version) FROM schema_version")
+            assert (await cursor.fetchone())[0] == 12
 
     async def test_audit_log_has_risk_and_session_columns(self, db_manager):
         """Migration 9 adds risk_level/session_id to audit_log."""

@@ -5,16 +5,16 @@ Provides simple interface for bot handlers.
 
 import asyncio
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import structlog
 
-from ..agents.types import AgentBackend
+from ..agents.types import AgentBackend, StreamCallback
 from ..config.settings import Settings
 from ..projects.registry import canonical_path_key
 from .exceptions import ClaudeProcessError, ClaudeTimeoutError
 from .local_sessions import find_latest_local_session
-from .sdk_integration import ClaudeResponse, StreamUpdate
+from .sdk_integration import ClaudeResponse
 from .session import ClaudeSession, SessionManager
 
 logger = structlog.get_logger()
@@ -84,7 +84,7 @@ class ClaudeIntegration:
         working_directory: Path,
         user_id: int,
         session_id: Optional[str] = None,
-        on_stream: Optional[Callable[[StreamUpdate], None]] = None,
+        on_stream: Optional[StreamCallback] = None,
         force_new: bool = False,
         allowed_tools_override: Optional[List[str]] = None,
         images: Optional[List[Dict[str, str]]] = None,
@@ -274,7 +274,7 @@ class ClaudeIntegration:
         working_directory: Path,
         session_id: Optional[str] = None,
         continue_session: bool = False,
-        stream_callback: Optional[Callable] = None,
+        stream_callback: Optional[StreamCallback] = None,
         allowed_tools_override: Optional[List[str]] = None,
         images: Optional[List[Dict[str, str]]] = None,
         interrupt_event: Optional[asyncio.Event] = None,
@@ -332,10 +332,11 @@ class ClaudeIntegration:
 
         sessions = await self.session_manager._get_user_sessions(user_id)
 
+        project_key = canonical_path_key(working_directory.resolve())
         matching_sessions = [
             s
             for s in sessions
-            if s.project_path == working_directory
+            if canonical_path_key(s.project_path.resolve()) == project_key
             and bool(s.session_id)
             and not s.is_expired(self.config.session_timeout_hours)
         ]
@@ -409,7 +410,7 @@ class ClaudeIntegration:
         user_id: int,
         working_directory: Path,
         prompt: Optional[str] = None,
-        on_stream: Optional[Callable[[StreamUpdate], None]] = None,
+        on_stream: Optional[StreamCallback] = None,
     ) -> Optional[ClaudeResponse]:
         """Continue the most recent session."""
         logger.info(
@@ -423,10 +424,12 @@ class ClaudeIntegration:
         sessions = await self.session_manager._get_user_sessions(user_id)
 
         # Find most recent session in this directory (exclude sessions without IDs)
+        project_key = canonical_path_key(working_directory.resolve())
         matching_sessions = [
             s
             for s in sessions
-            if s.project_path == working_directory and bool(s.session_id)
+            if canonical_path_key(s.project_path.resolve()) == project_key
+            and bool(s.session_id)
         ]
 
         if not matching_sessions:

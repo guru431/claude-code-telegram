@@ -448,6 +448,7 @@ async def run_application(app: Dict[str, Any]) -> int:
             event_bus=event_bus,
             bot=telegram_bot,
             default_chat_ids=config.notification_chat_ids or [],
+            db_manager=storage.db_manager,
         )
         notification_service.register()
         await notification_service.start()

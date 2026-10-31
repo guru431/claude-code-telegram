@@ -2,16 +2,23 @@
 
 Subscribes to AgentResponseEvent on the event bus and delivers messages
 through the Telegram bot API with rate limiting (1 msg/sec per chat).
+
+With a database, responses accepted by handle_response are stored durably and
+resume from the first unconfirmed chunk. The event bus itself is in memory;
+this does not make the preceding agent-to-bus handoff durable. Delivery is
+at least once: a crash after Telegram accepts a chunk but before its checkpoint
+commits can repeat that chunk on recovery.
 """
 
 import asyncio
-from datetime import timedelta
+import json
+from datetime import UTC, datetime, timedelta
 from typing import List, Optional, Union
 
 import structlog
 from telegram import Bot
 from telegram.constants import ParseMode
-from telegram.error import RetryAfter, TelegramError
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 
 from ..bot.utils.html_format import (
     TELEGRAM_MAX_MESSAGE_LENGTH,
@@ -20,6 +27,7 @@ from ..bot.utils.html_format import (
 from ..events.bus import Event, EventBus
 from ..events.types import AgentResponseEvent
 from ..security.secret_patterns import redact_secrets
+from ..storage.database import DatabaseManager
 
 logger = structlog.get_logger()
 
@@ -30,6 +38,12 @@ SEND_INTERVAL_SECONDS = 1.1
 # value (or a misparsed unit) must not park the sender worker for hours and
 # stall every other queued notification behind it.
 MAX_RETRY_AFTER_SECONDS = 60.0
+MAX_SEND_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 1.0
+# Exhausted transient deliveries wait between bounded attempts. The durable
+# outbox is retried without rerunning the agent or resending completed chunks.
+DELIVERY_RETRY_SECONDS = 300.0
+RETRY_SWEEP_INTERVAL_SECONDS = 60.0
 
 
 # Sentinel enqueued by stop() to wake an idle sender promptly without
@@ -78,14 +92,17 @@ class NotificationService:
         event_bus: EventBus,
         bot: Bot,
         default_chat_ids: Optional[List[int]] = None,
+        db_manager: Optional[DatabaseManager] = None,
     ) -> None:
         self.event_bus = event_bus
         self.bot = bot
         self.default_chat_ids = default_chat_ids or []
+        self.db_manager = db_manager
         self._send_queue: asyncio.Queue[AgentResponseEvent] = asyncio.Queue()
         self._last_send_per_chat: dict[int, float] = {}
         self._running = False
         self._sender_task: Optional[asyncio.Task[None]] = None
+        self._retry_task: Optional[asyncio.Task[None]] = None
 
     def register(self) -> None:
         """Subscribe to agent response events."""
@@ -95,8 +112,16 @@ class NotificationService:
         """Start the send queue processor."""
         if self._running:
             return
+        # Recover exact chunks and their progress before accepting new events.
+        if self.db_manager:
+            # Pre-start responses are already durable. Rebuild the queue from
+            # that canonical state rather than enqueueing them a second time.
+            self._send_queue = asyncio.Queue()
+        await self._requeue_pending(only_due=False)
         self._running = True
         self._sender_task = asyncio.create_task(self._process_send_queue())
+        if self.db_manager:
+            self._retry_task = asyncio.create_task(self._retry_pending())
         logger.info("Notification service started")
 
     async def stop(self) -> None:
@@ -109,12 +134,18 @@ class NotificationService:
 
         The whole drain is bounded by ``_STOP_TIMEOUT_SECONDS`` (at ~1 msg/sec
         per chat a large backlog does not fit). Past it the worker is
-        cancelled: the in-flight send and whatever is still queued are dropped,
-        and the dropped count is logged as an error.
+        cancelled and the remaining queue count is logged. With a database,
+        pending deliveries remain in the outbox for startup recovery.
         """
         if not self._running:
             return
         self._running = False
+        if self._retry_task:
+            self._retry_task.cancel()
+            try:
+                await self._retry_task
+            except asyncio.CancelledError:
+                pass
         task = self._sender_task
         if task:
             self._send_queue.put_nowait(_SHUTDOWN)
@@ -131,10 +162,10 @@ class NotificationService:
                     if self._send_queue.get_nowait() is not _SHUTDOWN:
                         dropped += 1
                 logger.error(
-                    "Notification service stop timed out; "
-                    "in-flight and queued notifications dropped",
+                    "Notification service stop timed out",
                     timeout_seconds=_STOP_TIMEOUT_SECONDS,
                     dropped_queued=dropped,
+                    retained=bool(self.db_manager),
                 )
         logger.info("Notification service stopped")
 
@@ -142,7 +173,69 @@ class NotificationService:
         """Queue an agent response for delivery."""
         if not isinstance(event, AgentResponseEvent):
             return
+        if self.db_manager:
+            # The outbox owns delivery once this handler accepts the response.
+            # Persist before enqueueing so the sender never takes an undurable
+            # delivery off its queue.
+            text = redact_secrets(event.text)
+            chunks = json.dumps(self._split_message(text))
+            async with self.db_manager.get_connection() as conn:
+                for chat_id in self._resolve_chat_ids(event):
+                    await conn.execute(
+                        "INSERT OR IGNORE INTO notification_outbox "
+                        "(event_id, chat_id, chunks, parse_mode, source, "
+                        "originating_event_id) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            event.id,
+                            chat_id,
+                            chunks,
+                            event.parse_mode,
+                            event.source,
+                            event.originating_event_id,
+                        ),
+                    )
+                await conn.commit()
         await self._send_queue.put(event)
+
+    async def _requeue_pending(self, *, only_due: bool) -> None:
+        """Claim failed tails, or all pending deliveries during startup recovery."""
+        if not self.db_manager:
+            return
+        where = (
+            " WHERE retry_at IS NOT NULL AND datetime(retry_at) <= datetime(?)"
+            if only_due
+            else ""
+        )
+        params = (datetime.now(UTC).isoformat(),) if only_due else ()
+        async with self.db_manager.get_connection() as conn:
+            cursor = await conn.execute(
+                "UPDATE notification_outbox SET retry_at = NULL"
+                + where
+                + " RETURNING event_id, chat_id, parse_mode, source, "
+                "originating_event_id",
+                params,
+            )
+            rows = await cursor.fetchall()
+            await conn.commit()
+        for row in rows:
+            await self._send_queue.put(
+                AgentResponseEvent(
+                    id=row["event_id"],
+                    chat_id=row["chat_id"],
+                    parse_mode=row["parse_mode"],
+                    source=row["source"],
+                    originating_event_id=row["originating_event_id"],
+                )
+            )
+
+    async def _retry_pending(self) -> None:
+        """Retry exhausted transient deliveries at a bounded cadence."""
+        while self._running:
+            await asyncio.sleep(RETRY_SWEEP_INTERVAL_SECONDS)
+            try:
+                await self._requeue_pending(only_due=True)
+            except Exception:
+                logger.exception("Failed to recover pending notifications")
 
     async def _process_send_queue(self) -> None:
         """Process queued messages with rate limiting."""
@@ -164,7 +257,7 @@ class NotificationService:
             except Exception as e:
                 logger.error(
                     "Notification delivery failed, continuing",
-                    error=str(e),
+                    error=redact_secrets(str(e)),
                     event_id=getattr(event, "id", None),
                 )
 
@@ -181,7 +274,7 @@ class NotificationService:
             except Exception as e:
                 logger.error(
                     "Notification delivery failed during drain",
-                    error=str(e),
+                    error=redact_secrets(str(e)),
                     event_id=getattr(event, "id", None),
                 )
             drained += 1
@@ -227,11 +320,39 @@ class NotificationService:
         text = redact_secrets(event.text)
         chunks = self._split_message(text)
         chunk_index = 0
+        if self.db_manager:
+            async with self.db_manager.get_connection() as conn:
+                cursor = await conn.execute(
+                    "SELECT chunks, next_chunk FROM notification_outbox "
+                    "WHERE event_id = ? AND chat_id = ?",
+                    (event.id, chat_id),
+                )
+                pending = await cursor.fetchone()
+            if pending is None:
+                # An already-queued duplicate may reach us after completion.
+                return
+            chunks = json.loads(pending["chunks"])
+            chunk_index = pending["next_chunk"]
 
         try:
-            for chunk_index, chunk in enumerate(chunks):
-                await self._send_chunk(chat_id, chunk, event)
+            for chunk_index in range(chunk_index, len(chunks)):
+                await self._send_chunk(chat_id, chunks[chunk_index], event)
                 self._last_send_per_chat[chat_id] = loop.time()
+                if self.db_manager:
+                    async with self.db_manager.get_connection() as conn:
+                        if chunk_index + 1 == len(chunks):
+                            await conn.execute(
+                                "DELETE FROM notification_outbox "
+                                "WHERE event_id = ? AND chat_id = ?",
+                                (event.id, chat_id),
+                            )
+                        else:
+                            await conn.execute(
+                                "UPDATE notification_outbox SET next_chunk = ?, "
+                                "last_error = NULL WHERE event_id = ? AND chat_id = ?",
+                                (chunk_index + 1, event.id, chat_id),
+                            )
+                        await conn.commit()
 
                 # Rate limit between chunks too — but not after the final one.
                 if chunk_index < len(chunks) - 1:
@@ -245,31 +366,41 @@ class NotificationService:
                 originating_event=event.originating_event_id,
             )
         except TelegramError as e:
-            # Record which chunk failed so a partial multi-part delivery is
-            # diagnosable (and which agent run it belonged to).
+            retry_at = None
+            if not isinstance(e, (BadRequest, Forbidden)):
+                retry_at = (
+                    datetime.now(UTC) + timedelta(seconds=DELIVERY_RETRY_SECONDS)
+                ).isoformat()
+            if self.db_manager:
+                async with self.db_manager.get_connection() as conn:
+                    await conn.execute(
+                        "UPDATE notification_outbox SET retry_at = ?, last_error = ? "
+                        "WHERE event_id = ? AND chat_id = ?",
+                        (retry_at, redact_secrets(str(e))[:1000], event.id, chat_id),
+                    )
+                    await conn.commit()
             logger.error(
                 "Failed to send notification",
                 chat_id=chat_id,
-                error=str(e),
+                error=redact_secrets(str(e)),
                 event_id=event.id,
                 originating_event=event.originating_event_id,
                 failed_chunk=chunk_index,
                 total_chunks=len(chunks),
+                pending_chunks=len(chunks) - chunk_index,
+                retained=bool(self.db_manager),
+                retry_at=retry_at if self.db_manager else None,
             )
 
     async def _send_chunk(
         self, chat_id: int, chunk: str, event: AgentResponseEvent
     ) -> None:
-        """Send one chunk, honouring Telegram's explicit RetryAfter (429) delay.
-
-        On RetryAfter (flood control), sleep the server-provided delay and retry
-        once rather than dropping the message. Bounded to 2 attempts total.
-        """
+        """Retry a transient chunk failure without replaying successful chunks."""
         try:
             parse_mode = _PARSE_MODES[event.parse_mode]
         except KeyError:
             raise ValueError(f"Unsupported parse_mode: {event.parse_mode!r}") from None
-        for attempt in range(2):
+        for attempt in range(MAX_SEND_ATTEMPTS):
             try:
                 await self.bot.send_message(
                     chat_id=chat_id,
@@ -277,12 +408,18 @@ class NotificationService:
                     parse_mode=parse_mode,
                 )
                 return
-            except RetryAfter as e:
-                if attempt + 1 >= 2:
+            except (BadRequest, Forbidden):
+                raise
+            except TelegramError as e:
+                if attempt + 1 >= MAX_SEND_ATTEMPTS:
                     raise
-                delay = _retry_delay_seconds(e.retry_after)
+                delay = (
+                    _retry_delay_seconds(e.retry_after)
+                    if isinstance(e, RetryAfter)
+                    else RETRY_BACKOFF_SECONDS * 2**attempt
+                )
                 logger.warning(
-                    "Telegram flood control, retrying after delay",
+                    "Telegram delivery failed, retrying after delay",
                     chat_id=chat_id,
                     retry_after=delay,
                 )

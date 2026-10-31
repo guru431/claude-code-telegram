@@ -25,6 +25,19 @@ from src.storage.repositories import (
 )
 
 
+def test_message_model_tolerates_invalid_token_usage():
+    row = {
+        "session_id": "session",
+        "user_id": 123,
+        "timestamp": "2026-01-01T00:00:00+00:00",
+        "prompt": "hello",
+        "token_usage": "{broken json",
+    }
+    message = MessageModel.from_row(row)
+    assert message.prompt == "hello"
+    assert message.token_usage is None
+
+
 @pytest.fixture
 async def db_manager(migrated_db):
     """Create test database manager."""

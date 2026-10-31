@@ -14,6 +14,32 @@ from scripts.sync_projects_yaml import scan_directories, sync
 from src.projects.registry import load_project_registry
 
 
+@pytest.mark.parametrize("prefix", ["export ", "\ufeff"])
+def test_main_reads_dotenv_syntax(tmp_path, monkeypatch, prefix):
+    import scripts.sync_projects_yaml as script
+
+    approved = tmp_path / "projects # archived"
+    approved.mkdir()
+    (tmp_path / ".env").write_text(
+        f'{prefix}APPROVED_DIRECTORY = "{approved.as_posix()}" # comment\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(script, "__file__", str(tmp_path / "scripts" / "sync.py"))
+    monkeypatch.delenv("APPROVED_DIRECTORY", raising=False)
+    monkeypatch.setattr("sys.argv", ["sync_projects_yaml.py"])
+    calls = []
+
+    def fake_sync(config, directory, **kwargs):
+        calls.append(directory)
+        return False
+
+    monkeypatch.setattr(script, "sync", fake_sync)
+    with pytest.raises(SystemExit) as exc:
+        script.main()
+    assert exc.value.code == 0
+    assert calls == [approved]
+
+
 def _write(config: Path, projects: List[Dict[str, Any]]) -> None:
     config.write_text(yaml.dump({"projects": projects}), encoding="utf-8")
 

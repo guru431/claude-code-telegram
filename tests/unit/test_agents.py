@@ -1,13 +1,14 @@
 """Backend contracts: provider isolation, durable routing and Codex events."""
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.agents.codex import CodexManager, codex_command
+from src.agents.codex import CodexManager, CodexRPC, codex_command
 from src.agents.requests import decision_handler, preference_directory
 from src.agents.router import AgentRouter
 from src.agents.storage import AgentState, ProviderSessionStorage
@@ -84,6 +85,45 @@ async def test_router_discards_stale_id_on_switch_and_enforces_token_budget(
     with pytest.raises(ClaudeProcessError, match="budget"):
         await router.run_command("hello", tmp_path, 1)
     claude.run_command.assert_not_called()
+
+
+async def test_codex_rpc_reads_reply_after_notification_burst(tmp_path):
+    """A consumer awaiting interrupt must not block stdout's reply reader."""
+    rpc = CodexRPC(["codex"], tmp_path, {})
+    reader = asyncio.StreamReader()
+    notifications = [
+        {"method": "item/agentMessage/delta", "params": {"delta": str(i)}}
+        for i in range(300)
+    ]
+
+    def send_request(raw):
+        request = json.loads(raw)
+        for message in notifications:
+            reader.feed_data((json.dumps(message) + "\n").encode())
+        reader.feed_data(
+            (
+                json.dumps({"id": request["id"], "result": {"interrupted": True}})
+                + "\n"
+            ).encode()
+        )
+        reader.feed_eof()
+
+    rpc.process = SimpleNamespace(
+        stdout=reader,
+        stdin=SimpleNamespace(write=send_request, drain=AsyncMock()),
+    )
+    task = asyncio.create_task(rpc._read_stdout())
+    try:
+        result = await asyncio.wait_for(rpc.request("turn/interrupt", {}), 0.5)
+        await task
+        assert result == {"interrupted": True}
+        assert [rpc.events.get_nowait() for _ in notifications] == notifications
+        assert rpc.events.get_nowait() == {"method": "_process/exited"}
+    finally:
+        while not rpc.events.empty():
+            rpc.events.get_nowait()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 class FakeRPC:
@@ -374,9 +414,50 @@ async def test_codex_unattended_requests_have_no_shell_or_approval(
         decision_handler.reset(token)
     assert response == {"decision": "decline"}
     callback.assert_not_called()
-    command = " ".join(manager._command(tmp_path, True))
+    command = " ".join(manager._command(tmp_path))
     assert "features.shell_tool=false" in command
     assert "network.enabled=false" in command
+
+
+@pytest.mark.parametrize(
+    "ephemeral,override,disabled,denied,expected",
+    [
+        (False, ["Write", "Bash"], False, [], {"write_file", "run_command"}),
+        (False, [], False, [], set()),
+        (True, ["Read", "Write", "Bash"], False, [], {"read_file"}),
+        (False, ["Read"], True, [], {"read_file"}),
+        (
+            False,
+            ["Read", "Write", "Bash"],
+            True,
+            ["Write", "Bash(git:*)"],
+            {"read_file"},
+        ),
+    ],
+)
+async def test_codex_override_is_enforced_without_widening_automation_or_mcp(
+    manager, tmp_path, monkeypatch, ephemeral, override, disabled, denied, expected
+):
+    manager.config.disable_tool_validation = disabled
+    manager.config.claude_disallowed_tools = denied
+    mcp_path = tmp_path / "mcp.json"
+    mcp_path.write_text(
+        json.dumps({"mcpServers": {"untrusted": {"command": "ignored"}}}),
+        encoding="utf-8",
+    )
+    manager.config.mcp_config_path = mcp_path
+    manager.config.enable_mcp = True
+    monkeypatch.setattr(
+        FakeRPC,
+        "events_to_send",
+        [event("turn/completed", turn={"status": "completed"})],
+    )
+    await manager.execute_command(
+        "hello", tmp_path, ephemeral=ephemeral, allowed_tools_override=override
+    )
+    start = next(p for name, p in FakeRPC.instance.calls if name == "thread/start")
+    assert {spec["name"] for spec in start["dynamicTools"]} == expected
+    assert start["config"]["mcp_servers"] == {"unrelated": {"enabled": False}}
 
 
 async def test_project_tools_validate_before_read_write_or_execute(settings, tmp_path):
@@ -423,6 +504,35 @@ async def test_readonly_tool_overrides_cannot_be_widened(settings, tmp_path):
     assert not (await tools.call("write_file", {"path": "file.txt", "content": "no"}))[
         "success"
     ]
+    tools.allowed_tools_override = ["Read", "Write", "Edit", "Bash"]
+    assert [spec["name"] for spec in tools.specs()] == ["read_file"]
+
+
+async def test_project_tool_override_maps_each_supported_tool(settings, tmp_path):
+    tools = ProjectTools(
+        None,
+        SecurityValidator(tmp_path),
+        tmp_path,
+        tmp_path,
+        False,
+        True,
+        allowed_tools_override=["Write", "Edit", "Bash", "send_image_to_user"],
+    )
+    assert {spec["name"] for spec in tools.specs()} == {
+        "write_file",
+        "edit_file",
+        "run_command",
+        "send_image_to_user",
+    }
+    assert (await tools.call("write_file", {"path": "file.txt", "content": "ok"}))[
+        "success"
+    ]
+    assert not (await tools.call("read_file", {"path": "file.txt"}))["success"]
+    tools.disallowed_tools = ["Write"]
+    assert not (await tools.call("write_file", {"path": "file.txt", "content": "no"}))[
+        "success"
+    ]
+    assert (tmp_path / "file.txt").read_text(encoding="utf-8") == "ok"
 
 
 async def test_shell_stop_terminates_the_running_command(settings, tmp_path):

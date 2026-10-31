@@ -61,6 +61,7 @@ class TestWebhookAPI:
     def test_github_webhook_valid_signature(self) -> None:
         """Valid GitHub webhook is accepted and event published."""
         bus = EventBus()
+        bus.publish = AsyncMock()  # type: ignore[method-assign]
         secret = "gh-secret"
         settings = make_settings(github_webhook_secret=secret)
         app = create_api_app(bus, settings)
@@ -121,6 +122,7 @@ class TestWebhookAPI:
     def test_generic_webhook_with_auth(self) -> None:
         """Generic webhooks with configured secret require Bearer token."""
         bus = EventBus()
+        bus.publish = AsyncMock()  # type: ignore[method-assign]
         settings = make_settings(webhook_api_secret="my-api-secret")
         app = create_api_app(bus, settings)
         client = TestClient(app)

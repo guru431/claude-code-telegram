@@ -514,9 +514,8 @@ async def handle_text_message(
         # Throttle progress edits to at most once per 2s (mirrors the agentic
         # orchestrator) — unthrottled edits hit Telegram rate limits.
         last_edit = [0.0]
-        # The edit runs as a task, at most one at a time, never awaited in the
-        # handler: it is awaited by the loop draining Claude's output, and in a
-        # group topic each edit waits for PTB's per-group limiter.
+        # Progress edits must not block output consumption. Retire the last
+        # edit before deleting the progress message when the run ends.
         edit_task: list[Optional[asyncio.Task[None]]] = [None]
 
         async def _edit_progress(text: str) -> None:
@@ -632,6 +631,9 @@ async def handle_text_message(
                 FormattedMessage(_format_error_message(e), parse_mode="HTML")
             ]
         finally:
+            if edit_task[0] is not None:
+                edit_task[0].cancel()
+                await asyncio.gather(edit_task[0], return_exceptions=True)
             # Always release the hold. A run that produced no usable result
             # settles at 0.0 and costs the user nothing.
             if rate_limiter and reservation_id:

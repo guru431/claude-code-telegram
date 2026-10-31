@@ -263,6 +263,30 @@ async def test_restart_command_denied_for_non_admin(deps):
     assert "Admin only" in msg
 
 
+async def test_restart_fallback_flushes_logs_before_hard_exit(monkeypatch):
+    import src.bot.handlers.command as command
+
+    events = []
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.reply_text = AsyncMock()
+    settings = MagicMock()
+    settings.is_admin.return_value = True
+    context = MagicMock()
+    context.bot_data = {"settings": settings, "audit_logger": None}
+
+    def failed_signal(*args):
+        raise OSError("no signal handler")
+
+    monkeypatch.setattr(command.os, "kill", failed_signal)
+    monkeypatch.setattr("logging.shutdown", lambda: events.append("flush"))
+    monkeypatch.setattr(command.os, "_exit", lambda code: events.append(("exit", code)))
+
+    await command.restart_command(update, context)
+
+    assert events == ["flush", ("exit", 1)]
+
+
 async def test_repo_scoped_to_thread_project_root_rejects_sibling(
     agentic_settings, deps, tmp_dir
 ):
@@ -1502,6 +1526,50 @@ async def test_sessions_marks_the_session_that_will_resume(
     active_row = next(line for line in text.splitlines() if "active" in line)
     assert "resumes-" in active_row
     assert "stale-on" not in active_row
+
+
+async def test_sessions_omits_oversized_callback_but_keeps_row(
+    isolation_settings, deps, tmp_dir
+):
+    orchestrator = MessageOrchestrator(isolation_settings, deps)
+    storage = _storage_mock()
+    long_id = "codex:" + "я" * 30
+    storage.sessions.get_user_sessions.return_value = [
+        _session_record(long_id, 111, tmp_dir),
+        _session_record("short-id", 111, tmp_dir),
+    ]
+    update = _sessions_update()
+
+    await orchestrator.agentic_sessions(update, _ctx(storage))
+
+    call = update.message.reply_text.call_args
+    assert long_id.removeprefix("codex:")[:8] in call.args[0]
+    callbacks = [
+        button.callback_data
+        for row in call.kwargs["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert callbacks == ["resume:short-id"]
+
+
+async def test_agent_decision_callback_before_prompt_is_ready(agentic_settings, deps):
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    pending = SimpleNamespace(
+        future=asyncio.get_running_loop().create_future(),
+        user_id=111,
+        chat_id=222,
+        message=None,
+        choices=["approve"],
+    )
+    orchestrator._agent_decisions["pending"] = pending
+    update = _resume_update()
+    update.callback_query.data = "decision:pending:0"
+    update.callback_query.message.chat.id = 222
+
+    await orchestrator._agent_decision_callback(update, MagicMock())
+
+    assert not pending.future.done()
+    assert update.callback_query.answer.call_args.kwargs["show_alert"]
 
 
 async def test_resume_rejects_another_users_session(isolation_settings, deps, tmp_dir):

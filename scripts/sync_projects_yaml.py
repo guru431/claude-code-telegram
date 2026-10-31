@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 import yaml
+from dotenv import dotenv_values
 
 # Run standalone (python scripts/sync_projects_yaml.py) but still share the
 # canonical slug and name generators and the directory scanner with
@@ -242,12 +243,10 @@ def main() -> None:
         # Try to read from .env
         env_file = project_root / ".env"
         if env_file.exists():
-            for line in env_file.read_text(encoding="utf-8").splitlines():
-                if line.startswith("APPROVED_DIRECTORY="):
-                    approved_dir_env = (
-                        line.split("=", 1)[1].strip().strip('"').strip("'")
-                    )
-                    break
+            approved_dir_env = (
+                dotenv_values(env_file, encoding="utf-8-sig").get("APPROVED_DIRECTORY")
+                or ""
+            )
 
     if not approved_dir_env:
         print("ERROR: APPROVED_DIRECTORY not set", file=sys.stderr)

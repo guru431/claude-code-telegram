@@ -129,6 +129,30 @@ class TestForceNewSkipsAutoResume:
             spy.assert_not_called()
 
 
+@pytest.mark.parametrize("continue_explicitly", [False, True])
+async def test_resume_matches_resolved_project_paths(
+    facade, session_manager, tmp_path, monkeypatch, continue_explicitly
+):
+    """Stored aliases identify the same project in both resume entry points."""
+    project = tmp_path / "project"
+    project.mkdir()
+    alias = project / ".." / "project"
+    now = datetime(2026, 10, 30, tzinfo=UTC)
+    session = ClaudeSession("existing", 123, alias, now, now)
+    monkeypatch.setattr(ClaudeSession, "is_expired", lambda *_: False)
+    await session_manager.storage.save_session(session)
+
+    if continue_explicitly:
+        with patch.object(facade, "run_command") as run:
+            await facade.continue_session(123, project)
+        run.assert_awaited_once()
+        assert run.await_args.kwargs["session_id"] == "existing"
+    else:
+        found = await facade._find_resumable_session(123, project)
+        assert found is not None
+        assert found.session_id == "existing"
+
+
 class TestTimedOutSessionStaysResumable:
     """A run that timed out leaves a session the next message continues."""
 

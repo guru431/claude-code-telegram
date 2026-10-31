@@ -3,7 +3,7 @@
 import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Union
 
 
 @dataclass
@@ -32,6 +32,9 @@ class StreamUpdate:
     metadata: Optional[Dict[str, Any]] = None
 
 
+StreamCallback = Callable[[StreamUpdate], Union[None, Awaitable[None]]]
+
+
 class AgentBackend(Protocol):
     async def execute_command(
         self,
@@ -39,7 +42,7 @@ class AgentBackend(Protocol):
         working_directory: Path,
         session_id: Optional[str] = None,
         continue_session: bool = False,
-        stream_callback: Optional[Callable] = None,
+        stream_callback: Optional[StreamCallback] = None,
         allowed_tools_override: Optional[List[str]] = None,
         images: Optional[List[Dict[str, str]]] = None,
         interrupt_event: Optional[asyncio.Event] = None,

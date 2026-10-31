@@ -599,13 +599,16 @@ def test_file_tool_boundary_follows_tool_path_boundary(tmp_path, boundary):
     assert settings.file_tool_boundary(working) == expected
 
 
-def test_database_path_slices_prefix_like_database_manager(tmp_path):
+@pytest.mark.parametrize(
+    "url",
+    ["sqlite:///data/sqlite:///bot.db", "sqlite://data/bot.db"],
+)
+def test_database_path_slices_prefix_like_database_manager(tmp_path, url):
     """Only the leading ``sqlite:///`` is stripped, as DatabaseManager does."""
     from src.storage.database import DatabaseManager
 
     test_dir = tmp_path / "projects"
     test_dir.mkdir()
-    url = "sqlite:///data/sqlite:///bot.db"
     settings = Settings(
         _env_file=None,
         telegram_bot_token="test_token",
@@ -616,7 +619,6 @@ def test_database_path_slices_prefix_like_database_manager(tmp_path):
 
     parsed = DatabaseManager(url)._parse_database_url(url)
     assert settings.database_path == Path(parsed).resolve()
-    assert settings.database_path == Path("data/sqlite:///bot.db").resolve()
 
 
 def test_voice_max_file_size_configuration(tmp_path):

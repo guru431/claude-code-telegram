@@ -4,6 +4,8 @@ import asyncio
 from dataclasses import dataclass
 from unittest.mock import MagicMock
 
+import pytest
+
 import src.events.bus as bus_module
 from src.events.bus import Event, EventBus
 
@@ -26,6 +28,46 @@ class OtherEvent(Event):
 
 class TestEventBus:
     """Tests for EventBus."""
+
+    @pytest.mark.parametrize("stopped", [False, True])
+    async def test_publish_without_processor_is_rejected(self, stopped: bool) -> None:
+        """A caller must see failure when there is no worker to consume the event."""
+        bus = EventBus()
+        if stopped:
+            await bus.start()
+            await bus.stop()
+
+        with pytest.raises(RuntimeError, match="not running"):
+            await bus.publish(BusTestEvent(data="undeliverable"))
+
+        assert bus._queue.empty()
+
+    async def test_stop_delivers_events_published_by_draining_handler(self) -> None:
+        """An in-flight handler can still publish its result during shutdown."""
+        bus = EventBus()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        received = []
+
+        async def handler(event: Event) -> None:
+            if isinstance(event, BusTestEvent):
+                started.set()
+                await release.wait()
+                await bus.publish(OtherEvent(value=42))
+            else:
+                received.append(event)
+
+        bus.subscribe_all(handler)
+        await bus.start()
+        await bus.publish(BusTestEvent())
+        await started.wait()
+        stopping = asyncio.create_task(bus.stop())
+        await asyncio.sleep(0)
+        release.set()
+        await stopping
+
+        assert len(received) == 1
+        assert received[0].value == 42
 
     async def test_publish_and_subscribe(self) -> None:
         """Events are delivered to matching handlers."""

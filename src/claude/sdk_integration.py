@@ -1,11 +1,12 @@
 """Claude Code Python SDK integration."""
 
 import asyncio
+import inspect
 import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Literal, Optional, Union
+from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Union
 
 import structlog
 from claude_agent_sdk import (
@@ -30,7 +31,7 @@ from claude_agent_sdk._internal.message_parser import parse_message
 from claude_agent_sdk.types import StreamEvent, SystemPromptFile
 
 from ..agents.types import AgentResponse as ClaudeResponse
-from ..agents.types import StreamUpdate
+from ..agents.types import StreamCallback, StreamUpdate
 from ..config.settings import Settings
 from ..security.validators import SecurityValidator
 from .exceptions import (
@@ -330,7 +331,7 @@ class ClaudeSDKManager:
         working_directory: Path,
         session_id: Optional[str] = None,
         continue_session: bool = False,
-        stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
+        stream_callback: Optional[StreamCallback] = None,
         allowed_tools_override: Optional[List[str]] = None,
         images: Optional[List[Dict[str, str]]] = None,
         interrupt_event: Optional[asyncio.Event] = None,
@@ -915,9 +916,15 @@ class ClaudeSDKManager:
                     )
 
     async def _handle_stream_message(
-        self, message: Message, stream_callback: Callable[[StreamUpdate], None]
+        self, message: Message, stream_callback: StreamCallback
     ) -> None:
         """Handle streaming message from claude-agent-sdk."""
+
+        async def emit(update: StreamUpdate) -> None:
+            result = stream_callback(update)
+            if inspect.isawaitable(result):
+                await result
+
         try:
             if isinstance(message, AssistantMessage):
                 # Extract content from assistant message
@@ -944,14 +951,14 @@ class ClaudeSDKManager:
                         content=("\n".join(text_parts) if text_parts else None),
                         tool_calls=tool_calls if tool_calls else None,
                     )
-                    await stream_callback(update)
+                    await emit(update)
                 elif content:
                     # Fallback for non-list content
                     update = StreamUpdate(
                         type="assistant",
                         content=str(content),
                     )
-                    await stream_callback(update)
+                    await emit(update)
 
             elif isinstance(message, StreamEvent):
                 event = message.event or {}
@@ -964,7 +971,7 @@ class ClaudeSDKManager:
                                 type="stream_delta",
                                 content=text,
                             )
-                            await stream_callback(update)
+                            await emit(update)
 
             elif isinstance(message, UserMessage):
                 content = getattr(message, "content", "")
@@ -973,7 +980,7 @@ class ClaudeSDKManager:
                         type="user",
                         content=content,
                     )
-                    await stream_callback(update)
+                    await emit(update)
 
         except Exception as e:
             logger.warning("Stream callback failed", error=str(e))

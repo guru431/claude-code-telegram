@@ -4,6 +4,7 @@ Provides context-aware quick action suggestions for common development tasks.
 """
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -12,6 +13,13 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from src.storage.models import SessionModel
 
 logger = logging.getLogger(__name__)
+
+_CONTEXT_KEYWORDS = {
+    "has_tests": re.compile(r"\b(?:tests?|pytest|unittest)\b"),
+    "has_package_manager": re.compile(r"\b(?:pip|poetry|npm|yarn)\b"),
+    "has_formatter": re.compile(r"\b(?:black|prettier|format)\b"),
+    "has_linter": re.compile(r"\b(?:flake8|pylint|eslint|mypy)\b"),
+}
 
 
 @dataclass
@@ -186,22 +194,13 @@ class QuickActionManager:
         for msg in recent_messages:
             content = (msg.get("content") or "").lower()
 
-            # Check for test indicators
-            if any(word in content for word in ["test", "pytest", "unittest"]):
-                context["has_tests"] = True
+            # Match complete words so "latest", "pipeline" and "information"
+            # do not advertise unrelated development actions.
+            for key, pattern in _CONTEXT_KEYWORDS.items():
+                if pattern.search(content):
+                    context[key] = True
 
-            # Check for package manager indicators
-            if any(word in content for word in ["pip", "poetry", "npm", "yarn"]):
-                context["has_package_manager"] = True
-                context["has_dependencies"] = True
-
-            # Check for formatter indicators
-            if any(word in content for word in ["black", "prettier", "format"]):
-                context["has_formatter"] = True
-
-            # Check for linter indicators
-            if any(word in content for word in ["flake8", "pylint", "eslint", "mypy"]):
-                context["has_linter"] = True
+        context["has_dependencies"] = context["has_package_manager"]
 
         # File-based context analysis could be added here
         # For now, we'll use heuristics based on session history

@@ -1,6 +1,7 @@
 """Command handlers for bot operations."""
 
 import asyncio
+import logging
 import os
 import signal
 import sys
@@ -1443,7 +1444,13 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         # Non-zero so restart-on-failure relaunches rather than treating the
         # /restart as a clean stop.
-        os._exit(1)
+        try:
+            logging.shutdown()
+            for stream in (sys.stdout, sys.stderr):
+                if stream is not None:
+                    stream.flush()
+        finally:
+            os._exit(1)
 
 
 def _escape_markdown(text: str) -> str:

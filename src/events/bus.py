@@ -74,7 +74,18 @@ class EventBus:
         self._global_handlers.append(handler)
 
     async def publish(self, event: Event) -> None:
-        """Publish an event to be processed by matching handlers."""
+        """Publish to a live processor, including its graceful shutdown drain."""
+        # stop() clears _running before draining. In-flight handlers may still
+        # publish their results while that processor is alive; after it exits
+        # accepting a new event would strand it in a queue with no consumer.
+        if self._processor_task is None or self._processor_task.done():
+            logger.warning(
+                "Event bus is not running; publish rejected",
+                event_type=event.event_type,
+                event_id=event.id,
+                source=event.source,
+            )
+            raise RuntimeError("Event bus is not running")
         logger.info(
             "Event published",
             event_type=event.event_type,

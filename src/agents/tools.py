@@ -18,6 +18,16 @@ from ..claude.exceptions import ClaudeProcessError
 from ..claude.monitor import check_bash_directory_boundary
 from ..security.validators import SecurityValidator
 
+# Claude-compatible names and native bridge names identify the same tool.
+_TOOL_NAMES = {
+    "read_file": {"read_file", "Read"},
+    "list_directory": {"list_directory", "LS", "Glob"},
+    "write_file": {"write_file", "Write"},
+    "edit_file": {"edit_file", "Edit", "MultiEdit"},
+    "run_command": {"run_command", "Bash"},
+    "send_image_to_user": {"send_image_to_user", "mcp__telegram__send_image_to_user"},
+}
+
 
 class ProjectTools:
     def __init__(
@@ -30,6 +40,7 @@ class ProjectTools:
         images_enabled: bool,
         interrupt_event: Optional[asyncio.Event] = None,
         allowed_tools_override: Optional[List[str]] = None,
+        disallowed_tools: Optional[List[str]] = None,
     ):
         self.rpc = rpc
         self.validator = validator
@@ -39,6 +50,7 @@ class ProjectTools:
         self.images_enabled = images_enabled
         self.interrupt_event = interrupt_event
         self.allowed_tools_override = allowed_tools_override
+        self.disallowed_tools = disallowed_tools or []
 
     def _path(self, value: str) -> Path:
         valid, path, error = self.validator.validate_path(
@@ -113,16 +125,11 @@ class ProjectTools:
                 )
         if self.allowed_tools_override is not None:
             allowed = set(self.allowed_tools_override)
-            specs = [
-                s
-                for s in specs
-                if (
-                    s[0] == "read_file"
-                    and "Read" in allowed
-                    or s[0] == "list_directory"
-                    and bool({"LS", "Glob"} & allowed)
-                )
-            ]
+            specs = [s for s in specs if _TOOL_NAMES[s[0]] & allowed]
+        # Argument-specific SDK denials cannot be emulated safely by this
+        # bridge. Withhold the entire tool rather than ignore such a denial.
+        denied = {name.split("(", 1)[0] for name in self.disallowed_tools}
+        specs = [s for s in specs if not _TOOL_NAMES[s[0]] & denied]
         return [
             {
                 "type": "function",

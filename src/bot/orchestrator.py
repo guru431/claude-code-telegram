@@ -823,6 +823,7 @@ class MessageOrchestrator:
             or pending.future.done()
             or pending.user_id != query.from_user.id
             or query.message is None
+            or pending.message is None
             or pending.chat_id != query.message.chat.id
             or pending.message.message_id != query.message.message_id
             or not parts[2].isascii()
@@ -2966,7 +2967,11 @@ class MessageOrchestrator:
                 f" · <code>{short_id}</code> · {age_str}{origin}{marker}{preview}"
             )
 
-            # callback_data max 64 bytes — uuid is 36 chars, prefix 7 = 43
+            # Provider-prefixed and externally stored IDs may exceed Telegram's
+            # callback limit; retain the row but omit an unusable button.
+            callback_data = f"resume:{sess.session_id}"
+            if len(callback_data.encode("utf-8")) > 64:
+                continue
             # Button text: show first words of the conversation
             btn_label = f"{short_id}"
             if sess.preview:
@@ -2978,7 +2983,7 @@ class MessageOrchestrator:
                 [
                     InlineKeyboardButton(
                         btn_label,
-                        callback_data=f"resume:{sess.session_id}",
+                        callback_data=callback_data,
                     )
                 ]
             )

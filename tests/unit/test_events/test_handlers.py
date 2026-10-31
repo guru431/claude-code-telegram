@@ -12,8 +12,11 @@ from src.utils.constants import AUTOMATION_USER_ID
 
 
 @pytest.fixture
-def event_bus() -> EventBus:
-    return EventBus()
+async def event_bus():
+    bus = EventBus()
+    await bus.start()
+    yield bus
+    await bus.stop()
 
 
 @pytest.fixture

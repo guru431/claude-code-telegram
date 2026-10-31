@@ -762,8 +762,9 @@ class Settings(BaseSettings):
         (``sqlite:///:memory:`` or an empty path after the prefix), so callers
         skip parent-directory creation and on-disk file handling.
         """
-        prefix = "sqlite:///"
-        if self.database_url.startswith(prefix):
+        for prefix in ("sqlite:///", "sqlite://"):
+            if not self.database_url.startswith(prefix):
+                continue
             # Slice off the prefix only, exactly like
             # DatabaseManager._parse_database_url — a replace() would also
             # strip later occurrences inside the path.

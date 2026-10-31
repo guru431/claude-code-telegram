@@ -580,6 +580,27 @@ class DatabaseManager:
                     DEFAULT TRUE;
                 """,
             ),
+            (
+                12,
+                """
+                -- Keep unsent notification chunks across failures and restarts.
+                -- Progress is checkpointed after each Telegram acceptance.
+                CREATE TABLE IF NOT EXISTS notification_outbox (
+                    event_id TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    chunks TEXT NOT NULL,
+                    parse_mode TEXT,
+                    source TEXT NOT NULL,
+                    originating_event_id TEXT,
+                    next_chunk INTEGER NOT NULL DEFAULT 0,
+                    retry_at TIMESTAMP,
+                    last_error TEXT,
+                    PRIMARY KEY (event_id, chat_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_notification_outbox_retry
+                    ON notification_outbox(retry_at);
+                """,
+            ),
         ]
 
     async def _init_pool(self):

@@ -162,6 +162,7 @@ class ProjectThreadManager:
         topic live forever, with nothing left to retry it. Leaving the mapping
         active makes the next sync run pick it up again.
         """
+        topic_closed = True
         try:
             await self._call_sync_api(
                 lambda: bot.delete_forum_topic(
@@ -173,7 +174,7 @@ class ProjectThreadManager:
             # Topic already deleted out of band: deletion succeeded in effect.
             # Do not misread it as "topics disabled".
             if self._is_topic_unusable_error(e):
-                pass
+                topic_closed = False
             elif self._is_private_topics_unavailable_error(e):
                 raise PrivateTopicsUnavailableError(
                     "Private chat topics are not enabled for this bot chat."
@@ -200,7 +201,8 @@ class ProjectThreadManager:
                     )
                     return
 
-        result.closed += 1
+        if topic_closed:
+            result.closed += 1
         await self.repository.set_active(
             chat_id=stale.chat_id,
             project_slug=stale.project_slug,

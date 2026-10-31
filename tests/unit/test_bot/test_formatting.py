@@ -11,7 +11,7 @@ from src.bot.utils.formatting import (
     ProgressIndicator,
     ResponseFormatter,
 )
-from src.bot.utils.html_format import escape_html, markdown_to_telegram_html
+from src.bot.utils.html_format import escape_html, markdown_to_telegram_html, tg_len
 from src.config.settings import Settings
 
 
@@ -124,6 +124,40 @@ class TestResponseFormatter:
 
         assert len(messages) == 1
         assert "empty output" in messages[0].text
+
+    @pytest.mark.parametrize(
+        "output", ["😀" * 120, "&<😀>" * 80], ids=["emoji", "escaped"]
+    )
+    def test_code_output_truncates_by_escaped_utf16_units(self, formatter, output):
+        formatter.max_code_block_length = 200
+
+        messages = formatter.format_code_output(output)
+        content = "".join(
+            re.findall(r"<code[^>]*>(.*?)</code>", message.text, flags=re.DOTALL)[0]
+            for message in messages
+        )
+
+        assert "output truncated" in content
+        assert tg_len(content) <= formatter.max_code_block_length
+        assert not re.search(r"&(?!amp;|lt;|gt;)", content)
+
+    def test_code_output_at_utf16_limit_keeps_all_content(self, formatter):
+        formatter.max_code_block_length = 200
+        output = "😀" * 100
+
+        messages = formatter.format_code_output(output)
+
+        assert f"<code>{output}</code>" in messages[0].text
+
+    def test_response_code_block_truncates_by_utf16_units(self, formatter):
+        formatter.max_code_block_length = 200
+
+        result = formatter._format_code_blocks(
+            "<pre><code>" + "😀" * 100 + "</code></pre>"
+        )
+
+        assert "truncated" in result
+        assert tg_len(result) <= formatter.max_code_block_length
 
     def test_format_file_list(self, formatter):
         """Test file list formatting."""
@@ -388,6 +422,44 @@ class TestMarkdownToTelegramHtml:
     def test_link(self):
         result = markdown_to_telegram_html("[text](https://example.com)")
         assert '<a href="https://example.com">text</a>' in result
+
+    @pytest.mark.parametrize(
+        ("label", "url", "rendered_label"),
+        [
+            ("page", "https://example.com/wiki/Page_(1)", "page"),
+            ("a [b] c", "https://example.com", "a [b] c"),
+            (
+                "a [**b**] `c`",
+                "https://example.com/(a_(b))",
+                "a [<b>b</b>] <code>c</code>",
+            ),
+        ],
+    )
+    def test_link_balances_label_and_destination_delimiters(
+        self, label, url, rendered_label
+    ):
+        result = markdown_to_telegram_html(f"before [{label}]({url}) after")
+
+        assert result == f'before <a href="{url}">{rendered_label}</a> after'
+
+    def test_link_deep_balanced_delimiters(self):
+        label = "[" * 32 + "label" + "]" * 32
+        url = "https://example.com/" + "(" * 32 + "page" + ")" * 32
+
+        assert markdown_to_telegram_html(f"[{label}]({url})") == (
+            f'<a href="{url}">{label}</a>'
+        )
+
+    def test_malformed_link_prefix_does_not_hide_later_valid_link(self):
+        prefix = "[label](" * 2000
+
+        assert markdown_to_telegram_html(prefix + "[ok](https://example.com)") == (
+            prefix + '<a href="https://example.com">ok</a>'
+        )
+
+    @pytest.mark.parametrize("url", ["javascript:alert(1)", "data:text/plain,(x)"])
+    def test_balanced_unsafe_link_keeps_only_escaped_label(self, url):
+        assert markdown_to_telegram_html(f"[a [<b>]]({url})") == "a [&lt;b&gt;]"
 
     def test_link_url_with_quote_escaped(self):
         result = markdown_to_telegram_html('[text](https://x.com/a?q="b")')

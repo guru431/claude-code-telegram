@@ -350,6 +350,46 @@ def split_telegram_html(
     return chunks
 
 
+def _markdown_link_spans(text: str) -> Iterator[Tuple[int, int, int]]:
+    """Yield link start, label end and destination end with balanced delimiters.
+
+    Match delimiters once before scanning links, so deeply nested or unfinished
+    destinations do not trigger repeated scans of the remaining text.
+    """
+    openings: Dict[str, List[int]] = {"[": [], "(": []}
+    closing_to_opening = {"]": "[", ")": "("}
+    matches: Dict[int, int] = {}
+    escaped = False
+    for position, char in enumerate(text):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+        elif char in openings:
+            openings[char].append(position)
+        elif char in closing_to_opening:
+            stack = openings[closing_to_opening[char]]
+            if stack:
+                matches[stack.pop()] = position
+
+    position = 0
+    while position < len(text):
+        label_end = matches.get(position) if text[position] == "[" else None
+        if label_end is not None and label_end > position + 1:
+            destination_start = label_end + 1
+            destination_end = matches.get(destination_start)
+            if (
+                text[destination_start : destination_start + 1] == "("
+                and destination_end is not None
+                and destination_end > destination_start + 1
+            ):
+                yield position, label_end, destination_end
+                position = destination_end + 1
+                continue
+        position += 1
+
+
 def markdown_to_telegram_html(text: str) -> str:
     """Convert Claude's markdown output to Telegram-compatible HTML.
 
@@ -412,12 +452,11 @@ def markdown_to_telegram_html(text: str) -> str:
     # Before escaping and emphasis: run later, they rewrote the URL itself, so
     # ``https://x/__init__.py`` or a backtick in the URL put <b>/<code> tags
     # inside href. The URL is final here; only the label goes on.
-    def _replace_link(m: re.Match) -> str:  # type: ignore[type-arg]
-        label: str = m.group(1)
+    def _replace_link(label: str, destination: str) -> str:
         # A code-span placeholder inside the URL stands for characters that
         # are literal in a link destination: put the original back.
         url = _PLACEHOLDER_RE.sub(
-            lambda p: sources.get(p.group(0), p.group(0)), m.group(2)
+            lambda p: sources.get(p.group(0), p.group(0)), destination
         )
         # Allowlist URL schemes: only http(s) and tg are clickable.
         # Reject javascript:, data:, etc. to prevent unsafe href injection.
@@ -430,11 +469,18 @@ def markdown_to_telegram_html(text: str) -> str:
             _make_placeholder(f'<a href="{href}">') + label + _make_placeholder("</a>")
         )
 
-    text = re.sub(
-        r"\[([^\]]+)\]\(([^)]+)\)",
-        _replace_link,
-        text,
-    )
+    link_parts: List[str] = []
+    link_end = 0
+    for start, label_end, destination_end in _markdown_link_spans(text):
+        link_parts.append(text[link_end:start])
+        link_parts.append(
+            _replace_link(
+                text[start + 1 : label_end], text[label_end + 2 : destination_end]
+            )
+        )
+        link_end = destination_end + 1
+    link_parts.append(text[link_end:])
+    text = "".join(link_parts)
 
     # --- 4. HTML-escape remaining text ---
     text = escape_html(text)

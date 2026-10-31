@@ -287,6 +287,39 @@ class TestClaudeSDKManager:
         assert len(stream_updates) > 0
         assert any(update.type == "assistant" for update in stream_updates)
 
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    async def test_stream_callbacks_accept_sync_and_async_handlers(
+        self, sdk_manager, asynchronous
+    ):
+        """Both backend callbacks deliver messages without spurious failures."""
+        updates = []
+
+        async def async_callback(update):
+            updates.append(update)
+
+        callback = async_callback if asynchronous else updates.append
+        messages = [
+            _make_assistant_message("answer"),
+            StreamEvent(
+                uuid="event",
+                session_id="session",
+                event={
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "partial"},
+                },
+            ),
+            UserMessage(content="question"),
+        ]
+        with patch("src.claude.sdk_integration.logger.warning") as warning:
+            for message in messages:
+                await sdk_manager._handle_stream_message(message, callback)
+        assert [update.content for update in updates] == [
+            "answer",
+            "partial",
+            "question",
+        ]
+        warning.assert_not_called()
+
     async def test_execute_command_timeout(self, sdk_manager):
         """Test command execution timeout."""
         from src.claude.exceptions import ClaudeTimeoutError

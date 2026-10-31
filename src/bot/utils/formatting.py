@@ -12,6 +12,7 @@ from .html_format import (
     markdown_to_telegram_html,
     split_telegram_html,
     tg_len,
+    utf16_cut,
 )
 
 
@@ -112,11 +113,14 @@ class ResponseFormatter:
         escaped_output = escape_html(output)
 
         # Check if the code block is too long
-        if len(escaped_output) > self.max_code_block_length:
-            escaped_output = (
-                escape_html(output[: self.max_code_block_length - 100])
-                + "\n... (output truncated)"
-            )
+        if tg_len(escaped_output) > self.max_code_block_length:
+            cut = utf16_cut(escaped_output, self.max_code_block_length - 100)
+            escaped_output = escaped_output[:cut]
+            # Cut the escaped text to budget without leaving a partial entity.
+            amp = escaped_output.rfind("&")
+            if amp != -1 and ";" not in escaped_output[amp:]:
+                escaped_output = escaped_output[:amp]
+            escaped_output += "\n... (output truncated)"
 
         if language:
             code_block = f'<pre><code class="language-{escape_html(language)}">{escaped_output}</code></pre>'
@@ -219,7 +223,7 @@ class ResponseFormatter:
 
         def _truncate_code(m: re.Match) -> str:  # type: ignore[type-arg]
             full = m.group(0)
-            if len(full) > self.max_code_block_length:
+            if tg_len(full) > self.max_code_block_length:
                 # Keep the original opening tags so a truncated block keeps the
                 # `class="language-..."` hint that short blocks have.
                 opening = full[: full.index(">", full.index("<code")) + 1]
@@ -228,7 +232,8 @@ class ResponseFormatter:
                 # second time, and back the cut off so it never lands inside an
                 # `&...;` HTML entity.
                 inner = m.group(1)
-                truncated = inner[: self.max_code_block_length - 80]
+                cut = utf16_cut(inner, self.max_code_block_length - 80)
+                truncated = inner[:cut]
                 amp = truncated.rfind("&")
                 if amp != -1 and ";" not in truncated[amp:]:
                     truncated = truncated[:amp]

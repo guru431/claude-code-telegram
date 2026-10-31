@@ -10,6 +10,8 @@ only ever fail. This test fails if any published id stops existing.
 
 from unittest.mock import Mock
 
+import pytest
+
 from src.bot.features.quick_actions import QuickActionManager
 from src.bot.utils.formatting import ResponseFormatter
 from src.config.settings import Settings
@@ -45,3 +47,36 @@ def test_published_ids_are_not_empty() -> None:
     # Guards against the keyboard silently becoming empty and the contract
     # above passing vacuously.
     assert _published_ids()
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["latest protest", "pipeline", "blackbird information", "noteslint"],
+)
+async def test_context_keywords_do_not_match_inside_unrelated_words(
+    content: str,
+) -> None:
+    actions = await QuickActionManager().get_suggestions(
+        Mock(), recent_messages=[{"content": content}]
+    )
+
+    assert {action.id for action in actions} == {"optimize", "document", "refactor"}
+
+
+@pytest.mark.parametrize(
+    ("content", "action_id"),
+    [
+        ("Run TESTS with pytest/unittest", "test"),
+        ("Install: pip, poetry, npm, yarn.", "install"),
+        ("Use BLACK/prettier to format.", "format"),
+        ("Check flake8, pylint, eslint and mypy.", "lint"),
+    ],
+)
+async def test_context_keywords_match_words_and_punctuation(
+    content: str, action_id: str
+) -> None:
+    actions = await QuickActionManager().get_suggestions(
+        Mock(), recent_messages=[{"content": content}]
+    )
+
+    assert action_id in {action.id for action in actions}
