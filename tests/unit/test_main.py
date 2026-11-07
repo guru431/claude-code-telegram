@@ -1,10 +1,38 @@
 """Tests for application wiring in ``src.main``."""
 
+import json
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from src.main import _sync_discovered_project_topics, apply_configured_log_level
+import structlog
+
+from src.main import (
+    _sync_discovered_project_topics,
+    apply_configured_log_level,
+    setup_logging,
+)
+
+
+def test_request_reference_is_in_production_logs(caplog):
+    """A reference displayed to the user must be searchable in JSON logs."""
+    previous = structlog.get_config()
+    noisy_levels = {
+        name: logging.getLogger(name).level
+        for name in ("httpx", "httpcore", "telegram.request", "telegram.ext.Updater")
+    }
+    try:
+        setup_logging()
+        with caplog.at_level(logging.INFO):
+            with structlog.contextvars.bound_contextvars(request_id="test-reference"):
+                structlog.get_logger("request-reference-test").warning("Request failed")
+        entry = json.loads(caplog.records[-1].getMessage())
+        assert entry["request_id"] == "test-reference"
+        assert entry["event"] == "Request failed"
+    finally:
+        structlog.configure(**previous)
+        for name, level in noisy_levels.items():
+            logging.getLogger(name).setLevel(level)
 
 
 class _FakeLog:

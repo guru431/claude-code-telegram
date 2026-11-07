@@ -295,7 +295,6 @@ class TestNotificationService:
         self, notification_db, event_bus, mock_bot, monkeypatch
     ) -> None:
         """A forced sender stop leaves both queued and in-flight work recoverable."""
-        monkeypatch.setattr(service_module, "_STOP_TIMEOUT_SECONDS", 0.01)
         monkeypatch.setattr(service_module, "SEND_INTERVAL_SECONDS", 0)
         started = asyncio.Event()
 
@@ -309,16 +308,24 @@ class TestNotificationService:
         await sender.handle_response(AgentResponseEvent(chat_id=100, text="in flight"))
         await sender.handle_response(AgentResponseEvent(chat_id=200, text="queued"))
         await started.wait()
-        await sender.stop()
+        # Force only the first stop to time out; recovery must be able to drain
+        # SQLite checkpoints without a millisecond deadline on a busy host.
+        with monkeypatch.context() as forced_stop:
+            forced_stop.setattr(service_module, "_STOP_TIMEOUT_SECONDS", 0)
+            await sender.stop()
+        assert sender._sender_task.cancelled()
 
         mock_bot.send_message.reset_mock(side_effect=True)
         restarted = NotificationService(event_bus, mock_bot, db_manager=notification_db)
         await restarted.start()
         await restarted.stop()
-        assert {
+        assert sorted(
             (call.kwargs["chat_id"], call.kwargs["text"])
             for call in mock_bot.send_message.call_args_list
-        } == {(100, "in flight"), (200, "queued")}
+        ) == [(100, "in flight"), (200, "queued")]
+        async with notification_db.get_connection() as conn:
+            cursor = await conn.execute("SELECT COUNT(*) FROM notification_outbox")
+            assert (await cursor.fetchone())[0] == 0
 
     async def test_stop_drains_pending_sends(
         self, service: NotificationService, mock_bot: AsyncMock

@@ -104,9 +104,33 @@ events arrive; one model response can overshoot a limit. Usage on failed and
 interrupted turns also counts when the CLI reports it. No automatic replay is
 performed after a timeout or a process failure.
 
+At 60% of the effective request budget, the bot sends one
+[in-turn notice](https://learn.chatgpt.com/docs/app-server#steer-an-active-turn) to
+prioritize the requested result. The hard limit still includes cached input and
+the remaining daily allowance. A final answer already completed before the last
+usage update is delivered even if that update exceeds the soft limit; all reported
+tokens are recorded.
+
+Bot runs use compact assistant instructions and load one project entry point
+(`AGENTS.md`, falling back to `CLAUDE.md`, up to 8 KiB). The full development guide
+remains available through file tools and must be consulted for code/configuration
+changes. Simple factual questions use targeted document lookup instead of loading
+unrelated development guides and change logs.
+
+`read_file` returns numbered pages (120 lines by default, at most 400), with an
+explicit continuation line. `search_files` performs case-insensitive literal
+search over a file or directory, defaults to `*.md`, and returns matching lines
+with nearby context. It accepts a filename glob and a match limit (default 20,
+maximum 50), scans at most 500 files / 500 directories / 8 MiB, and skips secret
+paths and dependency directories. Search paths in results are relative to the
+working directory, or absolute when outside it but within the permitted boundary.
+File pages, search results and directory listings have a 12,000-character content
+budget; command stdout/stderr are capped at 6,000 characters each. Truncation is
+explicit so the agent can request a narrower result. Text lookup never requires shell.
+
 Codex receives application-owned dynamic tools for reading, listing, writing,
-editing and running commands. Every operation passes the existing path/secret
-checks; commands additionally pass `check_bash_directory_boundary` and execute
+searching, editing and running commands. Every operation passes the existing
+path/secret checks; commands additionally pass `check_bash_directory_boundary` and execute
 through app-server's OS sandbox with network access disabled. Native shell and
 patch escalation cannot bypass these tools. On native Windows, Git Bash is
 required and the legacy OS sandbox provides write isolation, not complete read
@@ -114,6 +138,8 @@ isolation for arbitrary project scripts; the application's command checks remain
 necessary, as with the Claude backend. Direct file tools reject outside paths
 and secret files. Do not use untrusted executable project scripts as a substitute
 for direct file tools.
+If the Windows sandbox fails, further shell attempts in that run fail immediately
+and recommend the direct lookup tools. The bot never falls back to an unconfined shell.
 
 User hooks, apps, plugins, memories and unrelated MCP servers are disabled for
 bot runs. Only servers explicitly configured through the bot's `MCP_CONFIG_PATH`

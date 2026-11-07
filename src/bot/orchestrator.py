@@ -1794,13 +1794,20 @@ class MessageOrchestrator:
                     claude_response.error_type or "Agent returned an error."
                 )
                 if getattr(claude_response, "provider", "claude") == "codex":
-                    detail = "Codex: " + escape_html(
-                        redact_secrets(
-                            claude_response.content
-                            or claude_response.error_type
-                            or "Run failed"
-                        )[:2500]
-                    )
+                    if claude_response.error_type != "token_budget_exceeded":
+                        detail = "❌ <b>Codex run failed</b>\n\n" + escape_html(
+                            redact_secrets(claude_response.error_type or "Run failed")
+                        )
+                    if claude_response.content:
+                        detail += "\n\n<b>Partial response:</b>\n" + escape_html(
+                            redact_secrets(claude_response.content)[:2500]
+                        )
+                logger.warning(
+                    "Agent run failed",
+                    request_id=request_id,
+                    provider=getattr(claude_response, "provider", "claude"),
+                    error_type=claude_response.error_type,
+                )
                 return [
                     FormattedMessage(
                         self._error_with_ref(

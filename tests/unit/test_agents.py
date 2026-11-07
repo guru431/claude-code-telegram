@@ -624,6 +624,112 @@ async def test_usage_is_durable_and_not_counted_twice(state, monkeypatch):
     assert await state.daily_codex_tokens(7) == 130
 
 
+async def test_codex_uses_bounded_context_and_loads_full_guide_on_demand(
+    manager, monkeypatch, tmp_path
+):
+    (tmp_path / "AGENTS.md").write_text(
+        "Read the trip summary first.", encoding="utf-8"
+    )
+    (tmp_path / "CLAUDE.md").write_text(
+        "large-guide-content\n" * 4000, encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        FakeRPC,
+        "events_to_send",
+        [event("turn/completed", turn={"status": "completed"})],
+    )
+    await manager.execute_command("What is the baggage allowance?", tmp_path)
+    start = next(p for name, p in FakeRPC.instance.calls if name == "thread/start")
+    assert len(start["baseInstructions"]) < 2500
+    assert "Read the trip summary first." in start["developerInstructions"]
+    assert "CLAUDE.md" in start["developerInstructions"]
+    assert "large-guide-content" not in start["developerInstructions"]
+
+
+async def test_codex_warns_once_before_the_hard_limit(manager, monkeypatch, tmp_path):
+    manager.config.codex_max_tokens_per_request = 1000
+    monkeypatch.setattr(
+        FakeRPC,
+        "events_to_send",
+        [
+            event("thread/tokenUsage/updated", tokenUsage={"total": {"inputTokens": n}})
+            for n in (650, 700)
+        ]
+        + [event("turn/completed", turn={"status": "completed"})],
+    )
+    result = await manager.execute_command("hello", tmp_path)
+    warnings = [p for name, p in FakeRPC.instance.calls if name == "turn/steer"]
+    assert len(warnings) == 1
+    assert warnings[0]["expectedTurnId"] == "turn-one"
+    assert not result.is_error
+    assert not any(name == "turn/interrupt" for name, _ in FakeRPC.instance.calls)
+
+
+async def test_codex_budget_warning_failure_keeps_the_run_alive(
+    manager, monkeypatch, tmp_path
+):
+    manager.config.codex_max_tokens_per_request = 1000
+    original = FakeRPC.request
+
+    async def request(self, method, params=None):
+        if method == "turn/steer":
+            raise ClaudeProcessError("no active turn")
+        return await original(self, method, params)
+
+    monkeypatch.setattr(FakeRPC, "request", request)
+    monkeypatch.setattr(
+        FakeRPC,
+        "events_to_send",
+        [
+            event(
+                "thread/tokenUsage/updated", tokenUsage={"total": {"inputTokens": 650}}
+            ),
+            event("turn/completed", turn={"status": "completed"}),
+        ],
+    )
+    result = await manager.execute_command("hello", tmp_path)
+    assert not result.is_error and result.token_usage["inputTokens"] == 650
+
+
+async def test_codex_keeps_a_completed_answer_when_final_usage_overshoots(
+    manager, monkeypatch, tmp_path
+):
+    manager.config.codex_max_tokens_per_request = 1000
+    monkeypatch.setattr(
+        FakeRPC,
+        "events_to_send",
+        [
+            event(
+                "item/completed",
+                item={
+                    "id": "answer",
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "One checked bag up to 23 kg.",
+                },
+            ),
+            event(
+                "thread/tokenUsage/updated",
+                tokenUsage={
+                    "total": {
+                        "inputTokens": 1100,
+                        "outputTokens": 20,
+                    }
+                },
+            ),
+            event("turn/completed", turn={"status": "completed"}),
+        ],
+    )
+    result = await manager.execute_command("hello", tmp_path)
+    assert not result.is_error and result.content.endswith("23 kg.")
+    assert result.token_usage == {
+        "inputTokens": 1100,
+        "cachedInputTokens": 0,
+        "outputTokens": 20,
+    }
+    assert not any(name == "turn/interrupt" for name, _ in FakeRPC.instance.calls)
+
+
 async def test_topic_choice_applies_in_subdirectories(state, settings, tmp_path):
     router = AgentRouter(settings, state, {})
     await state.set_provider(1, tmp_path, "codex")

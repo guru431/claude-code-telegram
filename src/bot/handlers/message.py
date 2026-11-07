@@ -201,6 +201,14 @@ def _format_error_message(error: Exception | str) -> str:
 
     error_lower = error_str.lower()
 
+    if error_lower == "token_budget_exceeded":
+        return (
+            "⚠️ <b>Codex token budget reached</b>\n\n"
+            "The bot stopped this request because its token limit was reached. "
+            "The session was kept; send a follow-up to continue, "
+            "or ask the administrator to review the token limits."
+        )
+
     if "usage limit reached" in error_lower or "usage limit" in error_lower:
         return error_str  # Already user-friendly
 

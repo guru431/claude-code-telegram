@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from src.agents.types import AgentResponse
 from src.bot.orchestrator import MessageOrchestrator
 from src.claude.exceptions import ClaudeTimeoutError
 from src.config import create_test_config
@@ -1766,6 +1767,46 @@ async def test_agentic_text_charges_reported_cost_on_soft_error(agentic_settings
     )
 
     limiter.settle_reservation.assert_awaited_once_with("rid-1", 9.99)
+
+
+@pytest.mark.parametrize(
+    "error_type, expected",
+    [
+        ("token_budget_exceeded", "token budget reached"),
+        ("codex_turn_failed", "Codex run failed"),
+    ],
+)
+async def test_codex_failure_reports_cause_before_partial_response(
+    agentic_settings, deps, error_type, expected
+):
+    """Progress text must not replace the reason a Codex request stopped."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    fake_key = "sk-" + "0123456789abcdef0123456789"
+    response = AgentResponse(
+        session_id="codex:thread-one",
+        content=f"Checking <tickets> {fake_key}",
+        cost=0.0,
+        duration_ms=100,
+        num_turns=1,
+        provider="codex",
+        is_error=True,
+        error_type=error_type,
+    )
+    integration = AsyncMock()
+    integration.run_command.return_value = response
+    update = _cost_update()
+    context = _cost_context(agentic_settings, integration, _reserving_limiter())
+
+    await orchestrator.agentic_text(update, context)
+
+    texts = [call.args[0] for call in update.message.reply_text.call_args_list]
+    result = next(text for text in texts if "ref: " in text)
+    assert expected in result
+    assert result.index(expected) < result.index("Checking")
+    assert "Partial response:" in result
+    assert "&lt;tickets&gt;" in result and "<tickets>" not in result
+    assert fake_key not in result
+    assert context.user_data["claude_session_id"] == response.session_id
 
 
 async def test_agentic_text_settles_at_zero_without_result_message(
