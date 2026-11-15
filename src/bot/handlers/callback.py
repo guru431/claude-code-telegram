@@ -223,8 +223,12 @@ async def handle_cd_callback(
                 str(new_path), settings.approved_directory
             )
             if not valid:
+                logger.warning(
+                    "Directory validation denied", user_id=user_id, error=error
+                )
                 await query.edit_message_text(
-                    f"❌ <b>Access Denied</b>\n\n{escape_html(error)}",
+                    "❌ <b>Access Denied</b>\n\n"
+                    "The requested directory is not accessible.",
                     parse_mode="HTML",
                 )
                 return

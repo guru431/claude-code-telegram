@@ -42,6 +42,7 @@ from src.security.auth import (
     WhitelistAuthProvider,
 )
 from src.security.rate_limiter import RateLimiter
+from src.security.secret_patterns import redact_secrets
 from src.security.validators import SecurityValidator
 from src.storage.facade import Storage
 from src.storage.session_storage import SQLiteSessionStorage
@@ -682,10 +683,15 @@ async def run_application(app: Dict[str, Any]) -> int:
         # Cancel remaining tasks
         for task in pending:
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        cancelled_results = await asyncio.gather(*pending, return_exceptions=True)
+        for task, result in zip(pending, cancelled_results):
+            if isinstance(result, Exception):
+                logger.error(
+                    "Task failed during cancellation",
+                    task=task.get_name(),
+                    error=redact_secrets(str(result)),
+                    error_type=type(result).__name__,
+                )
 
         # Decide the process exit code. A clean stop (SIGINT/SIGTERM) exits 0
         # and the Scheduled Task stays down; a crashed core task or an explicit

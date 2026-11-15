@@ -142,7 +142,15 @@ class CodexRPC:
     async def _read_stdout(self) -> None:
         try:
             while line := await self.process.stdout.readline():
-                message = json.loads(line)
+                try:
+                    message = json.loads(line)
+                    if not isinstance(message, dict):
+                        raise ValueError("Codex event must be an object")
+                except ValueError as exc:
+                    logger.warning(
+                        "Invalid Codex event stream", error=type(exc).__name__
+                    )
+                    continue
                 if "method" not in message and "id" in message:
                     future = self.pending.get(message["id"])
                     if future is not None and not future.done():
@@ -158,7 +166,7 @@ class CodexRPC:
                             future.set_result(message.get("result"))
                 else:
                     await self.events.put(message)
-        except (ValueError, OSError) as exc:
+        except OSError as exc:
             logger.warning("Invalid Codex event stream", error=type(exc).__name__)
         finally:
             error = ClaudeProcessError("Codex app-server stopped before completion")
@@ -687,7 +695,9 @@ class CodexManager:
             error_type = "timeout"
             final_text["timeout"] = (
                 "Codex timed out; the conversation can be continued.\n\n"
-                + "\n\n".join(text_by_item.values())
+                + "\n\n".join(
+                    text for key, text in text_by_item.items() if key not in final_text
+                )
             )
         except ClaudeProcessError:
             if not turn_id:
@@ -695,7 +705,9 @@ class CodexManager:
             error_type = "codex_process_error"
             final_text["error"] = (
                 "Codex stopped before completing the turn. The session was kept.\n\n"
-                + "\n\n".join(text_by_item.values())
+                + "\n\n".join(
+                    text for key, text in text_by_item.items() if key not in final_text
+                )
             )
         finally:
             if stop_task is not None:

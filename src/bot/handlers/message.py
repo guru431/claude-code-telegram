@@ -187,9 +187,9 @@ def _format_error_message(error: Exception | str) -> str:
     # preserve their existing message as-is rather than downgrading
     # to a generic "process error".
     if isinstance(error_obj, ClaudeError):
-        safe_error = escape_html(error_str)
-        if len(safe_error) > 500:
-            safe_error = safe_error[:500] + "..."
+        safe_error = escape_html(error_str[:500])
+        if len(error_str) > 500:
+            safe_error += "..."
         return (
             f"❌ <b>Claude Error</b>\n\n"
             f"{safe_error}\n\n"
@@ -330,9 +330,9 @@ def _format_error_message(error: Exception | str) -> str:
 
 def _format_process_error(error_str: str) -> str:
     """Format a Claude process/SDK error with the actual details."""
-    safe_error = escape_html(error_str)
-    if len(safe_error) > 500:
-        safe_error = safe_error[:500] + "..."
+    safe_error = escape_html(error_str[:500])
+    if len(error_str) > 500:
+        safe_error += "..."
 
     return (
         f"❌ <b>Claude Process Error</b>\n\n"
@@ -1040,8 +1040,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 )
                 return
 
-        # Delete progress message
-        await progress_msg.delete()
+        # Delivery of a validated upload must not depend on progress cleanup.
+        try:
+            await progress_msg.delete()
+        except Exception as delete_error:
+            logger.debug("Failed to delete progress message", error=str(delete_error))
 
         # Create a new progress message for Claude processing
         claude_progress_msg = await update.message.reply_text(

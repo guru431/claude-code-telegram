@@ -1,10 +1,12 @@
 """Tests for application wiring in ``src.main``."""
 
+import asyncio
 import json
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 import structlog
 
 from src.main import (
@@ -15,8 +17,9 @@ from src.main import (
 )
 
 
+@pytest.mark.parametrize("cancellation_fails", [False, True])
 async def test_shutdown_signal_wins_simultaneous_normal_core_return(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, cancellation_fails
 ):
     from src import main as main_module
     from src.config import create_test_config
@@ -35,7 +38,21 @@ async def test_shutdown_signal_wins_simultaneous_normal_core_return(
         main_module, "NotificationService", MagicMock(return_value=notifications)
     )
 
+    api_started = asyncio.Event()
+
+    async def failing_api(*args):
+        api_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            raise RuntimeError("API cleanup failed")
+
+    monkeypatch.setattr("src.api.server.run_api_server", failing_api)
+    monkeypatch.setattr("src.api.server.recover_unprocessed_webhooks", AsyncMock())
+
     async def normal_return_during_shutdown():
+        if cancellation_fails:
+            await api_started.wait()
         signals[main_module.signal.SIGTERM](None, None)
 
     bot = SimpleNamespace(
@@ -58,7 +75,7 @@ async def test_shutdown_signal_wins_simultaneous_normal_core_return(
             "claude_integration": integration,
             "config": create_test_config(approved_directory=str(tmp_path)),
             "features": SimpleNamespace(
-                api_server_enabled=False, scheduler_enabled=False
+                api_server_enabled=cancellation_fails, scheduler_enabled=False
             ),
         }
     )

@@ -523,7 +523,7 @@ class AuditLogger:
             "/sys/",
             "/proc/",
             "/windows/",
-            "/program files",
+            "/program files/",
             "/programdata/",
             "/.env",
             "/.ssh/",

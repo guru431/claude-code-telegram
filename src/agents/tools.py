@@ -407,7 +407,9 @@ class ProjectTools:
             "processId": process_id,
             "command": [executable, "--noprofile", "--norc", "-c", command],
             "cwd": str(self.cwd),
-            "timeoutMs": 30_000,
+            # The native Windows RPC cannot cap buffered output. Bound the
+            # accumulation window more tightly until the CLI supports a cap.
+            "timeoutMs": 10_000 if os.name == "nt" else 30_000,
             "env": {"BASH_ENV": None, "ENV": None},
             "sandboxPolicy": {
                 "type": "workspaceWrite",

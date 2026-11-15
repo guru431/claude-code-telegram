@@ -1302,8 +1302,16 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
-        # Check if current directory is a git repository (stat off-loop).
-        is_git_repo = await asyncio.to_thread((current_dir / ".git").exists)
+        # Git also recognizes subdirectories, worktrees and submodules.
+        try:
+            root, _ = await git_integration.execute_git_command(
+                ["git", "rev-parse", "--show-toplevel"], current_dir
+            )
+            is_git_repo = bool(root.strip()) and Path(
+                root.strip()
+            ).resolve().is_relative_to(settings.approved_directory.resolve())
+        except GitError:
+            is_git_repo = False
         if not is_git_repo:
             await update.message.reply_text(
                 f"📂 <b>Not a Git Repository</b>\n\n"

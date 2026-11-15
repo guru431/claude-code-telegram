@@ -224,7 +224,11 @@ def discover_new_projects(
     # Load current config
     if config_path.exists():
         with open(config_path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            data = yaml.safe_load(f)
+        if data is None:
+            data = {}
+        if not isinstance(data, dict):
+            raise ValueError(f"{config_path} must contain a YAML mapping")
     else:
         data = {}
 

@@ -287,7 +287,8 @@ class NotificationService:
                     error=redact_secrets(str(e)),
                     event_id=getattr(event, "id", None),
                 )
-            drained += 1
+            else:
+                drained += 1
         if drained:
             logger.info("Drained queued notifications on shutdown", count=drained)
 
@@ -383,9 +384,9 @@ class NotificationService:
                 chunks=len(chunks),
                 originating_event=event.originating_event_id,
             )
-        except TelegramError as e:
+        except (TelegramError, ValueError) as e:
             retry_at = None
-            if not isinstance(e, (BadRequest, Forbidden)):
+            if not isinstance(e, (BadRequest, Forbidden, ValueError)):
                 retry_at = (
                     datetime.now(UTC) + timedelta(seconds=DELIVERY_RETRY_SECONDS)
                 ).isoformat()

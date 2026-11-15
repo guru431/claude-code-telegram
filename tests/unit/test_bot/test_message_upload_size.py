@@ -7,6 +7,8 @@ must not raise on ``None``, and must re-check the bytes actually downloaded.
 
 from unittest.mock import AsyncMock, MagicMock
 
+from telegram.error import NetworkError
+
 from src.bot.handlers.message import handle_document
 from src.config import create_test_config
 
@@ -59,6 +61,22 @@ def _make_context(tmp_path, update, downloaded=b"hello", max_mb=10):
 
 def _replies(update):
     return [c.args[0] for c in update.message.reply_text.call_args_list if c.args]
+
+
+async def test_document_still_runs_when_progress_delete_fails(tmp_path):
+    update = _make_update()
+    context = _make_context(tmp_path, update)
+    update.message.reply_text.return_value.delete.side_effect = NetworkError("offline")
+    integration = MagicMock()
+    integration.run_command = AsyncMock(
+        return_value=MagicMock(
+            is_error=False, session_id="one", cost=0.0, content="done"
+        )
+    )
+    context.bot_data["claude_integration"] = integration
+    await handle_document(update, context)
+    integration.run_command.assert_awaited_once()
+    assert not any("Unexpected Error" in text for text in _replies(update))
 
 
 async def test_none_file_size_does_not_raise_and_does_not_bypass(tmp_path):

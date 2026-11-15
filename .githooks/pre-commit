@@ -21,7 +21,7 @@ if [ -n "$added" ]; then
     | grep -ivE '\.example(\.|$)' || true)
   if [ -n "$bad" ]; then
     echo "BLOCKED: refusing to commit sensitive file(s):"
-    printf '  %s\n' $bad
+    printf '  %s\n' "$bad"
     fail=1
   fi
 fi
@@ -46,17 +46,19 @@ fi
 # 3) Personal denylist — concrete values from untracked .sanitize-patterns
 sp="$repo_root/.sanitize-patterns"
 if [ -f "$sp" ]; then
-  pat=$(mktemp 2>/dev/null || echo "$repo_root/.sanitize-patterns.tmp")
-  grep -vE '^[[:space:]]*$' "$sp" > "$pat" 2>/dev/null || true
-  if [ -s "$pat" ]; then
-    hits=$(printf '%s\n' "$diff_content" | grep -inEf "$pat" || true)
-    if [ -n "$hits" ]; then
+  if patterns=$(grep -vE '^[[:space:]]*$' "$sp"); then
+    if hits=$(printf '%s\n' "$diff_content" | grep -inE -e "$patterns"); then
       echo "BLOCKED: personal data (matched .sanitize-patterns) in staged changes:"
       printf '%s\n' "$hits" | sed 's/^/  /'
       fail=1
+    elif [ "$?" -gt 1 ]; then
+      echo "BLOCKED: .sanitize-patterns could not be applied; fix its regular expressions."
+      fail=1
     fi
+  elif [ "$?" -gt 1 ]; then
+    echo "BLOCKED: .sanitize-patterns could not be read."
+    fail=1
   fi
-  rm -f "$pat"
 fi
 
 if [ "$fail" -ne 0 ]; then

@@ -193,6 +193,50 @@ class FakeRPC:
         self.closed = True
 
 
+@pytest.mark.parametrize("failure", ["timeout", "process"])
+async def test_codex_failure_does_not_repeat_completed_messages(
+    manager, monkeypatch, tmp_path, failure
+):
+    messages = [
+        event("item/agentMessage/delta", itemId="done", delta="Completed answer"),
+        event(
+            "item/completed",
+            item={"id": "done", "type": "agentMessage", "text": "Completed answer"},
+        ),
+        event("item/agentMessage/delta", itemId="partial", delta="Unfinished tail"),
+    ]
+    if failure == "process":
+        messages.append(event("_process/exited"))
+    monkeypatch.setattr(FakeRPC, "events_to_send", messages)
+
+    tail_seen = asyncio.Event()
+    original_wait_for = asyncio.wait_for
+
+    async def stream(update):
+        if update.content == "Unfinished tail":
+            tail_seen.set()
+
+    async def wait_for(awaitable, timeout):
+        if failure != "timeout" or timeout != manager.config.codex_timeout_seconds:
+            return await original_wait_for(awaitable, timeout)
+        task = asyncio.create_task(awaitable)
+        try:
+            await tail_seen.wait()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr("src.agents.codex.asyncio.wait_for", wait_for)
+
+    result = await manager.execute_command("hello", tmp_path, stream_callback=stream)
+    assert result.is_error
+    assert result.content.count("Completed answer") == 1
+    assert result.content.count("Unfinished tail") == 1
+    assert result.session_id == "codex:native-one"
+    assert FakeRPC.instance.closed
+
+
 def event(method, **params):
     return {"method": method, "params": params}
 

@@ -68,8 +68,8 @@ run-debug:
 # Remote Mac Mini (SSH session)
 run-remote:  ## Start bot on remote Mac in tmux (persists after SSH disconnect)
 	security unlock-keychain ~/Library/Keychains/login.keychain-db
-	tmux new-session -d -s claude-bot 'poetry run claude-telegram-bot'
-	@echo "Bot started in tmux session 'claude-bot'"
+	tmux has-session -t '=claude-bot' 2>/dev/null || tmux new-session -d -s claude-bot 'poetry run claude-telegram-bot'
+	@echo "Bot is running in tmux session 'claude-bot'"
 	@echo "  Attach: make remote-attach"
 	@echo "  Stop:   make remote-stop"
 

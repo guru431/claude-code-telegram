@@ -178,6 +178,7 @@ _AWK_EXEC_RE = re.compile(
     r"\bsystem\s*\("  # system("cmd")
     r'|\|\s*&?\s*"'  # print … | "cmd", … |& "cmd"
     r'|"\s*\|\s*&?\s*getline'  # "cmd" | getline
+    r"|\bgetline\b[^;{}\n]*<"  # getline [var] < file (literal or expression)
     r'|\b(?:print|printf)\b[^;{}\n]*>>?\s*"'  # print … > "file"
 )
 
@@ -249,7 +250,7 @@ def _script_program_denial(base_command: str, program: str) -> Optional[str]:
     if _AWK_EXEC_RE.search(program):
         return (
             "it uses awk system()/command-pipe/redirect, which executes a shell "
-            "command or writes a file the boundary check never sees"
+            "command or reads/writes a file the boundary check never sees"
         )
     return None
 

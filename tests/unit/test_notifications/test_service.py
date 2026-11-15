@@ -64,6 +64,39 @@ class TestNotificationService:
         await service.handle_response(event)
         assert service._send_queue.qsize() == 1
 
+    async def test_invalid_parse_mode_retains_diagnostic_in_outbox(
+        self, event_bus, mock_bot, notification_db
+    ):
+        service = NotificationService(
+            event_bus, mock_bot, default_chat_ids=[100], db_manager=notification_db
+        )
+        event = AgentResponseEvent(chat_id=100, text="hello", parse_mode="invalid")
+        await service.handle_response(event)
+        await service._deliver(event)
+        async with notification_db.get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT next_chunk, retry_at, last_error FROM notification_outbox "
+                "WHERE event_id = ?",
+                (event.id,),
+            )
+            row = await cursor.fetchone()
+        assert row["next_chunk"] == 0
+        assert row["retry_at"] is None
+        assert "Unsupported parse_mode" in row["last_error"]
+        mock_bot.send_message.assert_not_awaited()
+
+    async def test_drain_count_excludes_failed_deliveries(self, service, monkeypatch):
+        logger = MagicMock()
+        monkeypatch.setattr(service_module, "logger", logger)
+        service._running = False
+        service._deliver = AsyncMock(side_effect=[RuntimeError("failed"), None])
+        for text in ("bad", "good"):
+            await service.handle_response(AgentResponseEvent(chat_id=100, text=text))
+        await service._process_send_queue()
+        logger.info.assert_called_once_with(
+            "Drained queued notifications on shutdown", count=1
+        )
+
     async def test_resolve_chat_ids_specific(
         self, service: NotificationService
     ) -> None:

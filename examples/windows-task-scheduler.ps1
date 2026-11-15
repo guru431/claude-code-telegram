@@ -10,13 +10,16 @@
 # -ProjectRoot overrides the auto-detected repository checkout.
 # -DryRun prints the action that would be registered and exits without
 # prompting for credentials or touching Task Scheduler.
+# -Elevated explicitly opts into administrator privileges; default is Limited.
 param(
     [string]$ProjectRoot,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$Elevated
 )
 
 $t_name  = 'claude-code-telegram'
 $t_dir   = '\'
+$t_level = if ($Elevated) { 'Highest' } else { 'Limited' }
 
 # Project root = the repository checkout, i.e. the PARENT of this examples/
 # directory (.venv and src/ live there, not next to this script). Using
@@ -66,6 +69,7 @@ if ($DryRun) {
     Write-Host "Execute      : $t_exe"
     Write-Host "Argument     : $t_arg"
     Write-Host "Working dir  : $($action.WorkingDirectory)"
+    Write-Host "Run level    : $t_level"
     Write-Host "(dry run - nothing registered)"
     exit 0
 }
@@ -89,7 +93,7 @@ try {
         -Action $action `
         -Trigger $trigger `
         -Settings $settings `
-        -RunLevel Highest `
+        -RunLevel $t_level `
         -User $cred.UserName `
         -Password $plainPwd `
         -Force | Out-Null

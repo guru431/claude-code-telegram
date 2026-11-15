@@ -10,9 +10,11 @@ Features:
 
 import asyncio
 import bz2
+import codecs
 import gzip
 import lzma
 import os
+import re
 import shutil
 import sys
 import tarfile
@@ -263,13 +265,38 @@ class FileHandler:
         if ext in self.code_extensions:
             return "code"
 
-        # Check if text
+        return "text" if self._text_encoding(file_path) is not None else "binary"
+
+    @staticmethod
+    def _text_encoding(file_path: Path) -> str | None:
+        """Detect BOM-marked Unicode or printable UTF-8/Latin-1 from a sample."""
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                f.read(1024)  # Try reading first 1KB
-            return "text"
-        except (UnicodeDecodeError, IOError):
-            return "binary"
+            with file_path.open("rb") as stream:
+                sample = stream.read(4096)
+        except OSError:
+            return None
+        # UTF-32 LE starts with the UTF-16 LE BOM, so check it first.
+        if sample.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+            encoding = "utf-32"
+        elif sample.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+            encoding = "utf-16"
+        else:
+            encoding = "utf-8-sig"
+        try:
+            text = codecs.getincrementaldecoder(encoding)().decode(sample, final=False)
+        except UnicodeDecodeError:
+            if encoding != "utf-8-sig":
+                return None
+            encoding = "latin-1"
+            text = sample.decode(encoding)
+        if "\x00" in text or (
+            text
+            and sum(not (char.isprintable() or char in "\t\n\r") for char in text)
+            / len(text)
+            > 0.05
+        ):
+            return None
+        return encoding
 
     async def _process_archive(self, archive_path: Path, context: str) -> ProcessedFile:
         """Extract and analyze archive contents.
@@ -551,7 +578,8 @@ class FileHandler:
         one more, to tell whether anything was cut) are read: an upload may be
         as large as MAX_FILE_UPLOAD_SIZE_MB.
         """
-        with open(file_path, encoding="utf-8", errors="ignore") as fh:
+        encoding = FileHandler._text_encoding(file_path) or "utf-8"
+        with open(file_path, encoding=encoding, errors="replace") as fh:
             content = fh.read(MAX_INLINE_CONTENT + 1)
         if len(content) > MAX_INLINE_CONTENT:
             content = content[:MAX_INLINE_CONTENT] + "\n...[truncated]"
@@ -748,18 +776,15 @@ class FileHandler:
         return list(set(frameworks))  # Remove duplicates
 
     def _find_todos(self, directory: Path) -> int:
-        """Count TODO and FIXME comments"""
+        """Count explicit TODO:/FIXME: markers in the analyzed source files."""
         todo_count = 0
 
-        for file_path in directory.rglob("*"):
-            if file_path.is_file() and file_path.suffix.lower() in self.code_extensions:
-                try:
-                    content = file_path.read_text(encoding="utf-8", errors="ignore")
-                    # Count TODOs and FIXMEs
-                    todo_count += content.upper().count("TODO")
-                    todo_count += content.upper().count("FIXME")
-                except Exception:
-                    continue
+        for file_path in self._find_code_files(directory):
+            try:
+                content = file_path.read_text(encoding="utf-8", errors="ignore")
+                todo_count += len(re.findall(r"\b(?:TODO|FIXME)\b\s*:", content, re.I))
+            except OSError:
+                continue
 
         return todo_count
 

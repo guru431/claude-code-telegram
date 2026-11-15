@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.bot.features.git_integration import GitError
+from src.bot.features.git_integration import GitError, GitStatus
 from src.bot.handlers import callback, command
 from src.bot.handlers.message import _format_error_message
 from src.claude.sdk_integration import ClaudeResponse
@@ -253,8 +253,11 @@ async def test_continue_exception_does_not_leak_raw_error(settings, monkeypatch)
     assert "/srv/secret/host/path" not in _sent_texts(update)
 
 
-def _git_context(settings, error: Exception):
+def _git_context(settings, error: Exception | None):
     git = MagicMock()
+    git.execute_git_command = AsyncMock(
+        return_value=(str(settings.approved_directory) + "\n", "")
+    )
     git.get_status = AsyncMock(side_effect=error)
     features = MagicMock()
     features.is_enabled.return_value = True
@@ -263,6 +266,51 @@ def _git_context(settings, error: Exception):
     context.bot_data = {"settings": settings, "features": features}
     context.user_data = {}
     return context
+
+
+async def test_git_command_recognizes_repository_subdirectory(settings):
+    subdirectory = settings.approved_directory / "src"
+    subdirectory.mkdir()
+    context = _git_context(settings, None)
+    context.user_data["current_directory"] = subdirectory
+    git = context.bot_data["features"].get_git_integration()
+    git.get_status = AsyncMock(return_value=GitStatus("main", [], [], [], [], 0, 0))
+    update = _continue_update()
+    await command.git_command(update, context)
+    assert "Git Repository Status" in _sent_texts(update)
+    git.execute_git_command.assert_awaited_once_with(
+        ["git", "rev-parse", "--show-toplevel"], subdirectory
+    )
+    git.get_status.assert_awaited_once_with(subdirectory)
+
+
+async def test_git_command_does_not_use_repository_above_approved_root(settings):
+    context = _git_context(settings, None)
+    git = context.bot_data["features"].get_git_integration()
+    git.execute_git_command.return_value = (str(settings.approved_directory.parent), "")
+    update = _continue_update()
+    await command.git_command(update, context)
+    assert "Not a Git Repository" in _sent_texts(update)
+    git.get_status.assert_not_awaited()
+
+
+async def test_cd_validator_does_not_reveal_host_paths(settings):
+    query = MagicMock()
+    query.from_user.id = 1
+    query.edit_message_text = AsyncMock()
+    context = MagicMock()
+    validator = MagicMock()
+    validator.validate_path.return_value = (
+        False,
+        None,
+        "Outside root /private/host/path",
+    )
+    context.bot_data = {"settings": settings, "security_validator": validator}
+    context.user_data = {}
+    await callback.handle_cd_callback(query, "bad", context)
+    text = query.edit_message_text.await_args.args[0]
+    assert "Access Denied" in text
+    assert "/private/host/path" not in text
 
 
 async def test_git_command_hides_unexpected_error(settings):

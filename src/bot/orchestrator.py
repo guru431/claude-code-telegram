@@ -682,7 +682,7 @@ class MessageOrchestrator:
         context.user_data["claude_session_id"] = session.session_id if session else None
         context.user_data.pop("force_new_session", None)
         await update.message.reply_text(
-            f"Agent: <b>{provider}</b>. "
+            f"Agent: <b>{escape_html(provider)}</b>. "
             + ("Previous session restored." if session else "Ready for a new session."),
             parse_mode="HTML",
         )
@@ -877,7 +877,7 @@ class MessageOrchestrator:
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
-        dir_display = f"<code>{current_dir}/</code>"
+        dir_display = f"<code>{escape_html(str(current_dir))}/</code>"
 
         safe_name = escape_html(user.first_name)
         await update.message.reply_text(
@@ -1137,31 +1137,31 @@ class MessageOrchestrator:
             if path:
                 # Show just the filename, not the full path (either separator:
                 # the bot runs on Windows)
-                return re.split(r"[\\/]", path)[-1]
+                return redact_secrets(re.split(r"[\\/]", path)[-1])
         if tool_name in ("Glob", "Grep"):
             pattern = tool_input.get("pattern", "")
             if pattern:
-                return pattern[:60]
+                return redact_secrets(pattern)[:60]
         if tool_name == "Bash":
             cmd = tool_input.get("command", "")
             if cmd:
-                return redact_secrets(cmd[:100])[:80]
+                return redact_secrets(cmd)[:80]
         if tool_name in ("WebFetch", "WebSearch"):
             url = tool_input.get("url", "")
             if url:
                 # URL query params often carry tokens that don't match the
                 # generic secret patterns — mask every query-string value.
                 url = re.sub(r"([?&][^=&\s]+=)[^&\s]+", r"\1***", url)
-                return redact_secrets(url[:200])[:60]
-            return redact_secrets(tool_input.get("query", "")[:200])[:60]
+                return redact_secrets(url)[:60]
+            return redact_secrets(tool_input.get("query", ""))[:60]
         if tool_name == "Task":
             desc = tool_input.get("description", "")
             if desc:
-                return redact_secrets(desc[:200])[:60]
+                return redact_secrets(desc)[:60]
         # Generic: show first key's value
         for v in tool_input.values():
             if isinstance(v, str) and v:
-                return redact_secrets(v[:200])[:60]
+                return redact_secrets(v)[:60]
         return ""
 
     @staticmethod
