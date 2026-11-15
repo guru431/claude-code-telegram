@@ -158,13 +158,17 @@ class NotificationService:
                 except asyncio.CancelledError:
                     pass
                 dropped = 0
+                dropped_ids = []
                 while not self._send_queue.empty():
-                    if self._send_queue.get_nowait() is not _SHUTDOWN:
+                    event = self._send_queue.get_nowait()
+                    if event is not _SHUTDOWN:
                         dropped += 1
+                        dropped_ids.append(event.id)
                 logger.error(
                     "Notification service stop timed out",
                     timeout_seconds=_STOP_TIMEOUT_SECONDS,
                     dropped_queued=dropped,
+                    dropped_event_ids=dropped_ids,
                     retained=bool(self.db_manager),
                 )
         logger.info("Notification service stopped")
@@ -254,6 +258,9 @@ class NotificationService:
             # already handled inside _rate_limited_send; this guards anything else.
             try:
                 await self._deliver(event)
+            except asyncio.CancelledError:
+                self._log_interrupted_delivery(event)
+                raise
             except Exception as e:
                 logger.error(
                     "Notification delivery failed, continuing",
@@ -271,6 +278,9 @@ class NotificationService:
                 continue
             try:
                 await self._deliver(event)
+            except asyncio.CancelledError:
+                self._log_interrupted_delivery(event)
+                raise
             except Exception as e:
                 logger.error(
                     "Notification delivery failed during drain",
@@ -280,6 +290,14 @@ class NotificationService:
             drained += 1
         if drained:
             logger.info("Drained queued notifications on shutdown", count=drained)
+
+    def _log_interrupted_delivery(self, event: AgentResponseEvent) -> None:
+        logger.error(
+            "Notification delivery interrupted",
+            event_id=event.id,
+            originating_event_id=event.originating_event_id,
+            retained=bool(self.db_manager),
+        )
 
     async def _deliver(self, event: AgentResponseEvent) -> None:
         """Send one event to all its resolved chats with rate limiting."""

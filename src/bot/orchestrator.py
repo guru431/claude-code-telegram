@@ -1648,10 +1648,9 @@ class MessageOrchestrator:
                                 update.message.message_id if i == 0 else None
                             ),
                         )
-                    except Exception as plain_err:
+                    except Exception:
                         await update.message.reply_text(
                             f"Failed to deliver response "
-                            f"(Telegram error: {str(plain_err)[:150]}). "
                             f"Please try again.",
                             reply_to_message_id=(
                                 update.message.message_id if i == 0 else None
@@ -2940,13 +2939,13 @@ class MessageOrchestrator:
                 display_path = Path(sess.cwd).name or sess.cwd
 
             short_id = sess.session_id.removeprefix(CODEX_PREFIX)[:8]
-            age = datetime.now(UTC) - sess.when
-            if age.days > 0:
-                age_str = f"{age.days}d ago"
-            elif age.seconds >= 3600:
-                age_str = f"{age.seconds // 3600}h ago"
+            age_s = max(0, int((datetime.now(UTC) - sess.when).total_seconds()))
+            if age_s >= 86400:
+                age_str = f"{age_s // 86400}d ago"
+            elif age_s >= 3600:
+                age_str = f"{age_s // 3600}h ago"
             else:
-                age_str = f"{age.seconds // 60}m ago"
+                age_str = f"{age_s // 60}m ago"
 
             # "active" is the session the next message in the current
             # directory actually resumes. The plain marker means "stored as

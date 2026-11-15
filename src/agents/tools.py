@@ -275,6 +275,8 @@ class ProjectTools:
             return f"Edited {path.name}"
         lines = text.splitlines()
         start = arguments.get("start_line", 1)
+        if start > len(lines):
+            return f"{path.name}: start_line {start} beyond end of file ({len(lines)} lines)"
         stop = min(len(lines), start + arguments.get("max_lines", 120) - 1)
         rows = []
         output_size = 0

@@ -71,6 +71,7 @@ async def _format_progress_update(update_obj) -> Optional[str]:
         percentage = update_obj.get_progress_percentage()
         if percentage is not None:
             # Create a simple progress bar
+            percentage = max(0, min(100, percentage))
             filled = int(percentage / 10)  # 0-10 scale
             bar = "█" * filled + "░" * (10 - filled)
             progress_text += f"\n\n<code>{bar}</code> {percentage}%"
@@ -384,9 +385,7 @@ async def _send_formatted_messages(
                     error=str(plain_err),
                 )
                 await update.message.reply_text(
-                    f"Failed to deliver response "
-                    f"(Telegram error: {str(plain_err)[:150]}). "
-                    f"Please try again.",
+                    "Failed to deliver response. Please try again.",
                     reply_to_message_id=(update.message.message_id if i == 0 else None),
                 )
 

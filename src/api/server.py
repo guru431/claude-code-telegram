@@ -15,7 +15,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 
 from ..config.settings import Settings
 from ..events.bus import EventBus
-from ..events.types import WebhookEvent
+from ..events.types import MAX_WEBHOOK_ATTEMPTS, WebhookEvent
 from ..storage.database import DatabaseManager
 from .auth import verify_github_signature, verify_shared_secret
 
@@ -262,10 +262,19 @@ async def _claim_and_replay(
     try:
         async with db_manager.get_connection() as conn:
             cursor = await conn.execute(
-                "UPDATE webhook_events SET last_attempt_at = ? "
-                "WHERE processed = 0" + where_extra + " "
+                "UPDATE webhook_events SET processed = 2, "
+                "last_error = COALESCE(last_error, 'Retry budget exhausted') "
+                "WHERE processed = 0 AND COALESCE(attempts, 0) >= ?" + where_extra,
+                (MAX_WEBHOOK_ATTEMPTS, *params),
+            )
+            if cursor.rowcount:
+                logger.warning("Webhook retry budget exhausted", count=cursor.rowcount)
+            cursor = await conn.execute(
+                "UPDATE webhook_events SET last_attempt_at = ?, "
+                "attempts = COALESCE(attempts, 0) + 1, last_error = NULL "
+                "WHERE processed = 0 AND COALESCE(attempts, 0) < ?" + where_extra + " "
                 "RETURNING provider, event_type, delivery_id, payload",
-                (now, *params),
+                (now, MAX_WEBHOOK_ATTEMPTS, *params),
             )
             rows = list(await cursor.fetchall())
             await conn.commit()
@@ -289,6 +298,7 @@ async def _claim_and_replay(
             event_type_name=row_dict["event_type"],
             payload=payload,
             delivery_id=row_dict.get("delivery_id") or "",
+            attempt_recorded=True,
         )
         await event_bus.publish(event)
         replayed += 1
@@ -305,7 +315,7 @@ async def recover_unprocessed_webhooks(
     completed rows (``processed=1``) are excluded. Each claimed row is stamped
     in-flight (``last_attempt_at``) before publishing so the first retry sweep
     does not immediately replay it again; the agent handler flips the row to 1
-    on success or bumps ``attempts``/dead-letters it on failure.
+    on success or records its failure. The claim reserves an attempt first.
     """
     replayed = await _claim_and_replay(db_manager, event_bus, "", ())
     if replayed:
@@ -322,8 +332,9 @@ async def retry_pending_webhooks(
     """Periodic retry sweep: replay pending deliveries whose backoff has elapsed.
 
     Backoff is exponential per attempt (``base_delay_seconds * 2**attempts``).
-    Rows that exhausted their retry budget are already dead-lettered
-    (``processed=2``) and excluded. A ``processed=0`` row never attempted yet
+    Exhausted orphaned claims are dead-lettered by the sweep itself. A row
+    still in flight keeps its grace period even when its backoff is shorter.
+    A ``processed=0`` row never attempted yet
     (``last_attempt_at IS NULL``) is normally still in flight — the initial
     publish runs the agent as a background task for minutes — so it becomes
     eligible only once its ``received_at`` is older than
@@ -339,14 +350,23 @@ async def retry_pending_webhooks(
         "   datetime(received_at) <= datetime('now', '-' || ? || ' seconds')) OR"
         "  (last_attempt_at IS NOT NULL AND"
         "   datetime(last_attempt_at) <="
-        "   datetime('now', '-' || (? * (1 << attempts)) || ' seconds'))"
+        "   datetime('now', '-' || (CASE WHEN last_error IS NULL "
+        "    THEN MAX(?, ? * (1 << MIN(COALESCE(attempts, 0), ?))) "
+        "    ELSE ? * (1 << MIN(COALESCE(attempts, 0), ?)) END) || ' seconds'))"
         ")"
     )
     replayed = await _claim_and_replay(
         db_manager,
         event_bus,
         where_extra,
-        (in_flight_grace_seconds, base_delay_seconds),
+        (
+            in_flight_grace_seconds,
+            in_flight_grace_seconds,
+            base_delay_seconds,
+            MAX_WEBHOOK_ATTEMPTS,
+            base_delay_seconds,
+            MAX_WEBHOOK_ATTEMPTS,
+        ),
     )
     if replayed:
         logger.info("Retried pending webhook events", count=replayed)

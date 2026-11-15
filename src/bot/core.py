@@ -199,7 +199,11 @@ class ClaudeCodeBot:
         return middleware_wrapper
 
     async def start(self) -> None:
-        """Start the bot."""
+        """Start the bot; the owner must call stop() in its shutdown finally.
+
+        run_application owns teardown after draining agent and notification
+        tasks that still use PTB. Cancellation here only ends the keepalive.
+        """
         if self.is_running:
             logger.warning("Bot is already running")
             return

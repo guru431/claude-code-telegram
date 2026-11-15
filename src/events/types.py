@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional
 
 from .bus import Event
 
+MAX_WEBHOOK_ATTEMPTS = 3
+
 
 @dataclass
 class WebhookEvent(Event):
@@ -15,6 +17,9 @@ class WebhookEvent(Event):
     event_type_name: str = ""
     payload: Dict[str, Any] = field(default_factory=dict)
     delivery_id: str = ""
+    # Replay claims reserve an attempt before publishing, including crashes
+    # that never reach the handler's failure checkpoint.
+    attempt_recorded: bool = False
     source: str = "webhook"
 
 

@@ -1221,10 +1221,19 @@ def check_bash_directory_boundary(
                     f"against approved directory '{resolved_approved}'"
                 )
 
+            # A literal filename may contain '='; check it before extracting
+            # a value so '../../outside/file=notes.txt' cannot hide an escape.
+            if "=" in token and _path_escapes(token):
+                return False, (
+                    f"Directory boundary violation: '{base_command}' targets "
+                    f"'{token}' which is outside approved directory "
+                    f"'{resolved_approved}'"
+                )
+
             # ``key=value`` operands (e.g. ``dd of=/etc/shadow``) hide the real
             # path on the right of ``=``; resolving the whole token would treat
             # ``of=/etc/shadow`` as a relative name inside the working dir and
-            # miss the escape. Check the value part instead.
+            # miss the escape. Check the value part as well.
             if "=" in token:
                 token = token.split("=", 1)[1]
                 # The value side may itself be a URL (e.g. ``url=https://…``);

@@ -682,7 +682,10 @@ async def run_application(app: Dict[str, Any]) -> int:
         # The restart intent comes from the flag ``restart_command`` sets, not
         # from the signal number: SIGBREAK exists only on Windows, so on Linux
         # a signal-derived check can never fire and /restart would exit 0.
-        core_task_exited = any(task is not shutdown_task for task in done)
+        core_task_exited = (
+            not shutdown_event.is_set()
+            and any(task is not shutdown_task for task in done)
+        )
         restart_requested = bool(
             bot.app is not None and bot.app.bot_data.get("restart_requested")
         )

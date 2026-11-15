@@ -93,6 +93,9 @@ async def handle_callback_query(
     query = update.callback_query
     user_id = query.from_user.id
     data = query.data
+    if not isinstance(data, str) or not data:
+        await query.answer()
+        return
 
     # The contextual formatting buttons answer the query themselves (with a
     # toast) in their routed branch below; pre-answering here would make a

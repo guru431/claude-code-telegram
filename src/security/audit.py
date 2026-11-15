@@ -529,27 +529,22 @@ class AuditLogger:
             "/.ssh/",
             "/.aws/",
             "/secrets/",
-            "config",
-            "password",
-            "key",
-            "token",
         ]
 
         risky_actions = {"delete", "write"}
 
         path_lower = file_path.replace("\\", "/").lower()
+        name_tokens = set(re.split(r"[^a-z0-9]+", path_lower.rsplit("/", 1)[-1]))
+        sensitive = bool(name_tokens & {"config", "password", "key", "token"}) or any(
+            marker in path_lower for marker in sensitive_paths
+        )
 
         # High risk: sensitive paths with write/delete
-        if action in risky_actions and any(
-            sensitive in path_lower for sensitive in sensitive_paths
-        ):
+        if action in risky_actions and sensitive:
             return "high"
 
         # Medium risk: any sensitive path access or risky actions
-        if (
-            any(sensitive in path_lower for sensitive in sensitive_paths)
-            or action in risky_actions
-        ):
+        if sensitive or action in risky_actions:
             return "medium"
 
         return "low"

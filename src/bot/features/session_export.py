@@ -93,6 +93,7 @@ class SessionExporter:
             "user_id": session_model.user_id,
             "created_at": session_model.created_at,
             "updated_at": session_model.last_used,
+            "message_count": len(message_models),
         }
         messages: list[dict[str, Any]] = []
         for msg in reversed(message_models):
@@ -163,7 +164,7 @@ class SessionExporter:
         lines.append(f"**Created:** {_iso(session.get('created_at'))}")
         if session.get("updated_at"):
             lines.append(f"**Last Updated:** {_iso(session['updated_at'])}")
-        lines.append(f"**Message Count:** {len(messages)}")
+        lines.append(f"**Message Count:** {session['message_count']}")
         lines.append("\n---\n")
 
         # Messages
@@ -197,7 +198,7 @@ class SessionExporter:
                 # configuration; ``_iso`` accepts both.
                 "created_at": _iso(session.get("created_at")),
                 "updated_at": _iso(session.get("updated_at")),
-                "message_count": len(messages),
+                "message_count": session["message_count"],
             },
             "messages": [
                 {

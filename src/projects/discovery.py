@@ -174,12 +174,13 @@ def write_yaml_atomic(
     written config is a complete one.
     """
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(config_path.parent), prefix=f"{config_path.name}.", suffix=".tmp"
-    )
-    tmp_path = Path(tmp_name)
+    tmp_path = None
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=config_path.parent,
+            prefix=f"{config_path.name}.", suffix=".tmp", delete=False,
+        ) as f:
+            tmp_path = Path(f.name)
             yaml.dump(
                 payload,
                 f,
@@ -190,11 +191,11 @@ def write_yaml_atomic(
         if validate is not None:
             validate(tmp_path)
         os.replace(tmp_path, config_path)
-    except Exception:
+    finally:
         # A failed dump or a rejected candidate would otherwise leave a
         # truncated temp file next to projects.yaml, one per failed run.
-        tmp_path.unlink(missing_ok=True)
-        raise
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
 def discover_new_projects(

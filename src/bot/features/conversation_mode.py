@@ -33,6 +33,7 @@ import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ...claude.sdk_integration import ClaudeResponse
+from ..utils.html_format import escape_html, markdown_to_telegram_html
 
 logger = structlog.get_logger()
 
@@ -355,16 +356,15 @@ class ConversationEnhancer:
         """Format response with follow-up suggestions."""
         # Truncate content only for extremely large responses;
         # normal splitting into multiple Telegram messages is handled by the caller.
-        content = response.content
-        if len(content) > max_content_length:
-            content = (
-                content[:max_content_length] + "\n\n... <i>(response truncated)</i>"
-            )
+        truncated = len(response.content) > max_content_length
+        content = markdown_to_telegram_html(response.content[:max_content_length])
+        if truncated:
+            content += "\n\n... <i>(response truncated)</i>"
 
         # Add session info if this is a new session
         if context.conversation_turn == 1 and response.session_id:
             session_info = (
-                f"\n\n🆔 <b>Session:</b> <code>{response.session_id[:8]}...</code>"
+                f"\n\n🆔 <b>Session:</b> <code>{escape_html(response.session_id[:8])}...</code>"
             )
             content += session_info
 

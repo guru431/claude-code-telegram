@@ -18,7 +18,12 @@ from ..claude.facade import ClaudeIntegration
 from ..storage.database import DatabaseManager
 from ..utils.constants import AUTOMATION_USER_ID
 from .bus import Event, EventBus
-from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
+from .types import (
+    MAX_WEBHOOK_ATTEMPTS,
+    AgentResponseEvent,
+    ScheduledEvent,
+    WebhookEvent,
+)
 
 logger = structlog.get_logger()
 
@@ -30,7 +35,6 @@ _MAX_CONCURRENT_AGENT_RUNS = 3
 # Max delivery attempts before a webhook is dead-lettered (processed=2). The
 # retry sweep replays processed=0 rows below this cap; at the cap the row is
 # parked and surfaced via /events.
-_MAX_WEBHOOK_ATTEMPTS = 3
 
 # Webhook payloads are untrusted external input (PR/issue bodies, etc.) that run
 # unattended with no human-in-the-loop. A prompt-injection payload could turn a
@@ -166,7 +170,7 @@ class AgentHandler:
                 event_id=event.id,
             )
             attempts, dead = await self._mark_webhook_failed(
-                event.delivery_id, str(exc)
+                event.delivery_id, str(exc), attempt_recorded=event.attempt_recorded
             )
             # Notify only when retries are exhausted (dead-letter) or when there
             # is no persistence to retry from — otherwise the retry sweep will
@@ -358,12 +362,13 @@ class AgentHandler:
             )
 
     async def _mark_webhook_failed(
-        self, delivery_id: str, error: str
+        self, delivery_id: str, error: str, *, attempt_recorded: bool = False
     ) -> tuple[int, bool]:
         """Record a failed webhook run; dead-letter it when retries run out.
 
-        Increments ``attempts`` and stamps ``last_error``/``last_attempt_at``.
-        Once attempts reach ``_MAX_WEBHOOK_ATTEMPTS`` the row is moved to the
+        Counts the initial failure, or uses the attempt already reserved by a
+        replay claim, and stamps ``last_error``/``last_attempt_at``.
+        Once attempts reach ``MAX_WEBHOOK_ATTEMPTS`` the row is moved to the
         dead-letter state (``processed=2``) so the retry sweep skips it. Returns
         ``(attempts, dead)``; a no-op ``(0, False)`` when no db_manager is wired.
         """
@@ -376,21 +381,21 @@ class AgentHandler:
                 # RETURNING (SQLite 3.35+) so a concurrent retry sweep can't read
                 # a stale count between a separate UPDATE and SELECT.
                 cursor = await conn.execute(
-                    "UPDATE webhook_events SET attempts = attempts + 1, "
+                    "UPDATE webhook_events SET attempts = COALESCE(attempts, 0) + ?, "
                     "last_error = ?, last_attempt_at = ? WHERE delivery_id = ? "
                     "RETURNING attempts",
-                    (error[:1000], now, delivery_id),
+                    (0 if attempt_recorded else 1, error[:1000], now, delivery_id),
                 )
                 row = await cursor.fetchone()
                 attempts = int(row[0]) if row else 0
-                dead = attempts >= _MAX_WEBHOOK_ATTEMPTS
+                dead = attempts >= MAX_WEBHOOK_ATTEMPTS
                 if dead:
                     # Re-check the cap in the WHERE clause so the dead-letter
                     # flip only ever applies once the threshold is durably met.
                     await conn.execute(
                         "UPDATE webhook_events SET processed = 2 "
                         "WHERE delivery_id = ? AND attempts >= ?",
-                        (delivery_id, _MAX_WEBHOOK_ATTEMPTS),
+                        (delivery_id, MAX_WEBHOOK_ATTEMPTS),
                     )
                 await conn.commit()
                 return attempts, dead

@@ -15,7 +15,6 @@ import lzma
 import shutil
 import sys
 import tarfile
-import tempfile
 import uuid
 import zipfile
 from collections import defaultdict
@@ -85,8 +84,10 @@ class FileHandler:
     def __init__(self, config: Settings, security: SecurityValidator):
         self.config = config
         self.security = security
-        self.temp_dir = Path(tempfile.gettempdir()) / "claude_bot_files"
-        self.temp_dir.mkdir(exist_ok=True)
+        self.temp_dir = Path(__file__).resolve().parents[3] / ".tmp" / "uploads"
+        self.temp_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name == "posix":
+            self.temp_dir.chmod(0o700)
 
         # Supported code extensions
         self.code_extensions = {

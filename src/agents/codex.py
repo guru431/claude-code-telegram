@@ -120,8 +120,11 @@ class CodexRPC:
         await self.send({"method": "initialized"})
 
     async def send(self, message: Dict[str, Any]) -> None:
-        self.process.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
-        await self.process.stdin.drain()
+        try:
+            self.process.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
+            await self.process.stdin.drain()
+        except OSError as exc:
+            raise ClaudeProcessError("Could not send request to Codex app-server") from exc
 
     async def request(self, method: str, params: Any = None) -> Any:
         self._sequence += 1
@@ -142,8 +145,11 @@ class CodexRPC:
                     future = self.pending.get(message["id"])
                     if future is not None and not future.done():
                         if "error" in message:
+                            error = message["error"]
                             detail = redact_secrets(
-                                str(message["error"].get("message", "RPC error"))
+                                str(error.get("message", "RPC error"))
+                                if isinstance(error, dict)
+                                else str(error or "RPC error")
                             )
                             future.set_exception(ClaudeProcessError(detail))
                         else:
@@ -448,9 +454,25 @@ class CodexManager:
                 and self.config.enable_mcp
                 and self.config.mcp_config_path
             ):
-                raw = json.loads(
-                    self.config.mcp_config_path.read_text(encoding="utf-8")
-                )
+                try:
+                    raw = json.loads(
+                        self.config.mcp_config_path.read_text(encoding="utf-8")
+                    )
+                    if not isinstance(raw, dict) or not isinstance(
+                        raw.get("mcpServers", {}), dict
+                    ):
+                        raise ValueError("Invalid MCP configuration")
+                    if any(
+                        not isinstance(value, dict)
+                        for value in raw.get("mcpServers", {}).values()
+                    ):
+                        raise ValueError("Invalid MCP server configuration")
+                except (OSError, ValueError) as exc:
+                    logger.warning(
+                        "Could not load Codex MCP configuration",
+                        error_type=type(exc).__name__,
+                    )
+                    raw = {}
                 for name, value in raw.get("mcpServers", {}).items():
                     server = {
                         k: v
