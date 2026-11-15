@@ -124,7 +124,9 @@ class CodexRPC:
             self.process.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
             await self.process.stdin.drain()
         except OSError as exc:
-            raise ClaudeProcessError("Could not send request to Codex app-server") from exc
+            raise ClaudeProcessError(
+                "Could not send request to Codex app-server"
+            ) from exc
 
     async def request(self, method: str, params: Any = None) -> Any:
         self._sequence += 1

@@ -32,10 +32,6 @@ logger = structlog.get_logger()
 # the semaphore bounds how many run at once to avoid overwhelming the SDK.
 _MAX_CONCURRENT_AGENT_RUNS = 3
 
-# Max delivery attempts before a webhook is dead-lettered (processed=2). The
-# retry sweep replays processed=0 rows below this cap; at the cap the row is
-# parked and surfaced via /events.
-
 # Webhook payloads are untrusted external input (PR/issue bodies, etc.) that run
 # unattended with no human-in-the-loop. A prompt-injection payload could turn a
 # full tool set into RCE inside the approved directory. Restrict webhook-driven

@@ -535,6 +535,7 @@ class AuditLogger:
 
         path_lower = file_path.replace("\\", "/").lower()
         name_tokens = set(re.split(r"[^a-z0-9]+", path_lower.rsplit("/", 1)[-1]))
+        name_tokens.update(path_lower.split("/")[:-1])
         sensitive = bool(name_tokens & {"config", "password", "key", "token"}) or any(
             marker in path_lower for marker in sensitive_paths
         )

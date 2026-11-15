@@ -338,3 +338,87 @@ async def test_retry_sweep_excludes_dead_letter(tmp_path, migrated_db) -> None:
     assert bus.publish.await_args.args[0].delivery_id == "pending"
 
     await storage.close()
+
+
+async def test_orphaned_webhook_claims_exhaust_budget_without_handler(
+    tmp_path, migrated_db
+):
+    storage = Storage(f"sqlite:///{migrated_db(tmp_path / 'orphan.db')}")
+    await storage.initialize()
+    db = storage.db_manager
+    bus = AsyncMock()
+    try:
+        await _try_record_webhook(
+            db,
+            event_id="orphan",
+            provider="github",
+            event_type="issues",
+            delivery_id="orphan",
+            payload={},
+        )
+        for attempt in range(1, 4):
+            assert (
+                await retry_pending_webhooks(
+                    db, bus, base_delay_seconds=0, in_flight_grace_seconds=0
+                )
+                == 1
+            )
+            assert bus.publish.call_args.args[0].attempt_recorded
+            async with db.get_connection() as conn:
+                cursor = await conn.execute(
+                    "SELECT attempts FROM webhook_events WHERE delivery_id='orphan'"
+                )
+                assert (await cursor.fetchone())[0] == attempt
+        assert (
+            await retry_pending_webhooks(
+                db, bus, base_delay_seconds=0, in_flight_grace_seconds=0
+            )
+            == 0
+        )
+        assert await recover_unprocessed_webhooks(db, bus) == 0
+        async with db.get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT processed FROM webhook_events WHERE delivery_id='orphan'"
+            )
+            assert (await cursor.fetchone())[0] == 2
+        assert bus.publish.await_count == 3
+    finally:
+        await storage.close()
+
+
+async def test_replayed_failure_does_not_double_count_and_inflight_keeps_lease(
+    tmp_path, migrated_db
+):
+    from src.events.handlers import AgentHandler
+
+    storage = Storage(f"sqlite:///{migrated_db(tmp_path / 'claim.db')}")
+    await storage.initialize()
+    db = storage.db_manager
+    bus = AsyncMock()
+    try:
+        await _try_record_webhook(
+            db,
+            event_id="claim",
+            provider="github",
+            event_type="issues",
+            delivery_id="claim",
+            payload={},
+        )
+        assert await recover_unprocessed_webhooks(db, bus) == 1
+        # Zero backoff does not make a live claim eligible before its grace.
+        assert await retry_pending_webhooks(db, bus, base_delay_seconds=0) == 0
+        handler = AgentHandler(
+            event_bus=bus,
+            claude_integration=AsyncMock(),
+            default_working_directory=tmp_path,
+            db_manager=db,
+        )
+        assert await handler._mark_webhook_failed(
+            "claim", "boom", attempt_recorded=True
+        ) == (1, False)
+        assert await retry_pending_webhooks(db, bus, base_delay_seconds=0) == 1
+        assert await handler._mark_webhook_failed(
+            "claim", "boom", attempt_recorded=True
+        ) == (2, False)
+    finally:
+        await storage.close()

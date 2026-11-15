@@ -1016,12 +1016,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 # any backtick run in the file, otherwise a file containing ```
                 # closes the block early and the rest is read as prompt.
                 caption = update.message.caption or "Please review this file:"
+                display_name = " ".join(file_name.splitlines())
                 longest_run = max(
-                    (len(m) for m in re.findall(r"`+", content)), default=0
+                    (len(m) for m in re.findall(r"`+", content + display_name)),
+                    default=0,
                 )
                 fence = "`" * max(3, longest_run + 1)
                 prompt = (
-                    f"{caption}\n\n**File:** `{file_name}`\n\n"
+                    f"{caption}\n\n**File:** {fence} {display_name} {fence}\n\n"
                     f"{fence}\n{content}\n{fence}"
                 )
 

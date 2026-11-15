@@ -177,8 +177,12 @@ def write_yaml_atomic(
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=config_path.parent,
-            prefix=f"{config_path.name}.", suffix=".tmp", delete=False,
+            mode="w",
+            encoding="utf-8",
+            dir=config_path.parent,
+            prefix=f"{config_path.name}.",
+            suffix=".tmp",
+            delete=False,
         ) as f:
             tmp_path = Path(f.name)
             yaml.dump(

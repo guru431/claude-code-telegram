@@ -12,6 +12,7 @@ import asyncio
 import bz2
 import gzip
 import lzma
+import os
 import shutil
 import sys
 import tarfile
@@ -220,9 +221,8 @@ class FileHandler:
                 f"Max: {max_mb}MB."
             )
 
-        # Per-request directory isolates this download from every other. 0700:
-        # the shared parent lives in the system temp dir, where other local
-        # users of a POSIX host could otherwise read the upload.
+        # Per-request directory isolates this download from every other. Both
+        # it and the project-local upload parent are private on POSIX hosts.
         download_dir = self.temp_dir / str(uuid.uuid4())
         download_dir.mkdir(mode=0o700)
 

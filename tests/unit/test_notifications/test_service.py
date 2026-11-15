@@ -332,8 +332,9 @@ class TestNotificationService:
     ) -> None:
         """A graceful stop still delivers messages left in the send queue."""
         await service.start()
-        for i in range(3):
-            await service.handle_response(AgentResponseEvent(chat_id=100 + i, text="x"))
+        events = [AgentResponseEvent(chat_id=100 + i, text="x") for i in range(3)]
+        for event in events:
+            await service.handle_response(event)
         await service.stop()
 
         assert mock_bot.send_message.call_count == 3
@@ -380,14 +381,19 @@ class TestNotificationService:
         mock_bot.send_message = AsyncMock(side_effect=hanging_send)
 
         await service.start()
-        for i in range(3):
-            await service.handle_response(AgentResponseEvent(chat_id=100 + i, text="x"))
+        events = [AgentResponseEvent(chat_id=100 + i, text="x") for i in range(3)]
+        for event in events:
+            await service.handle_response(event)
         await started.wait()
 
         await service.stop()
 
-        log.error.assert_called_once()
-        assert log.error.call_args.kwargs["dropped_queued"] == 2
+        assert log.error.call_count == 2
+        interrupted, timeout = log.error.call_args_list
+        assert interrupted.kwargs["event_id"] == events[0].id
+        assert interrupted.kwargs["retained"] is False
+        assert timeout.kwargs["dropped_queued"] == 2
+        assert timeout.kwargs["dropped_event_ids"] == [event.id for event in events[1:]]
 
     async def test_ignores_non_response_events(
         self, service: NotificationService

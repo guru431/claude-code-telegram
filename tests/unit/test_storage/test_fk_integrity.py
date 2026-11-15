@@ -90,7 +90,9 @@ class TestAuditLogFkMigration:
 
             # Build the pre-migration state: schema through version 7.
             legacy = DatabaseManager(f"sqlite:///{db_path}")
-            async with aiosqlite.connect(db_path) as conn:
+            # Legacy setup is disposable; build it without flushing every DDL
+            # statement, then migrate an actual file through the production path.
+            async with aiosqlite.connect(":memory:") as conn:
                 await conn.execute("PRAGMA foreign_keys = ON")
                 for version, migration in legacy._get_migrations():
                     if version >= 8:
@@ -127,6 +129,9 @@ class TestAuditLogFkMigration:
                         (777, "auth_attempt", True),
                     )
                 await conn.rollback()
+
+                async with aiosqlite.connect(db_path) as target:
+                    await conn.backup(target)
 
             storage = Storage(f"sqlite:///{db_path}")
             await storage.initialize()

@@ -208,6 +208,39 @@ def manager(monkeypatch, settings, state):
     return CodexManager(settings, SecurityValidator(settings.approved_directory), state)
 
 
+@pytest.mark.parametrize(
+    "contents", [None, "{broken", "[]", '{"mcpServers":{"bad":null}}']
+)
+async def test_codex_invalid_mcp_config_keeps_guarded_backend_usable(
+    manager, monkeypatch, tmp_path, contents
+):
+    path = tmp_path / "mcp.json"
+    path.write_text('{"mcpServers":{"valid":{"command":"unused"}}}', encoding="utf-8")
+    # The settings were validated earlier; simulate the file changing later.
+    manager.config.mcp_config_path = path
+    manager.config.enable_mcp = True
+    if contents is None:
+        path.unlink()
+    else:
+        path.write_text(contents, encoding="utf-8")
+    monkeypatch.setattr(
+        FakeRPC,
+        "events_to_send",
+        [
+            event("turn/completed", turn={"status": "completed"}),
+        ],
+    )
+    result = await manager.execute_command("hello", tmp_path)
+    assert not result.is_error
+    config = next(
+        params["config"]
+        for method, params in FakeRPC.instance.calls
+        if method == "thread/start"
+    )
+    assert config["mcp_servers"] == {"unrelated": {"enabled": False}}
+    assert FakeRPC.instance.closed
+
+
 async def test_codex_stream_final_answer_usage_and_isolated_config(
     manager, monkeypatch, tmp_path
 ):

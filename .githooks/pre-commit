@@ -4,7 +4,7 @@
 # personal strings listed in an untracked .sanitize-patterns file.
 #
 # Activate once per clone:   git config core.hooksPath .githooks
-# Bypass a confirmed false positive:   git commit --no-verify
+# Resolve false positives by narrowing the matching rule; never bypass the hook.
 set -eu
 
 repo_root=$(git rev-parse --show-toplevel)
@@ -62,7 +62,7 @@ fi
 if [ "$fail" -ne 0 ]; then
   echo ""
   echo "Commit aborted — this is a PUBLIC repository."
-  echo "Fix the lines above, or for a confirmed false positive: git commit --no-verify"
+  echo "Fix the lines above; verify false positives before adjusting the matching rule."
   exit 1
 fi
 exit 0

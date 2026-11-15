@@ -53,7 +53,9 @@ $t_exe = 'cmd'
 # leave it set to a single space.
 # No trailing `& popd`: it always ran and handed Task Scheduler its own exit
 # code 0, hiding the non-zero exit the bot uses to ask for a restart.
-$t_arg = "/c set `"CLAUDECODE=`" && pushd `"$t_work`" && .venv\Scripts\python.exe -m src.main >> `"$t_work\bot.log`" 2>&1"
+# The application bounds the log size; shell redirection cannot rotate an
+# indefinitely open stdout file on Windows.
+$t_arg = "/c set `"CLAUDECODE=`" && pushd `"$t_work`" && .venv\Scripts\python.exe -m src.main --log-file `"$t_work\bot.log`""
 
 $action   = New-ScheduledTaskAction -Execute $t_exe -Argument $t_arg -WorkingDirectory $t_work
 $trigger  = New-ScheduledTaskTrigger -AtStartup

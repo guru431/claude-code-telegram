@@ -3,15 +3,70 @@
 import json
 import logging
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import structlog
 
 from src.main import (
     _sync_discovered_project_topics,
     apply_configured_log_level,
+    run_application,
     setup_logging,
 )
+
+
+async def test_shutdown_signal_wins_simultaneous_normal_core_return(
+    monkeypatch, tmp_path
+):
+    from src import main as main_module
+    from src.config import create_test_config
+
+    signals = {}
+    monkeypatch.setattr(
+        main_module.signal,
+        "signal",
+        lambda signum, callback: signals.update({signum: callback}),
+    )
+    monkeypatch.setattr("apscheduler.schedulers.asyncio.AsyncIOScheduler", MagicMock())
+    notifications = MagicMock()
+    notifications.start = AsyncMock()
+    notifications.stop = AsyncMock()
+    monkeypatch.setattr(
+        main_module, "NotificationService", MagicMock(return_value=notifications)
+    )
+
+    async def normal_return_during_shutdown():
+        signals[main_module.signal.SIGTERM](None, None)
+
+    bot = SimpleNamespace(
+        initialize=AsyncMock(),
+        start=AsyncMock(side_effect=normal_return_during_shutdown),
+        stop=AsyncMock(),
+        app=SimpleNamespace(bot=object(), bot_data={}),
+        deps={},
+    )
+    bus = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+    agent = SimpleNamespace(aclose=AsyncMock())
+    storage = SimpleNamespace(db_manager=object(), close=AsyncMock())
+    integration = SimpleNamespace(shutdown=AsyncMock())
+    result = await run_application(
+        {
+            "bot": bot,
+            "event_bus": bus,
+            "agent_handler": agent,
+            "storage": storage,
+            "claude_integration": integration,
+            "config": create_test_config(approved_directory=str(tmp_path)),
+            "features": SimpleNamespace(
+                api_server_enabled=False, scheduler_enabled=False
+            ),
+        }
+    )
+    assert result == 0
+    bot.stop.assert_awaited_once()
+    notifications.stop.assert_awaited_once()
+    integration.shutdown.assert_awaited_once()
+    storage.close.assert_awaited_once()
 
 
 def test_request_reference_is_in_production_logs(caplog):

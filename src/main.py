@@ -6,6 +6,7 @@ import logging
 import signal
 import sys
 from datetime import timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -46,15 +47,22 @@ from src.storage.facade import Storage
 from src.storage.session_storage import SQLiteSessionStorage
 
 
-def setup_logging(debug: bool = False) -> None:
+def setup_logging(debug: bool = False, log_file: Path | None = None) -> None:
     """Configure structured logging."""
     level = logging.DEBUG if debug else logging.INFO
 
     # Configure standard logging
+    handler = (
+        RotatingFileHandler(
+            log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        )
+        if log_file is not None
+        else logging.StreamHandler(sys.stdout)
+    )
     logging.basicConfig(
         level=level,
         format="%(message)s",
-        stream=sys.stdout,
+        handlers=[handler],
     )
 
     # httpx/PTB log every request as "HTTP Request: POST
@@ -115,6 +123,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
     parser.add_argument("--config-file", type=Path, help="Path to configuration file")
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        help="Write rotating UTF-8 logs (5 MiB per file, 3 backups)",
+    )
 
     return parser.parse_args()
 
@@ -682,9 +695,8 @@ async def run_application(app: Dict[str, Any]) -> int:
         # The restart intent comes from the flag ``restart_command`` sets, not
         # from the signal number: SIGBREAK exists only on Windows, so on Linux
         # a signal-derived check can never fire and /restart would exit 0.
-        core_task_exited = (
-            not shutdown_event.is_set()
-            and any(task is not shutdown_task for task in done)
+        core_task_exited = not shutdown_event.is_set() and any(
+            task is not shutdown_task for task in done
         )
         restart_requested = bool(
             bot.app is not None and bot.app.bot_data.get("restart_requested")
@@ -769,7 +781,7 @@ async def run_application(app: Dict[str, Any]) -> int:
 async def main() -> None:
     """Main application entry point."""
     args = parse_args()
-    setup_logging(debug=args.debug)
+    setup_logging(debug=args.debug, log_file=args.log_file)
 
     logger = structlog.get_logger()
     logger.info("Starting Claude Code Telegram Bot", version=__version__)

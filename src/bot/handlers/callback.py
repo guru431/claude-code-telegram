@@ -110,7 +110,7 @@ async def handle_callback_query(
         if ":" in data:
             action, param = data.split(":", 1)
         else:
-            action, param = data, None
+            action, param = data, ""
 
         # Route to appropriate handler
         handlers = {

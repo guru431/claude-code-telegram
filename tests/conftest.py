@@ -87,14 +87,14 @@ def _isolate_dotenv(monkeypatch):
 
 
 @pytest.fixture(scope="session")
-def _migrated_db_image(tmp_path_factory) -> bytes:
+def _migrated_db_image() -> bytes:
     """Byte image of a fully migrated database, built once per session.
 
     ``DatabaseManager.initialize()`` runs nine migrations, each committing on
     its own; on Windows that costs ~0.4 s per database. Roughly ninety tests
     build one, which alone blew the 60 s budget for the fast suite. The
     migration list is replayed here once (synchronously — same SQL, same
-    ``schema_version`` rows as the async path) and the resulting file is handed
+    ``schema_version`` rows as the async path) and the resulting image is handed
     to those tests as bytes: ``initialize()`` then finds version 9 and runs no
     migration at all.
 
@@ -103,8 +103,9 @@ def _migrated_db_image(tmp_path_factory) -> bytes:
     """
     from src.storage.database import DatabaseManager
 
-    db_path = tmp_path_factory.mktemp("db-template") / "template.db"
-    conn = sqlite3.connect(db_path)
+    # Building a disposable template in memory avoids a disk flush per DDL
+    # statement, repeated by each parallel worker.
+    conn = sqlite3.connect(":memory:")
     try:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)"
@@ -115,9 +116,9 @@ def _migrated_db_image(tmp_path_factory) -> bytes:
             conn.executescript(migration)
             conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
         conn.commit()
+        return conn.serialize()
     finally:
         conn.close()
-    return db_path.read_bytes()
 
 
 @pytest.fixture

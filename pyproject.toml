@@ -64,6 +64,7 @@ pytest-asyncio = "^1.4.0"
 pytest-cov = "^6.1.1"
 pytest-mock = "^3.14.1"
 pytest-timeout = "^2.4.0"
+pytest-xdist = "^3.8.0"
 black = "^25.1.0"
 isort = "^6.0.1"
 flake8 = "^7.2.0"
@@ -85,7 +86,9 @@ python_files = "test_*.py"
 # набор, бюджет 60 с. `--cov` из addopts убран — покрытие считается по требованию
 # (`pytest --cov=src --cov-report=term-missing`), а не в каждом прогоне: оно
 # тормозит набор и на каждый запуск переписывает htmlcov/.
-addopts = "-m 'not integration and not manual'"
+# Keep each module in one worker so module/session fixtures are reused; cap
+# concurrency on shared hosts. Use -n 0 for serial diagnostics/full runs.
+addopts = "-m 'not integration and not manual' -n 4 --dist=loadfile"
 # pytest-timeout: зависший тест падает за 30 с со стеком, а не держит прогон
 timeout = 30
 markers = [

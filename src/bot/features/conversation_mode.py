@@ -363,9 +363,7 @@ class ConversationEnhancer:
 
         # Add session info if this is a new session
         if context.conversation_turn == 1 and response.session_id:
-            session_info = (
-                f"\n\n🆔 <b>Session:</b> <code>{escape_html(response.session_id[:8])}...</code>"
-            )
+            session_info = f"\n\n🆔 <b>Session:</b> <code>{escape_html(response.session_id[:8])}...</code>"
             content += session_info
 
         # Add cost info if significant
