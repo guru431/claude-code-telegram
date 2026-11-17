@@ -1,6 +1,7 @@
 """Tests for reading session previews out of Claude's JSONL transcripts."""
 
 import json
+from pathlib import Path
 
 from src.claude import local_sessions
 from src.claude.local_sessions import (
@@ -96,7 +97,9 @@ class TestParseSessionTail:
 class TestLoadSessionPreviews:
     def test_finds_the_transcript_for_a_known_session(self, tmp_path, monkeypatch):
         projects = tmp_path / "projects"
-        cwd = tmp_path / "work"
+        # cwd is metadata only; encoding tmp_path here doubles the temporary
+        # path length and can exceed Windows limits under xdist/nightly runs.
+        cwd = Path(tmp_path.anchor) / "work"
         session_dir = projects / _encode_path(cwd)
         session_dir.mkdir(parents=True)
         _write_jsonl(
@@ -125,7 +128,7 @@ class TestLoadSessionPreviews:
     def test_session_id_cannot_leave_the_project_folder(self, tmp_path, monkeypatch):
         """The id becomes a file name; ``../x`` must not reach another folder."""
         projects = tmp_path / "projects"
-        cwd = tmp_path / "work"
+        cwd = Path(tmp_path.anchor) / "work"
         (projects / _encode_path(cwd)).mkdir(parents=True)
         _write_jsonl(
             projects / "other.jsonl",
